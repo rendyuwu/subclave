@@ -20,7 +20,7 @@ import {
   effectiveParentId,
   collectIds,
   type GroupNode,
-} from "../src/modules/groups/groupTree";
+} from "../src/modules/groups/groupTreeModel";
 import {
   ALL_SCOPE,
   FAVORITES_SCOPE,

@@ -33,6 +33,15 @@ env:
   # any more (x11rb is pure Rust, x11-dl dlopens), but they are kept until a
   # green build proves them unnecessary. patchelf is required by the AppImage
   # bundler.
+  #
+  # libayatana-appindicator3-dev is for the tray. The -dev package specifically,
+  # not the runtime library: `tauri build` looks the library up with
+  # `pkg-config ayatana-appindicator3-0.1` (falling back to `appindicator3-0.1`)
+  # and panics with "Can't detect any appindicator library" when neither .pc file
+  # is installed, failing the bundle job after the release build has already
+  # succeeded. The compiled app does not link it - libappindicator-sys dlopens
+  # libayatana-appindicator3.so.1 at runtime - so the -dev package is what puts
+  # both the .pc file and the library on the runner.
   LINUX_DEPS: >-
     libwebkit2gtk-4.1-dev
     libgtk-3-dev
@@ -41,6 +50,7 @@ env:
     libdbus-1-dev
     libxcb1-dev
     libxcb-randr0-dev
+    libayatana-appindicator3-dev
     patchelf
 
 jobs:

@@ -18,6 +18,7 @@ env:
     libdbus-1-dev
     libxcb1-dev
     libxcb-randr0-dev
+    libayatana-appindicator3-dev
     patchelf
 
 jobs:

@@ -3,7 +3,7 @@
 // draft that names it) and neither is anything the caller excludes.
 
 import { Combobox, type ComboboxOption } from "@/modules/vault/editor/Combobox";
-import { ROOT_ID, TRASH_ID, groupPath } from "./groupTree";
+import { ROOT_ID, TRASH_ID, groupPath } from "./groupTreeModel";
 import { useVaultStore } from "@/modules/vault/store";
 
 export function GroupPicker({

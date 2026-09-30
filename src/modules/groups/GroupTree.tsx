@@ -5,7 +5,7 @@
 
 import { EntryGlyph } from "./AppearancePicker";
 import { GroupEditorDialog } from "./GroupEditorDialog";
-import { ROOT_ID, TRASH_ID, buildGroupTree, descendantIds, type GroupNode } from "./groupTree";
+import { ROOT_ID, TRASH_ID, buildGroupTree, descendantIds, type GroupNode } from "./groupTreeModel";
 import {
   AlertDialog,
   AlertDialogAction,

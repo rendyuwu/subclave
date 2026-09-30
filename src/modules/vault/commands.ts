@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { toast } from "@/components/ui/toast";
-import { ROOT_ID } from "@/modules/groups/groupTree";
+import { ROOT_ID } from "@/modules/groups/groupTreeModel";
 import type { ShortcutHandlers } from "@/modules/shortcuts";
 
 import { copyToastText } from "./copy";

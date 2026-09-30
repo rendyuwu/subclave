@@ -3,7 +3,7 @@
 
 import { AppearancePicker } from "./AppearancePicker";
 import { GroupPicker } from "./GroupPicker";
-import { ROOT_ID, descendantIds } from "./groupTree";
+import { ROOT_ID, descendantIds } from "./groupTreeModel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,

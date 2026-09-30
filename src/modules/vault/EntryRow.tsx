@@ -23,7 +23,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { EntryGlyph } from "@/modules/groups/AppearancePicker";
-import { groupPath } from "@/modules/groups/groupTree";
+import { groupPath } from "@/modules/groups/groupTreeModel";
 import { cn } from "@/lib/utils";
 
 import { copyEntryField, openEntryUrlById, runVaultMutation } from "./commands";
