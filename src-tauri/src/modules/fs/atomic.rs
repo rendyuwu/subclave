@@ -21,8 +21,9 @@
 //!
 //! Callers that need a specific final byte stream (DPAPI-encrypted, 0600
 //! perms, pretty-printed JSON) compose AROUND this: produce the bytes, then
-//! call [`atomic_write`]. This helper owns only the staging/rename mechanics,
-//! never the encoding.
+//! call [`atomic_write`], or [`atomic_write_mode`] when the staging temp needs
+//! its permission bits set before the first byte lands. This helper owns only
+//! the staging/rename mechanics, never the encoding.
 
 use std::collections::HashMap;
 use std::fs;
@@ -37,6 +38,23 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// [`io::Error`] so callers can map it to their own error type.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_staged(path, bytes, |tmp| fs::File::create(tmp))
+}
+
+/// Unix-only [`atomic_write`] variant that creates the staging temp with the
+/// given permission `mode` BEFORE any bytes are written, so the contents are
+/// never briefly world-readable. The vault file and its `.bak` are written at
+/// mode `0o600`: they hold passwords.
+#[cfg(unix)]
+pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    write_staged(path, bytes, move |tmp| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(tmp)
+    })
 }
 
 /// One lock per TARGET FILE, held across the whole stage-fsync-rename sequence.
@@ -59,10 +77,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// registers `tauri-plugin-single-instance`, so a second launch forwards its
 /// argv and exits rather than becoming a second writer.
 ///
-/// The one caller left, `fs_write_file`, is a Tauri command, so two
+/// Two callers write through this helper today, both Tauri commands, so two
 /// invocations naming one file can overlap - and over a shared staging temp the
-/// loser of the rename race gets `os error 2` rather than a torn file. Any
-/// future caller that stages through this helper needs the same lock.
+/// loser of the rename race gets `os error 2` rather than a torn file:
+/// `fs_write_file` (editor saves), and `save_vault` in
+/// `modules/vault/file.rs` (the sealed vault file and its `.bak`, which also
+/// serialize one level up through the vault's save lock). Any future caller
+/// that stages through this helper needs the same lock.
 static TARGET_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

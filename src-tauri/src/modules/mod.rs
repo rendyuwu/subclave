@@ -1,2 +1,9 @@
+pub mod aesgcm;
+pub mod clipboard;
 pub mod events;
 pub mod fs;
+pub mod generator;
+pub mod lockext;
+pub mod strength;
+pub mod totp;
+pub mod vault;

@@ -62,6 +62,36 @@ tauri-plugin-log = "2"
 tauri-plugin-os = "2"
 tauri-plugin-process = "2"
 
+# Vault crypto. `ring` for AES-256-GCM, HMAC and the system RNG; `zeroize` for
+# scrubbing key material and decrypted payloads on drop. Tervia carries both as
+# transitive dependencies; this promotes them to direct use.
+ring = "0.17"
+zeroize = "1"
+uuid = { version = "1", features = ["v4"] }
+# Argon2id for the vault file, the sync keyfile and backups. Default features
+# off, `alloc` and `zeroize` on. `hash_password_into` is the only API used
+# here; the password-hashing convenience API is not, though `alloc` still
+# pulls its supporting crates.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+# zxcvbn for the strength meter. Default features off drops `derive_builder`;
+# the score and feedback APIs used in `strength.rs` do not need it.
+zxcvbn = { version = "3", default-features = false }
+# Base32 for TOTP secrets.
+data-encoding = "2"
+# URL parsing for TOTP otpauth URIs and entry host extraction.
+url = "2"
+# `wayland-data-control` is not a default and is kept for wlroots and COSMIC,
+# where it is the only clipboard path. arboard tries Wayland when
+# `WAYLAND_DISPLAY` is set, warns on failure and falls back to X11.
+# `image-data` stays off: only text is copied through this module.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
+# Boot-time clock calls (CLOCK_BOOTTIME / CLOCK_MONOTONIC) on Unix. Already in
+# the lockfile as a transitive dependency; promoted for the direct calls in
+# `vault/lock.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
 	"Win32_Foundation",
@@ -71,6 +101,7 @@ windows-sys = { version = "0.59", features = [
 	"Win32_System_Console",
 	"Win32_System_Diagnostics_ToolHelp",
 	"Win32_System_JobObjects",
+	"Win32_System_SystemInformation",
 	"Win32_System_Threading",
 	"Win32_Graphics_Dwm",
 	"Win32_Graphics_Gdi",
