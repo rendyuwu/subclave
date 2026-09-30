@@ -40,11 +40,6 @@ pub fn boot_now_ms() -> u64 {
     }
 }
 
-/// The idle deadline used until the settings file carries
-/// `autoLockMinutes` (its writer is the Settings UI), so 10 minutes is the
-/// only value in effect for now.
-pub(crate) const DEFAULT_AUTO_LOCK_MINUTES: u64 = 10;
-
 /// `minutes == 0` means never: the sentinel is `u64::MAX`. Saturating
 /// arithmetic because the input comes from settings, not from a constant.
 pub fn deadline_after(minutes: u64, now: u64) -> u64 {

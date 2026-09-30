@@ -25,6 +25,12 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
 - **Imports**: always `@/...`, never a relative path across modules
   (`scripts/check-imports.mjs`).
 - **Types**: no `any` in TypeScript.
+- **Vault secrets**: the vault UI never puts a password, a TOTP URI or a hidden
+  custom value in the store, and rarely in component state. A secret is read
+  back through `vault_entry_reveal` or `clip_copy_field` and lives only in the
+  component showing it: a reveal (through `SecretField`) clears on blur, after
+  30 s, and when the selected entry changes, and the entry editor holds the TOTP
+  URI only while its dialog is open.
 - **Window styling**: macOS gets native traffic lights via an Overlay title
   bar; Linux and Windows are borderless with React `WindowControls`. Windows
   adds `apply_windows_frame_fixes` (main window only, maximize-clamp and

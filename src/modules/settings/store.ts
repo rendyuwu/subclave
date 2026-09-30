@@ -2,6 +2,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createRecoveredStore } from "@/lib/recoveredStore";
 import type { StoreRecovery } from "@/lib/storeRecovery";
 import type { KeyBinding, ShortcutId } from "@/modules/shortcuts/shortcuts";
+import type { GeneratorOptions } from "@/modules/vault/types";
 import { normalizeCustomTheme, type CustomTheme } from "./customTheme";
 import { DEFAULT_CUSTOM_THEME } from "./themePresets";
 
@@ -41,6 +42,23 @@ export type Preferences = {
    * again. Items can be deleted individually.
    */
   userThemePresets: CustomTheme[];
+  /**
+   * Idle minutes before the vault locks itself; `0` = never. Rust reads the
+   * same key from `subclave-settings.json` at unlock and touch time, so this
+   * value must stay the on-disk one.
+   */
+  autoLockMinutes: number;
+  /** Seconds before a copied secret is cleared from the clipboard; `0` = never. */
+  clipboardClearSeconds: number;
+  /** Lock the vault when the main window is minimized. */
+  lockOnMinimize: boolean;
+  /**
+   * Closing the main window hides it instead of exiting. Default true, so the
+   * app keeps running for the browser extension.
+   */
+  closeToTray: boolean;
+  /** Last-used password-generator settings, reused by the browser extension. */
+  generator: GeneratorOptions;
 };
 
 export const BRAND_COLOR_DEFAULT = "#0057fe";
@@ -69,12 +87,24 @@ const KEY_CUSTOM_THEME_ENABLED = "customThemeEnabled";
 const KEY_CUSTOM_THEME = "customTheme";
 const KEY_APP_OPACITY = "appOpacity";
 const KEY_USER_THEME_PRESETS = "userThemePresets";
+const KEY_AUTO_LOCK_MINUTES = "autoLockMinutes";
+const KEY_CLIPBOARD_CLEAR_SECONDS = "clipboardClearSeconds";
+const KEY_LOCK_ON_MINIMIZE = "lockOnMinimize";
+const KEY_CLOSE_TO_TRAY = "closeToTray";
+const KEY_GENERATOR = "generator";
 
 export const APP_OPACITY_DEFAULT = 1;
 // 0 = fully transparent (app dissolves into the wallpaper / desktop), 1 = solid.
 export const APP_OPACITY_MIN = 0;
 export const APP_OPACITY_MAX = 1;
 export const APP_OPACITY_STEP = 0.05;
+
+// The same clamps the Rust side applies when it reads this file, so the
+// settings window and the vault agree on what is legal.
+export const AUTO_LOCK_MINUTES_MAX = 1440;
+export const CLIPBOARD_CLEAR_SECONDS_MAX = 600;
+export const GENERATOR_LENGTH_MIN = 8;
+export const GENERATOR_LENGTH_MAX = 128;
 
 export const DEFAULT_PREFERENCES: Preferences = {
   theme: "system",
@@ -86,6 +116,18 @@ export const DEFAULT_PREFERENCES: Preferences = {
   customTheme: DEFAULT_CUSTOM_THEME,
   appOpacity: APP_OPACITY_DEFAULT,
   userThemePresets: [],
+  autoLockMinutes: 10,
+  clipboardClearSeconds: 30,
+  lockOnMinimize: false,
+  closeToTray: true,
+  generator: {
+    length: 20,
+    lower: true,
+    upper: true,
+    digits: true,
+    symbols: true,
+    excludeAmbiguous: false,
+  },
 };
 
 export type PrefKey = keyof Preferences;
@@ -106,6 +148,11 @@ const PREF_STORE_KEYS = {
   // Written from the Settings window, consumed live by the main window.
   appOpacity: KEY_APP_OPACITY,
   userThemePresets: KEY_USER_THEME_PRESETS,
+  autoLockMinutes: KEY_AUTO_LOCK_MINUTES,
+  clipboardClearSeconds: KEY_CLIPBOARD_CLEAR_SECONDS,
+  lockOnMinimize: KEY_LOCK_ON_MINIMIZE,
+  closeToTray: KEY_CLOSE_TO_TRAY,
+  generator: KEY_GENERATOR,
 } satisfies Record<PrefKey, string>;
 
 /**
@@ -188,12 +235,53 @@ export async function loadPreferences(): Promise<Preferences> {
         return typeof p.name === "string" && p.name.length > 0 ? [p] : [];
       });
     })(),
+    autoLockMinutes: clampPref(
+      get<unknown>(KEY_AUTO_LOCK_MINUTES),
+      DEFAULT_PREFERENCES.autoLockMinutes,
+      AUTO_LOCK_MINUTES_MAX,
+    ),
+    clipboardClearSeconds: clampPref(
+      get<unknown>(KEY_CLIPBOARD_CLEAR_SECONDS),
+      DEFAULT_PREFERENCES.clipboardClearSeconds,
+      CLIPBOARD_CLEAR_SECONDS_MAX,
+    ),
+    lockOnMinimize: get<boolean>(KEY_LOCK_ON_MINIMIZE) ?? DEFAULT_PREFERENCES.lockOnMinimize,
+    closeToTray: get<boolean>(KEY_CLOSE_TO_TRAY) ?? DEFAULT_PREFERENCES.closeToTray,
+    generator: normalizeGeneratorOptions(get<unknown>(KEY_GENERATOR)),
   };
 }
 
 export function clampOpacity(value: number): number {
   if (!Number.isFinite(value)) return APP_OPACITY_DEFAULT;
   return Math.min(APP_OPACITY_MAX, Math.max(APP_OPACITY_MIN, value));
+}
+
+/**
+ * A whole number in `0..=max`. `0` is legal and means "never"; a wrong-typed or
+ * absent value falls back to the default instead of collapsing to 0, and an
+ * out-of-range one is clamped, matching `prefs.rs` on the Rust side.
+ */
+function clampPref(value: unknown, fallback: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(0, Math.trunc(value)));
+}
+
+/** Fill in any missing or wrong-typed generator field from the defaults. */
+export function normalizeGeneratorOptions(value: unknown): GeneratorOptions {
+  const raw = (value ?? {}) as Partial<Record<keyof GeneratorOptions, unknown>>;
+  const fallback = DEFAULT_PREFERENCES.generator;
+  const bool = (v: unknown, d: boolean): boolean => (typeof v === "boolean" ? v : d);
+  return {
+    length:
+      typeof raw.length === "number" && Number.isFinite(raw.length)
+        ? Math.min(GENERATOR_LENGTH_MAX, Math.max(GENERATOR_LENGTH_MIN, Math.trunc(raw.length)))
+        : fallback.length,
+    lower: bool(raw.lower, fallback.lower),
+    upper: bool(raw.upper, fallback.upper),
+    digits: bool(raw.digits, fallback.digits),
+    symbols: bool(raw.symbols, fallback.symbols),
+    excludeAmbiguous: bool(raw.excludeAmbiguous, fallback.excludeAmbiguous),
+  };
 }
 
 export async function setTheme(value: ThemePref): Promise<void> {
@@ -226,6 +314,32 @@ export async function setCustomTheme(value: CustomTheme): Promise<void> {
 
 export async function setUserThemePresets(value: CustomTheme[]): Promise<void> {
   await writePref(KEY_USER_THEME_PRESETS, value);
+}
+
+export async function setAutoLockMinutes(value: number): Promise<void> {
+  await writePref(
+    KEY_AUTO_LOCK_MINUTES,
+    clampPref(value, DEFAULT_PREFERENCES.autoLockMinutes, AUTO_LOCK_MINUTES_MAX),
+  );
+}
+
+export async function setClipboardClearSeconds(value: number): Promise<void> {
+  await writePref(
+    KEY_CLIPBOARD_CLEAR_SECONDS,
+    clampPref(value, DEFAULT_PREFERENCES.clipboardClearSeconds, CLIPBOARD_CLEAR_SECONDS_MAX),
+  );
+}
+
+export async function setLockOnMinimize(value: boolean): Promise<void> {
+  await writePref(KEY_LOCK_ON_MINIMIZE, value);
+}
+
+export async function setCloseToTray(value: boolean): Promise<void> {
+  await writePref(KEY_CLOSE_TO_TRAY, value);
+}
+
+export async function setGenerator(value: GeneratorOptions): Promise<void> {
+  await writePref(KEY_GENERATOR, normalizeGeneratorOptions(value));
 }
 
 /**

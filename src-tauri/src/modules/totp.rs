@@ -172,16 +172,28 @@ fn totp_code_inner(
         .totp
         .clone()
         .ok_or_else(|| "vault: no TOTP on this entry".to_string())?;
-    let parsed = parse(&uri)?;
+    Ok(code_now(&parse(&uri)?))
+}
+
+/// Preview a code for an otpauth URI that is not saved anywhere yet. Needs no
+/// vault state, so the editor can validate and show a code before a save; a
+/// bad URI returns the parser's message unchanged.
+#[tauri::command]
+pub async fn totp_preview(uri: String) -> Result<TotpCode, String> {
+    Ok(code_now(&parse(&uri)?))
+}
+
+/// The current code and its remaining seconds, from the wall clock.
+fn code_now(parsed: &TotpUri) -> TotpCode {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    Ok(TotpCode {
-        code: code(&parsed, now),
+    TotpCode {
+        code: code(parsed, now),
         period: parsed.period,
-        remaining: remaining(&parsed, now),
-    })
+        remaining: remaining(parsed, now),
+    }
 }
 
 #[cfg(test)]
@@ -367,5 +379,45 @@ mod tests {
         // reaches the NOPAD fallback and must decode there.
         let lowercase = parse("otpauth://totp/T?secret=gezdgnbvgy3tqojqgezdgnbvgy").unwrap();
         assert_eq!(lowercase.secret, b"1234567890123456".to_vec());
+    }
+
+    /// `totp_preview` parses and codes without any vault state, and passes
+    /// the parser's message through unchanged.
+    #[test]
+    fn preview_computes_a_code_and_refuses_bad_uris() {
+        let uri = format!(
+            "otpauth://totp/T?secret={}&digits=8",
+            BASE32.encode(b"12345678901234567890")
+        );
+        let preview = tauri::async_runtime::block_on(totp_preview(uri)).unwrap();
+        assert_eq!(preview.code.len(), 8);
+        assert!(preview.code.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(preview.period, 30);
+        assert!((1..=30).contains(&preview.remaining));
+
+        let refusals = [
+            ("https://totp/x".to_string(), "totp: not an otpauth URI"),
+            (
+                "otpauth://totp/T?secret=!!!notbase32!!!".to_string(),
+                "totp: bad base32 secret",
+            ),
+            (
+                format!(
+                    "otpauth://totp/T?secret={}&algorithm=MD5",
+                    BASE32.encode(b"abc")
+                ),
+                "totp: unknown algorithm \"MD5\"",
+            ),
+            (
+                format!("otpauth://totp/T?secret={}&digits=5", BASE32.encode(b"abc")),
+                "totp: digits must be 6 to 8",
+            ),
+        ];
+        for (uri, expected) in refusals {
+            let err = tauri::async_runtime::block_on(totp_preview(uri))
+                .err()
+                .unwrap();
+            assert_eq!(err, expected);
+        }
     }
 }

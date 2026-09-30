@@ -48,7 +48,7 @@ mimalloc = "0.1"
 # `mi_collect`, which is what actually hands freed commit back to the OS. See
 # `purge_allocator` in lib.rs.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

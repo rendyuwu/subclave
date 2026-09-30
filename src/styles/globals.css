@@ -620,3 +620,13 @@ html[data-chrome="borderless"] *::-webkit-scrollbar-corner {
   height: 0.875rem;
   background-color: color-mix(in srgb, var(--border) 70%, transparent);
 }
+
+/* ===== Vault entry rows =====
+ * The list can hold thousands of rows, so layout and paint are skipped for the
+ * ones scrolled out of view. `contain-intrinsic-size` keeps an unpainted row
+ * from collapsing to zero height, which would make the scrollbar jump; the
+ * `auto` keyword remembers each row's real size once it has painted. */
+.vault-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 34px;
+}

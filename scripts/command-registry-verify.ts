@@ -45,30 +45,11 @@ const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
  * NOT on it reddens check 2, which is the point.
  */
 const UNINVOKED = new Set<string>([
-  // Vault core: registered and exercised by cargo tests; there is no
-  // frontend yet, so no invoke call site exists.
-  "vault_status",
-  "vault_create",
-  "vault_unlock",
-  "vault_lock",
-  "vault_touch",
-  "vault_change_master",
-  "vault_retry_save",
-  "vault_list",
-  "vault_entry_get",
-  "vault_entry_reveal",
-  "vault_entry_upsert",
-  "vault_entry_move",
-  "vault_entry_trash",
-  "vault_entry_restore",
-  "vault_entry_delete",
-  "vault_entry_restore_version",
-  "vault_group_upsert",
-  "vault_group_delete",
-  "clip_copy_field",
-  "totp_code",
-  "gen_password",
-  "gen_strength",
+  // Empty: every registered command now either has a caller in `src/` or is
+  // one of the always-invoked shell commands (`fs_*`, `open_settings_window`).
+  // The mechanism stays, because the next command that ships ahead of its
+  // caller belongs here as a recorded decision rather than a silent loss of
+  // the `removeUnusedCommands` guard.
 ]);
 
 /**

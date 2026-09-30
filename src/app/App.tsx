@@ -1,12 +1,13 @@
 /**
  * App.tsx - the main-window shell.
  *
- * An empty shell for now: a header, three empty resizable panes and a status
- * bar, plus the command palette and the modal registry it registers with. The
- * panes stay empty until the vault UI lands.
+ * The shell owns the chrome (header, tray, status bar) and hands the tray's
+ * whole content to `VaultScreen`, which picks the first-run, unlock or
+ * workspace surface from the vault status. The three panes live inside
+ * `VaultWorkspace`, not here, so the panel group is only mounted once there
+ * is a vault to show.
  */
-import { useEffect, useMemo, useState, useCallback } from "react";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Toaster } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CommandPalette } from "@/modules/commandPalette";
@@ -16,21 +17,30 @@ import { usePreferencesStore } from "@/modules/settings/preferences";
 import { useGlobalShortcuts } from "@/modules/shortcuts";
 import { StatusBar } from "@/modules/statusbar";
 import { ThemeProvider } from "@/modules/theme";
+import { QuitConfirmDialog } from "@/modules/vault/QuitConfirmDialog";
+import { SaveFailedBanner } from "@/modules/vault/SaveFailedBanner";
+import { VaultSearchInput } from "@/modules/vault/SearchField";
+import { VaultScreen } from "@/modules/vault/VaultScreen";
+import { useVaultStore } from "@/modules/vault/store";
 import { buildShortcutHandlers } from "./lib/shortcutHandlers";
 import { useStoreRecoveryNotices } from "./hooks/useStoreRecoveryNotices";
 
-/** One empty pane. */
-const PANE =
-  "border-border/60 bg-background subclave-glass-panel flex h-full min-h-0 flex-col overflow-hidden rounded-md border";
-
 export default function App() {
-  const init = usePreferencesStore((s) => s.init);
+  const initPrefs = usePreferencesStore((s) => s.init);
+  const initVault = useVaultStore((s) => s.init);
+  const lock = useVaultStore((s) => s.lock);
+  const status = useVaultStore((s) => s.status);
+  const locked = status?.locked ?? true;
   useStoreRecoveryNotices();
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 
   useEffect(() => {
-    void init();
-  }, [init]);
+    void initPrefs();
+  }, [initPrefs]);
+
+  useEffect(() => {
+    void initVault();
+  }, [initVault]);
 
   const shortcutHandlers = useMemo(
     () => buildShortcutHandlers({ toggleCommandPalette: () => setCommandPaletteOpen((o) => !o) }),
@@ -44,23 +54,15 @@ export default function App() {
     <ThemeProvider>
       <TooltipProvider>
         <div className="bg-background text-foreground relative flex h-screen flex-col overflow-hidden">
-          <Header onOpenSettings={openSettings} />
+          <Header onOpenSettings={openSettings} onLock={locked ? undefined : lock}>
+            {locked ? null : <VaultSearchInput />}
+          </Header>
+          <SaveFailedBanner />
           <main className="bg-sidebar flex min-h-0 flex-1 gap-1.5 p-1.5">
-            <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1 gap-1.5">
-              <ResizablePanel id="groups" defaultSize="225px" minSize="8%" maxSize="450px">
-                <div className={PANE} />
-              </ResizablePanel>
-              <ResizableHandle withHandle />
-              <ResizablePanel id="entries" defaultSize="58%" minSize="25%">
-                <div className={PANE} />
-              </ResizablePanel>
-              <ResizableHandle withHandle />
-              <ResizablePanel id="detail" defaultSize="22%" minSize="18%" maxSize="50%">
-                <div className={PANE} />
-              </ResizablePanel>
-            </ResizablePanelGroup>
+            <VaultScreen />
           </main>
           <StatusBar />
+          <QuitConfirmDialog />
           <Toaster />
           <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
         </div>
