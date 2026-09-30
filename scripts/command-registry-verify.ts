@@ -44,7 +44,32 @@ const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
  * that a command ships with no caller deliberately. Removing a caller for a name
  * NOT on it reddens check 2, which is the point.
  */
-const UNINVOKED = new Set<string>([]);
+const UNINVOKED = new Set<string>([
+  // Vault core: registered and exercised by cargo tests; there is no
+  // frontend yet, so no invoke call site exists.
+  "vault_status",
+  "vault_create",
+  "vault_unlock",
+  "vault_lock",
+  "vault_touch",
+  "vault_change_master",
+  "vault_retry_save",
+  "vault_list",
+  "vault_entry_get",
+  "vault_entry_reveal",
+  "vault_entry_upsert",
+  "vault_entry_move",
+  "vault_entry_trash",
+  "vault_entry_restore",
+  "vault_entry_delete",
+  "vault_entry_restore_version",
+  "vault_group_upsert",
+  "vault_group_delete",
+  "clip_copy_field",
+  "totp_code",
+  "gen_password",
+  "gen_strength",
+]);
 
 /**
  * `invoke` call sites whose command name is not a literal at the call. Each is
