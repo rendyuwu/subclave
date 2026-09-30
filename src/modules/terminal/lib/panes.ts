@@ -1,0 +1,824 @@
+// Unified pane tree. Leaves are terminal, editor, rdp, board, or page.
+// `kind: "leaf"` stays for back-compat; the discriminator is `leafKind`.
+
+import type { AiCliKind } from "./aiCliStatus";
+
+export type PaneId = number;
+
+export type SplitDir = "row" | "col";
+
+/** Drop edge for drag-and-drop pane moves. */
+export type PaneEdge = "left" | "right" | "top" | "bottom";
+
+export type TerminalLeafState = {
+  leafKind: "terminal";
+  cwd?: string;
+  /**
+   * Saved SSH connection id. When set, connects to that host instead of
+   * spawning a local PTY; `cwd` is ignored.
+   */
+  hostId?: string;
+  /**
+   * FIFO creation index. 1-based, shown on the tab chip and surfaced to the
+   * AI in `<env>`. Set at creation, preserved across split/drag/restart.
+   * Optional for back-compat with older saved state.
+   */
+  terminalOrdinal?: number;
+  /**
+   * User-chosen name for this pane's tab-strip entry, set from the tab's
+   * right-click "Rename". Overrides everything derived (a terminal's folder
+   * basename, an editor's file name, a page title), because the whole point of
+   * renaming is that the derived name is not what you want it called. Cleared
+   * back to `undefined` by "Reset name", never emptied to `""`. Declared on
+   * every leaf kind so the rename works on any entry.
+   */
+  customTitle?: string;
+  /**
+   * Daemon-owned PTY UUID for this leaf. Stamped onto the leaf when its
+   * `useTerminalSession` Session successfully calls `openPty`/`reattachPty`
+   * and the daemon returns a non-empty `sessionId`. The workspace
+   * serializer persists this so the next GUI launch can ask the daemon to
+   * resume the same shell via `pty_attach`. Empty/undefined means
+   * "respawn fresh on restore" (no persistent backend or first run).
+   */
+  ptyId?: string;
+  /**
+   * Set by the workspace restore path (`savedToTab`) so
+   * `useTerminalSession.attachSession` knows to try `reattachPty` before
+   * falling back to a fresh `openPty`. Cleared once the session attaches
+   * (or fails to) so a manual close-and-reopen of the tab spawns fresh.
+   */
+  savedPtyId?: string;
+  /**
+   * Per-leaf terminal theme override. Holds a `TERMINAL_PRESETS` id so this
+   * pane paints its own palette regardless of the global terminal theme.
+   * Undefined = follow the global terminal theme (Settings -> Terminal). Set
+   * from the pane header's right-click "Terminal theme" menu and persisted by
+   * the workspace serializer so it survives restart.
+   */
+  terminalThemeId?: string;
+  /**
+   * AI CLI kind detected running in this terminal (claude, codex, …), or
+   * undefined when no agent is active. Written live by the detector's status
+   * callback and persisted alongside `ptyId` so that after a reattach the
+   * detector can resume classifying a still-running agent instead of going
+   * dark until the user types a new command. Consumed once on restore to
+   * pre-activate the detector; it self-corrects (clears on the first shell
+   * prompt) if the agent had already exited. SSH leaves never persist it (a
+   * remote reconnect is a fresh shell, not a reattach).
+   */
+  activeTool?: AiCliKind;
+};
+
+export type EditorLeafState = {
+  leafKind: "editor";
+  /** Absolute forward-slash path of the open file. */
+  path: string;
+  /** Unsaved-edits state of the CodeMirror buffer. */
+  dirty: boolean;
+  /** VSCode-style preview indicator (italic title). */
+  preview: boolean;
+  /**
+   * Saved SSH connection id of the host this file lives on. The STABLE half of
+   * a remote editor's identity: it survives a restart, so the workspace
+   * serializer persists it and the pane resolves it to whatever russh session
+   * is live at render time (see `sshSessionId`). Absent on local files and on
+   * ad-hoc connections, which have no saved profile to rebind to.
+   */
+  hostId?: string;
+  /**
+   * LIVE russh session this leaf currently reads and writes through (SFTP).
+   * Frozen at open time for an ad-hoc connection (no saved profile, so nothing
+   * to re-resolve); for a profile-bound leaf the pane passes the freshly
+   * resolved session instead, which is why this is never persisted.
+   */
+  sshSessionId?: number;
+  /** Display label for the remote host. Set alongside either ssh field. */
+  sshHostLabel?: string;
+  /** User-chosen tab name; see {@link TerminalLeafState.customTitle}. */
+  customTitle?: string;
+};
+
+/**
+ * Kanban of the workspace's terminals, in columns of what their AI CLI is
+ * doing. A leaf rather than a standalone tab so it gets the ordinary pane
+ * chrome - drag handle, close, split, the lot - from `PaneLeafFrame` instead of
+ * a second copy of that header.
+ *
+ * Carries no state at all: the columns are rebuilt from the live tab tree on
+ * every render, so this leaf is restorable from nothing but its own existence.
+ */
+export type BoardLeafState = {
+  leafKind: "board";
+  /** User-chosen tab name; see {@link TerminalLeafState.customTitle}. */
+  customTitle?: string;
+};
+
+/**
+ * One RDP session, rendered on a canvas in the pane.
+ *
+ * Holds a REFERENCE to a saved connection, not a copy of its fields: the host,
+ * port, credentials and desktop size all live on the row, so an edit to the
+ * connection is picked up by the next connect instead of being frozen into
+ * every leaf that ever dialled it. It also means the leaf carries no secret and
+ * nothing host-shaped for the serializer to persist.
+ *
+ * There is deliberately no live-session id here, and no `savedPtyId` analogue.
+ * An RDP session cannot be reattached the way a PTY can - there is no byte
+ * stream to replay and the server treats a dropped connection as a
+ * *disconnected* session - so restoring one means dialling again, exactly as
+ * restoring an SSH leaf does.
+ */
+export type RdpLeafState = {
+  leafKind: "rdp";
+  /** Id of the saved RDP host in the hosts store (`modules/hosts/store.ts`). */
+  rdpConnectionId: string;
+  /** User-chosen tab name; see {@link TerminalLeafState.customTitle}. */
+  customTitle?: string;
+};
+
+/** The four pages the activity rail can show. Only one of them may be a pane
+ *  LEAF - see {@link TabPageKind}. */
+export type PageKind = "hosts" | "vault" | "forwards" | "known-hosts";
+
+/**
+ * The page kinds that may live in a tab as a pane leaf. Hosts, and only Hosts.
+ *
+ * The tab strip is for connections, and Hosts earns a place there because
+ * it is where connections come from. Vault and Port Forwarding are rail VIEWS
+ * shown over the tab area (`app/components/RailViewArea.tsx`), so there is no
+ * such thing as a tab for one - and narrowing the leaf's `page` here is what
+ * makes "open Vault as a tab" a type error rather than a leaf the rail's pressed
+ * state, `openPageTab` and `PageLeafBody` would each have to refuse separately.
+ *
+ * Declared beside the leaf it constrains rather than in `tabs/lib/pages.ts`
+ * (which re-exports it alongside the rail-view half): a module that owns a type
+ * cannot import its own constraint back from a module that imports it.
+ */
+export type TabPageKind = "hosts";
+
+export const PAGE_KINDS: readonly PageKind[] = ["hosts", "vault", "forwards", "known-hosts"];
+
+export function isPageKind(value: string): value is PageKind {
+  return (PAGE_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * Single source for what to call a page, read by the rail buttons, the tab
+ * strip label (`leafLabel`), and the startup fallback tab - so the three
+ * cannot drift into naming the same leaf differently.
+ */
+export const PAGE_LABELS: Record<PageKind, string> = {
+  hosts: "Hosts",
+  vault: "Vault",
+  forwards: "Port Forwarding",
+  "known-hosts": "Known Hosts",
+};
+
+/**
+ * A page tab: the Hosts page, opened from the left rail. Stateless beyond the
+ * discriminator, exactly like `BoardLeafState` - restorable from nothing but its
+ * own existence.
+ *
+ * `TabPageKind`, not `PageKind`: a Vault or Port-Forwarding leaf is
+ * unrepresentable. The workspace restore path drops one saved by an
+ * older build; see `workspaces/serialize.ts`.
+ */
+export type PageLeafState = {
+  leafKind: "page";
+  page: TabPageKind;
+  /** User-chosen tab name; see {@link TerminalLeafState.customTitle}. */
+  customTitle?: string;
+};
+
+export type LeafState =
+  TerminalLeafState | EditorLeafState | RdpLeafState | BoardLeafState | PageLeafState;
+
+export type PaneLeaf = { kind: "leaf"; id: PaneId } & LeafState;
+
+export type PaneNode =
+  | PaneLeaf
+  | {
+      kind: "split";
+      id: PaneId;
+      dir: SplitDir;
+      children: PaneNode[];
+      /**
+       * Per-child size percentages (0..100, one per child, in order). Captured
+       * from react-resizable-panels' `onLayoutChanged` when the user drags a
+       * divider and persisted by the workspace serializer so a restored layout
+       * keeps its divider positions instead of resetting to an equal split.
+       * Undefined (or a stale length after a split/close) means "equal split".
+       */
+      sizes?: number[];
+    };
+
+export function isLeaf(n: PaneNode): n is PaneLeaf {
+  return n.kind === "leaf";
+}
+
+/**
+ * True for an editor leaf whose file lives on a remote host over SFTP, bound to
+ * a live session or not.
+ *
+ * Every "is this file local?" decision must route through this. Testing only
+ * `sshSessionId` misses a leaf restored from a saved workspace (which carries
+ * just the connection id until a session comes up) and treats it as a LOCAL
+ * file: that is how a remote path used to be read from, and on the next save
+ * written to, the local disk.
+ */
+export function isRemoteEditorLeaf(leaf: PaneLeaf): boolean {
+  return (
+    leaf.leafKind === "editor" && (leaf.hostId !== undefined || leaf.sshSessionId !== undefined)
+  );
+}
+
+/**
+ * Which session an editor pane may read and write through this render.
+ *
+ * `undefined` = the local filesystem, i.e. an ordinary local file. A number =
+ * that russh session. `"blocked"` = remote with nothing to reach it through,
+ * and the pane MUST NOT mount an editor: `useDocument` falls back to the LOCAL
+ * filesystem whenever no session is set, so mounting would read - and on the
+ * next save write - a remote path against this machine's disk. That single
+ * fallback is why remote leaves used to be dropped from the saved workspace
+ * rather than restored.
+ *
+ * `lastBound` keeps a pane that HAS been bound on its previous session when the
+ * connection drops, instead of tearing the editor down and taking unsaved edits
+ * with it; saving then fails against the dead session (exactly as it did before
+ * any of this) until a reconnect resolves a new one.
+ */
+export function editorPaneSession(
+  leaf: PaneLeaf,
+  resolved: number | undefined,
+  lastBound: number | undefined,
+): number | "blocked" | undefined {
+  if (!isRemoteEditorLeaf(leaf)) return undefined;
+  return resolved ?? lastBound ?? "blocked";
+}
+
+export function leafIds(n: PaneNode): PaneId[] {
+  if (isLeaf(n)) return [n.id];
+  return n.children.flatMap(leafIds);
+}
+
+/** Direction of the split that directly contains `leafId`: `"row"` = the leaf
+ *  sits beside its sibling (left/right), `"col"` = stacked (above/below). Null
+ *  when the leaf is the tab's only pane, so there is no split to rotate. */
+export function leafParentDir(n: PaneNode, leafId: PaneId): SplitDir | null {
+  if (n.kind !== "split") return null;
+  if (n.children.some((c) => c.kind === "leaf" && c.id === leafId)) return n.dir;
+  for (const c of n.children) {
+    const d = leafParentDir(c, leafId);
+    if (d) return d;
+  }
+  return null;
+}
+
+export function leaves(n: PaneNode): PaneLeaf[] {
+  if (isLeaf(n)) return [n];
+  return n.children.flatMap(leaves);
+}
+
+export function findLeaf(n: PaneNode, id: PaneId): PaneLeaf | null {
+  if (isLeaf(n)) return n.id === id ? n : null;
+  for (const c of n.children) {
+    const r = findLeaf(c, id);
+    if (r) return r;
+  }
+  return null;
+}
+
+export function hasLeaf(tree: PaneNode, id: PaneId): boolean {
+  return findLeaf(tree, id) !== null;
+}
+
+/** Update a terminal leaf's cwd. No-op for editor leaves or mismatched ids. */
+export function setLeafCwd(n: PaneNode, id: PaneId, cwd: string): PaneNode {
+  if (isLeaf(n)) {
+    if (n.id !== id || n.leafKind !== "terminal") return n;
+    return { ...n, cwd };
+  }
+  return { ...n, children: n.children.map((c) => setLeafCwd(c, id, cwd)) };
+}
+
+/**
+ * Stamp a daemon-side PTY UUID onto a terminal leaf. Also clears
+ * `savedPtyId` so any later retry/respawn does not redundantly try to
+ * reattach the same uuid (which would race the daemon killing the
+ * original). No-op for editor leaves or mismatched ids.
+ */
+export function setLeafPtyId(n: PaneNode, id: PaneId, ptyId: string): PaneNode {
+  if (isLeaf(n)) {
+    if (n.id !== id || n.leafKind !== "terminal") return n;
+    if (n.ptyId === ptyId && n.savedPtyId === undefined) return n;
+    // Narrow to the terminal branch by leafKind before reassembling so
+    // TypeScript keeps the PaneLeaf union tight (editor branch has no
+    // ptyId / savedPtyId fields to drop).
+    const { savedPtyId: _drop, ...rest } = n;
+    const updated: PaneLeaf = { ...rest, leafKind: "terminal", ptyId };
+    return updated;
+  }
+  return { ...n, children: n.children.map((c) => setLeafPtyId(c, id, ptyId)) };
+}
+
+/**
+ * Set or clear a terminal leaf's detected AI CLI kind. Pass `null` to clear it
+ * (no agent active). Returns the same tree by reference on no-op so callers can
+ * bail before churning React state. No-op for non-terminal leaves or mismatched
+ * ids.
+ */
+export function setLeafActiveTool(n: PaneNode, id: PaneId, tool: AiCliKind | null): PaneNode {
+  if (isLeaf(n)) {
+    if (n.id !== id || n.leafKind !== "terminal") return n;
+    if ((n.activeTool ?? null) === tool) return n;
+    if (tool) return { ...n, activeTool: tool };
+    const { activeTool: _drop, ...rest } = n;
+    return rest as PaneLeaf;
+  }
+  return { ...n, children: n.children.map((c) => setLeafActiveTool(c, id, tool)) };
+}
+
+/**
+ * Store per-child size percentages on the split node identified by `splitId`.
+ * `sizes` must have one entry per child, in child order. Returns the same tree
+ * by reference when the sizes are unchanged (rounded compare) so a layout event
+ * that merely re-reports the current sizes doesn't churn React state or the
+ * on-disk snapshot. No-op when the length doesn't match the split's children.
+ */
+export function setSplitSizes(n: PaneNode, splitId: PaneId, sizes: number[]): PaneNode {
+  if (isLeaf(n)) return n;
+  if (n.id === splitId) {
+    if (sizes.length !== n.children.length) return n;
+    const same =
+      n.sizes?.length === sizes.length &&
+      n.sizes.every((v, i) => Math.round(v) === Math.round(sizes[i]));
+    if (same) return n;
+    return { ...n, sizes };
+  }
+  // Return the same node reference when no descendant changed, so a caller
+  // walking every tab's tree can skip the ones that don't hold this split.
+  let changed = false;
+  const children = n.children.map((c) => {
+    const r = setSplitSizes(c, splitId, sizes);
+    if (r !== c) changed = true;
+    return r;
+  });
+  if (!changed) return n;
+  return { ...n, children };
+}
+
+/**
+ * Set or clear a terminal leaf's per-leaf theme override. `themeId` is a
+ * `TERMINAL_PRESETS` id; pass `null` to clear it (the pane reverts to the
+ * global terminal theme). Returns the same tree by reference on no-op. No-op
+ * for non-terminal leaves or mismatched ids.
+ */
+export function setLeafTerminalTheme(n: PaneNode, id: PaneId, themeId: string | null): PaneNode {
+  if (isLeaf(n)) {
+    if (n.id !== id || n.leafKind !== "terminal") return n;
+    if (themeId) {
+      if (n.terminalThemeId === themeId) return n;
+      return { ...n, terminalThemeId: themeId };
+    }
+    if (n.terminalThemeId === undefined) return n;
+    const { terminalThemeId: _drop, ...rest } = n;
+    return rest as PaneLeaf;
+  }
+  return { ...n, children: n.children.map((c) => setLeafTerminalTheme(c, id, themeId)) };
+}
+
+/**
+ * Set or clear a leaf's user-chosen tab name. A blank string clears it, so the
+ * entry falls back to its derived label rather than rendering as an empty tab.
+ * Returns the same tree by reference on no-op. Works on any leaf kind.
+ */
+export function setLeafCustomTitle(n: PaneNode, id: PaneId, title: string | null): PaneNode {
+  if (isLeaf(n)) {
+    if (n.id !== id) return n;
+    const next = title?.trim();
+    if (next) {
+      if (n.customTitle === next) return n;
+      return { ...n, customTitle: next };
+    }
+    if (n.customTitle === undefined) return n;
+    const { customTitle: _drop, ...rest } = n;
+    return rest as PaneLeaf;
+  }
+  return { ...n, children: n.children.map((c) => setLeafCustomTitle(c, id, title)) };
+}
+
+/** Patch an editor leaf's mutable state. */
+export function updateEditorLeaf(
+  n: PaneNode,
+  id: PaneId,
+  patch: Partial<Pick<EditorLeafState, "path" | "dirty" | "preview">>,
+): PaneNode {
+  if (isLeaf(n)) {
+    if (n.id !== id || n.leafKind !== "editor") return n;
+    return { ...n, ...patch };
+  }
+  return {
+    ...n,
+    children: n.children.map((c) => updateEditorLeaf(c, id, patch)),
+  };
+}
+
+/**
+ * Clone a leaf's state (without its id) for a live move/extract, so the leaf's
+ * attached PTY / editor session travels with it. Drops the
+ * serialization-only `ptyId`/`savedPtyId` (the live session re-stamps them).
+ *
+ * An RDP leaf is the one kind whose live session does NOT travel: the clone
+ * gets a fresh leaf ID and `RdpPane` keys its session off that, so a
+ * move/extract redials. That is the same behaviour a restore has, for the same
+ * reason - there is nothing to reattach to.
+ */
+export function cloneLeafState(leaf: PaneLeaf): LeafState {
+  if (leaf.leafKind === "terminal") {
+    return {
+      leafKind: "terminal",
+      cwd: leaf.cwd,
+      hostId: leaf.hostId,
+      terminalOrdinal: leaf.terminalOrdinal,
+      ...(leaf.terminalThemeId ? { terminalThemeId: leaf.terminalThemeId } : {}),
+      // Carry the live agent kind so a move/extract doesn't drop the badge
+      // until the detector re-emits; the same session keeps running.
+      ...(leaf.activeTool ? { activeTool: leaf.activeTool } : {}),
+    };
+  }
+  if (leaf.leafKind === "editor") {
+    return {
+      leafKind: "editor",
+      path: leaf.path,
+      dirty: leaf.dirty,
+      preview: leaf.preview,
+      hostId: leaf.hostId,
+      sshSessionId: leaf.sshSessionId,
+      sshHostLabel: leaf.sshHostLabel,
+    };
+  }
+  if (leaf.leafKind === "rdp") {
+    return {
+      leafKind: "rdp",
+      rdpConnectionId: leaf.rdpConnectionId,
+    };
+  }
+  if (leaf.leafKind === "board") {
+    // Board: no state of its own - the columns are rebuilt from the live tab tree.
+    return { leafKind: "board" };
+  }
+  // Page: nothing but which page it is - the body itself carries no state here.
+  return { leafKind: "page", page: leaf.page };
+}
+
+/**
+ * How a freshly opened multi-pane tab arranges its leaves.
+ * `row` = side by side, `col` = stacked, `grid` = both axes combined.
+ */
+export type PaneLayout = "row" | "col" | "grid";
+
+/**
+ * Layouts that are meaningful for `count` panes, in menu order. Below three
+ * panes there is nothing for `grid` to combine (it would just be a row), so it
+ * is left out rather than offered as a duplicate.
+ */
+export function layoutsFor(count: number): PaneLayout[] {
+  if (count < 2) return [];
+  if (count < 3) return ["row", "col"];
+  return ["row", "col", "grid"];
+}
+
+/**
+ * Build a pane tree holding `states` in the given layout, left-to-right /
+ * top-to-bottom in array order. `allocId` yields fresh pane ids.
+ *
+ * `grid` mixes both axes: 3 panes become one full-height pane beside a stacked
+ * pair, and 4 or more split into two rows with the larger half on top (4 = 2x2,
+ * 5 = 3 over 2, 6 = 3x2). Under 3 panes there is nothing to combine, so it falls
+ * back to a single row and the caller never has to special-case it.
+ */
+export function buildPaneTree(
+  states: LeafState[],
+  layout: PaneLayout,
+  allocId: () => PaneId,
+): PaneNode {
+  if (states.length === 0) throw new Error("buildPaneTree: needs at least one leaf");
+  const leaf = (s: LeafState): PaneLeaf => ({ kind: "leaf", id: allocId(), ...s });
+  if (states.length === 1) return leaf(states[0]);
+  const split = (dir: SplitDir, children: PaneNode[]): PaneNode => ({
+    kind: "split",
+    id: allocId(),
+    dir,
+    children,
+  });
+  if (layout === "grid" && states.length === 3) {
+    const [a, b, c] = states.map((s) => leaf(s));
+    return split("row", [a, split("col", [b, c])]);
+  }
+  if (layout === "grid" && states.length >= 4) {
+    // Two rows, larger half on top. Ceil keeps both rows at 2+ children, so no
+    // single-child split (which `normalizePaneTree` would only unwrap again).
+    const top = Math.ceil(states.length / 2);
+    const cells = states.map((s) => leaf(s));
+    return split("col", [split("row", cells.slice(0, top)), split("row", cells.slice(top))]);
+  }
+  return split(
+    layout === "col" ? "col" : "row",
+    states.map((s) => leaf(s)),
+  );
+}
+
+/** Insert a new leaf next to `targetId` in `dir`. Joins as a sibling if the enclosing split already runs that way. */
+export function splitLeaf(
+  tree: PaneNode,
+  targetId: PaneId,
+  newSplitId: PaneId,
+  newLeafId: PaneId,
+  dir: SplitDir,
+  newLeafState: LeafState,
+): PaneNode {
+  if (tree.kind === "split" && tree.dir === dir) {
+    const idx = tree.children.findIndex((c) => c.kind === "leaf" && c.id === targetId);
+    if (idx >= 0) {
+      const newLeaf: PaneLeaf = {
+        kind: "leaf",
+        id: newLeafId,
+        ...newLeafState,
+      };
+      return {
+        ...tree,
+        children: [...tree.children.slice(0, idx + 1), newLeaf, ...tree.children.slice(idx + 1)],
+        // Adding a child invalidates the stored divider ratios (positional,
+        // one-per-child); the next drag re-captures them.
+        sizes: undefined,
+      };
+    }
+  }
+  if (isLeaf(tree)) {
+    if (tree.id !== targetId) return tree;
+    const newLeaf: PaneLeaf = {
+      kind: "leaf",
+      id: newLeafId,
+      ...newLeafState,
+    };
+    return {
+      kind: "split",
+      id: newSplitId,
+      dir,
+      children: [tree, newLeaf],
+    };
+  }
+  return {
+    ...tree,
+    children: tree.children.map((c) =>
+      splitLeaf(c, targetId, newSplitId, newLeafId, dir, newLeafState),
+    ),
+  };
+}
+
+export function removeLeaf(tree: PaneNode, targetId: PaneId): PaneNode | null {
+  if (isLeaf(tree)) return tree.id === targetId ? null : tree;
+  const newChildren: PaneNode[] = [];
+  for (const c of tree.children) {
+    const r = removeLeaf(c, targetId);
+    if (r !== null) newChildren.push(r);
+  }
+  if (newChildren.length === 0) return null;
+  if (newChildren.length === 1) return newChildren[0];
+  return {
+    ...tree,
+    children: newChildren,
+    // A removed DIRECT child drops a slot, so this split's positional ratios no
+    // longer line up; a deeper removal (count unchanged) leaves them valid.
+    ...(newChildren.length === tree.children.length ? {} : { sizes: undefined }),
+  };
+}
+
+export function nextLeafId(tree: PaneNode, currentId: PaneId, delta: 1 | -1): PaneId {
+  const ids = leafIds(tree);
+  if (ids.length === 0) return currentId;
+  const idx = ids.indexOf(currentId);
+  if (idx < 0) return ids[0];
+  return ids[(idx + delta + ids.length) % ids.length];
+}
+
+export function siblingLeafOf(tree: PaneNode, leafId: PaneId): PaneId | null {
+  if (isLeaf(tree)) return null;
+  for (let i = 0; i < tree.children.length; i++) {
+    const c = tree.children[i];
+    if (isLeaf(c) && c.id === leafId) {
+      const sibling = tree.children[i + 1] ?? tree.children[i - 1];
+      if (!sibling) return null;
+      return leafIds(sibling)[0] ?? null;
+    }
+  }
+  for (const c of tree.children) {
+    if (!isLeaf(c)) {
+      const r = siblingLeafOf(c, leafId);
+      if (r !== null) return r;
+    }
+  }
+  return null;
+}
+
+/**
+ * Pair `leafId` with its immediate sibling and wrap them in a sub-split with
+ * opposite direction. Prefers the right neighbor, falls back to left. Other
+ * siblings of the parent split are untouched. For a flat 2-leaf split, this
+ * collapses to flipping the parent's direction. Returns null on no-op.
+ */
+export function rotateLeafWithNeighbor(
+  tree: PaneNode,
+  leafId: PaneId,
+  newSplitId: PaneId,
+): PaneNode | null {
+  if (isLeaf(tree)) return null;
+  const idx = tree.children.findIndex((c) => isLeaf(c) && c.id === leafId);
+  if (idx >= 0) {
+    // Prefer right neighbor. Fall back to left when at the tail.
+    const neighborIdx = idx + 1 < tree.children.length ? idx + 1 : idx - 1;
+    if (neighborIdx < 0) return null;
+    const lo = Math.min(idx, neighborIdx);
+    const hi = Math.max(idx, neighborIdx);
+    const pair: PaneNode = {
+      kind: "split",
+      id: newSplitId,
+      dir: tree.dir === "row" ? "col" : "row",
+      children: [tree.children[lo], tree.children[hi]],
+    };
+    const newChildren = [...tree.children];
+    newChildren.splice(lo, 2, pair);
+    // One-child wrapper after a 2-leaf collapse. Unwrap to keep the tree canonical.
+    if (newChildren.length === 1) return newChildren[0];
+    // Two children were replaced by one wrapper -> the ratio set changed.
+    return { ...tree, children: newChildren, sizes: undefined };
+  }
+  // Leaf is deeper. Recurse and rebuild only on the matching path.
+  let changed = false;
+  const newChildren = tree.children.map((c) => {
+    const r = rotateLeafWithNeighbor(c, leafId, newSplitId);
+    if (r !== null) {
+      changed = true;
+      return r;
+    }
+    return c;
+  });
+  if (!changed) return null;
+  return { ...tree, children: newChildren };
+}
+
+/**
+ * Reorder `leafId` within its immediate split parent. Lands before
+ * `beforeLeafId`, or at the end when null. No-op when the two leaves aren't
+ * direct siblings. Returns the same tree by reference on no-op.
+ */
+export function reorderLeafInTree(
+  tree: PaneNode,
+  leafId: PaneId,
+  beforeLeafId: PaneId | null,
+): PaneNode {
+  if (isLeaf(tree)) return tree;
+  const fromIdx = tree.children.findIndex((c) => isLeaf(c) && c.id === leafId);
+  if (fromIdx >= 0) {
+    let insertIdx: number;
+    if (beforeLeafId === null) {
+      insertIdx = tree.children.length;
+    } else {
+      const toIdx = tree.children.findIndex((c) => isLeaf(c) && c.id === beforeLeafId);
+      if (toIdx < 0) return tree;
+      insertIdx = toIdx;
+    }
+    if (fromIdx === insertIdx || fromIdx + 1 === insertIdx) return tree;
+    const moving = tree.children[fromIdx];
+    const without = [...tree.children.slice(0, fromIdx), ...tree.children.slice(fromIdx + 1)];
+    const targetIdx = fromIdx < insertIdx ? insertIdx - 1 : insertIdx;
+    return {
+      ...tree,
+      children: [...without.slice(0, targetIdx), moving, ...without.slice(targetIdx)],
+      // Reordering keeps the count but changes the order, so the positional
+      // ratios would land on the wrong panes -> drop them.
+      sizes: undefined,
+    };
+  }
+  let changed = false;
+  const newChildren = tree.children.map((c) => {
+    if (isLeaf(c)) return c;
+    const r = reorderLeafInTree(c, leafId, beforeLeafId);
+    if (r !== c) {
+      changed = true;
+      return r;
+    }
+    return c;
+  });
+  if (!changed) return tree;
+  return { ...tree, children: newChildren };
+}
+
+/**
+ * Insert an existing `source` leaf as a sibling of `targetLeafId` on the
+ * given side. When the target's enclosing split already runs in `dir`, the
+ * leaf joins as a direct sibling; otherwise the target is wrapped in a fresh
+ * sub-split of that direction. `before` controls which side of the target the
+ * leaf lands on.
+ */
+function insertLeafBeside(
+  tree: PaneNode,
+  targetLeafId: PaneId,
+  source: PaneLeaf,
+  dir: SplitDir,
+  before: boolean,
+  newSplitId: PaneId,
+): PaneNode {
+  if (isLeaf(tree)) {
+    if (tree.id !== targetLeafId) return tree;
+    return {
+      kind: "split",
+      id: newSplitId,
+      dir,
+      children: before ? [source, tree] : [tree, source],
+    };
+  }
+  const idx = tree.children.findIndex((c) => isLeaf(c) && c.id === targetLeafId);
+  if (idx >= 0) {
+    if (tree.dir === dir) {
+      const insertAt = before ? idx : idx + 1;
+      return {
+        ...tree,
+        children: [...tree.children.slice(0, insertAt), source, ...tree.children.slice(insertAt)],
+        // Inserting a sibling adds a slot -> stored ratios no longer align.
+        sizes: undefined,
+      };
+    }
+    const wrapped: PaneNode = {
+      kind: "split",
+      id: newSplitId,
+      dir,
+      children: before ? [source, tree.children[idx]] : [tree.children[idx], source],
+    };
+    const next = [...tree.children];
+    next[idx] = wrapped;
+    return { ...tree, children: next };
+  }
+  return {
+    ...tree,
+    children: tree.children.map((c) =>
+      insertLeafBeside(c, targetLeafId, source, dir, before, newSplitId),
+    ),
+  };
+}
+
+/**
+ * Drag-and-drop move: relocate `sourceLeafId` so it sits on the `edge` side of
+ * `targetLeafId`. The leaf keeps its id and full state, so its attached PTY /
+ * editor session survives the move. `left`/`right` land in a row split,
+ * `top`/`bottom` in a column split; a target already inside a split of that
+ * direction gains the leaf as a direct sibling rather than nesting deeper. The
+ * result is normalized. Returns null on no-op (same leaf, missing id, or the
+ * removal would also drop the target).
+ */
+export function movePaneLeafToEdge(
+  tree: PaneNode,
+  sourceLeafId: PaneId,
+  targetLeafId: PaneId,
+  edge: PaneEdge,
+  newSplitId: PaneId,
+): PaneNode | null {
+  if (sourceLeafId === targetLeafId) return null;
+  const source = findLeaf(tree, sourceLeafId);
+  if (!source) return null;
+  if (!hasLeaf(tree, targetLeafId)) return null;
+  const without = removeLeaf(tree, sourceLeafId);
+  if (without === null || !hasLeaf(without, targetLeafId)) return null;
+  const dir: SplitDir = edge === "left" || edge === "right" ? "row" : "col";
+  const before = edge === "left" || edge === "top";
+  const inserted = insertLeafBeside(without, targetLeafId, source, dir, before, newSplitId);
+  return normalizePaneTree(inserted);
+}
+
+/**
+ * Canonicalize the tree. Flattens nested splits matching the parent's
+ * direction and unwraps single-child splits. Used after rotations so
+ * successive toggles round-trip the tree.
+ */
+export function normalizePaneTree(node: PaneNode): PaneNode {
+  if (isLeaf(node)) return node;
+  const flattened: PaneNode[] = [];
+  for (const raw of node.children) {
+    const c = normalizePaneTree(raw);
+    if (c.kind === "split" && c.dir === node.dir) {
+      flattened.push(...c.children);
+    } else {
+      flattened.push(c);
+    }
+  }
+  if (flattened.length === 1) return flattened[0];
+  return {
+    ...node,
+    children: flattened,
+    // A flatten (a nested same-dir split expanded) changes the direct-child
+    // count, so positional ratios are stale; a same-count normalize keeps them.
+    ...(flattened.length === node.children.length ? {} : { sizes: undefined }),
+  };
+}

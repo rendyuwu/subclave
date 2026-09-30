@@ -1,0 +1,65 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies / builds
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+
+# Rust / Tauri build artifacts
+src-tauri/target
+src-tauri/gen
+.tauri
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+.claude
+.opencode
+.omo
+.agents
+# Per-workspace app state (window layout, restored tabs, saved pane trees).
+# Listed explicitly rather than relying on the `*.tervia` theme-file pattern
+# further down, so a change to that pattern cannot start committing local
+# session state.
+.tervia/
+.local/
+
+# Recovered WinSCP credentials — local only, never commit
+plan.txt
+check-public-ip.ps1
+
+# react-doctor: local-only scan config (rule policy kept off the repo)
+react-doctor.config.json
+
+# Project-local working files
+/icon.png
+# Both cases on purpose. Ignore patterns are matched case-SENSITIVELY, so the
+# uppercase spelling alone only worked here because Windows sets
+# core.ignorecase=true; a Linux clone would have offered `todo.md` for commit.
+TODO.MD
+todo.md
+REMOTE-ACCESS-SPEC.md
+FEATURE-STUDY.md
+# Exported theme files are personal / test artifacts, not repo content.
+*.tervia

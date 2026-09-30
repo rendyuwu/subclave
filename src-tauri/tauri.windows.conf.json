@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tervia",
+        "width": 800,
+        "height": 600,
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
+        "shadow": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "minWidth": 640,
+        "minHeight": 480
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "compression": "lzma",
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "displayLanguageSelector": false,
+        "installerHooks": "./installer.nsh"
+      }
+    }
+  }
+}

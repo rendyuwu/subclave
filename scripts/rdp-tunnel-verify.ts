@@ -1,0 +1,1787 @@
+/**
+ * Self-check for RDP over SSH: the refcounted forward orchestrator in
+ * `src/modules/ssh/tunnel.ts` and the dial resolution in `src/modules/rdp/dial.ts`.
+ * Run: `npx tsx scripts/rdp-tunnel-verify.ts`.
+ *
+ * This one drives the real modules against a stand-in for the Tauri IPC bridge
+ * (same idiom as `clipboard-read-verify` and `terminal-resize-verify`) rather
+ * than testing pure helpers, because every property worth pinning here is about
+ * WHEN a session is opened and closed - which is bookkeeping across two maps and
+ * an await, not arithmetic.
+ *
+ * What it pins, and why each one is a bug that already happened or nearly did:
+ *
+ * 1. THE AUTH CALL SITE RUNS. The call that decides whether a private key or a
+ *    password reaches the handshake had never executed in the app's life: its
+ *    module had zero callers. That call is `sshKeychainCredentials`, which
+ *    `tunnel.ts` reaches through `resolveSshAuth`. A typo there fails as "no
+ *    credentials", on a path that authenticates with keys. Now it is
+ *    exercised for all three auth modes - and this is also where the captured
+ *    `ssh_open` payload proves the wire carries keychain REFERENCES and the
+ *    dial reads no secret at all.
+ *
+ * 2. ONE SESSION PER BASTION, and it lives exactly as long as its consumers.
+ *    Two forwards over one jump host must cost one russh session, and the first
+ *    consumer to let go must not take the second one's tunnel with it.
+ *
+ * 3. REUSE TAKES A REFERENCE. The original `openForwardForConnection` returned
+ *    an existing forward WITHOUT incrementing anything, while every close
+ *    decremented: two RDP panes tunnelling to the same host shared one
+ *    reference, so the first pane closed the session out from under the second.
+ *    That is a black pane and a dead session for the survivor.
+ *
+ * 4. CONCURRENT OPENS SHARE ONE DIAL. Restoring a workspace with two RDP leaves
+ *    behind one bastion runs both connects in the same tick. A map of resolved
+ *    sessions has both miss and both dial, and the second overwrites the first -
+ *    leaking a russh session whose reference count nobody can reach.
+ *
+ * 5. AN UNVERIFIED BASTION REFUSES, unless the caller can ask. The refusal is
+ *    the old behaviour and stays the default; the RDP caller opts into the TOFU
+ *    prompt because it has a dialog on screen anyway. Both directions matter:
+ *    a caller that cannot ask must not park the backend on a question with no
+ *    audience, and the prompt must pin the fingerprint on the right saved row.
+ *
+ * 6. THE TUNNEL CHANGES THE ADDRESS AND NOTHING ELSE. A tunnelled connect dials
+ *    `127.0.0.1:<ephemeral>` but carries the same pinned certificate, because
+ *    the pin belongs to the saved connection. Key it by address instead and the
+ *    ephemeral port looks like a brand-new machine on every single connect: a
+ *    TOFU prompt that never stops asking.
+ *
+ * 7. A RELEASE NAMES AN ENTRY, NOT A TARGET. `dropSession` deletes a
+ *    connection's entries when the bastion dies, and the next consumer of the
+ *    same target creates fresh ones under the same key. A release that only
+ *    looked the key up spent the REINCARNATED entry's reference and closed a
+ *    session another pane was using - and the pane whose late release did it had
+ *    no way to know, since a parked TCP connection only fails on a keepalive.
+ *    Over-release against a SPENT entry (item 3's mirror) was already covered;
+ *    this is the re-created one, which the refs-at-zero guard cannot catch.
+ *
+ * 8. A JOINER LEARNS THE DIAL'S PROMPT IDS. Only the caller that starts a dial
+ *    used to hear about its host-key questions, so a second pane riding the same
+ *    handshake had nothing to abandon on its way out and depended entirely on
+ *    the first one still being there. Both joiner shapes matter: a different
+ *    target (which re-enters `sessionFor`) and the same target (which reuses the
+ *    forward and never reaches it), plus catch-up for a question raised before
+ *    the joiner arrived.
+ *
+ * 9. THE REQUESTED LOCAL PORT NAMES THE FORWARD. `forwardKey` was three parts,
+ *    so a second rule onto the same target through a DIFFERENT local port took
+ *    the reuse branch: it was handed the first rule's bound port and the first
+ *    rule's claim, and nothing reported it. A rule pinned to 18081 ran on 18080
+ *    and looked fine. Both directions matter - two callers asking for the SAME
+ *    port (including 0, which is what the RDP path always sends) must still
+ *    share one forward, or the reuse contract is gone.
+ *
+ * 10. STOP FREES THE PORT. An entry at zero references used to be kept, because
+ *    `ssh_forward_open` had no counterpart: the port stayed bound while the
+ *    session lived. With a Stop button on the page that is a rule whose own port
+ *    is still held, so the next Start asks for it and the bind fails.
+ *    `ssh_forward_close` closes one listener without touching the session, and
+ *    it takes the BOUND port - which for an auto-port rule is not the one that
+ *    was asked for.
+ *
+ * 11. AND THE RELEASE WAITS FOR IT. A release that resolved before the backend
+ *    had been told would let the page's Stop re-enable Start against a port that
+ *    is still bound. Only a stop while the dial is STILL IN FLIGHT can tell the
+ *    awaited form apart from a fired-and-forgotten one, which is what the last
+ *    `[stop]` fixture sets up.
+ *
+ * 12. AND THE CLOSE NAMES THE LISTENER ITS OWN OPEN BOUND. `ssh_forward_close`
+ *    used to be keyed by bound port alone, so a close still in flight named
+ *    whatever was listening on that port when it landed - a re-open's brand-new
+ *    listener included, which from the page reads as "Start silently does
+ *    nothing every other time". The open now answers with a GENERATION beside
+ *    the port and the close carries it back. This is a wire change and a wire
+ *    change half-lands silently, so `[wire]` below asserts the frontend really
+ *    SENDS the field: nothing else in the suite would notice a half where the
+ *    backend reads a generation the frontend never puts on the call.
+ */
+
+export {};
+
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { HOSTS_KEY, HOSTS_STORE_PATH, type SshHost } from "../src/modules/hosts/types";
+import type { SshExitReason } from "../src/modules/ssh/bridge";
+import type { SshShellOptions } from "../src/modules/ssh/tunnel";
+import {
+  SshAuthRejectedError,
+  SshLocalConnectError,
+} from "../src/modules/terminal/lib/ssh-exit-decision";
+import type { VaultAuthMode } from "../src/modules/vault/types";
+
+// ---------------------------------------------------------------------------
+// Stand-in for the Tauri IPC bridge `@tauri-apps/api` calls into.
+// ---------------------------------------------------------------------------
+
+type Call = { cmd: string; args: Record<string, unknown> };
+const calls: Call[] = [];
+const callbacks = new Map<number, (payload: unknown) => void>();
+let nextCallbackId = 1;
+
+/** The hosts store's contents. Every row here is an SSH host - `tunnel.ts` only
+ *  ever dials a bastion, and a saved id that names an RDP host is refused, not
+ *  cast. Mutable: pinning a fingerprint writes through this, which is how
+ *  prompt attribution is observed. */
+type Row = SshHost;
+let sshRows: Row[] = [];
+/** Keychain, keyed the way `vaultAccount` in `src/modules/vault/types.ts` builds it. */
+let secrets: Record<string, string> = {};
+
+/** `ssh_open` calls that have not been answered yet, so a test can park a dial
+ *  the way a real host-key prompt does. */
+type ParkedOpen = {
+  input: Record<string, unknown>;
+  channelId: number;
+  resolve: (id: number) => void;
+  reject: (e: unknown) => void;
+};
+let parkedOpens: ParkedOpen[] = [];
+/** When false, `ssh_open` hangs until a test resolves it by hand. */
+let autoAnswerOpen = true;
+let nextSessionId = 100;
+let nextLocalPort = 45000;
+let nextShellId = 1;
+/** When set, `ssh_forward_close` hangs and queues its answer here instead. */
+let parkedForwardCloses: (() => void)[] | null = null;
+/**
+ * Generations the harness has handed out, per session id, the way
+ * `SshSession::forward_seq` mints them: from 1, monotonic, and never reused
+ * within one session.
+ *
+ * PER SESSION and not one global counter, because the two are
+ * indistinguishable for a fixture that only ever compares numbers it was
+ * handed - and a global one would let a close that named the right generation
+ * on the WRONG session pass, which is precisely the pairing the backend's
+ * per-session counter makes impossible.
+ */
+const forwardGenerations = new Map<number, number>();
+
+/** Where `appDataDir()` resolves for this harness. */
+const APP_DATA_DIR = "/verify-app-data";
+const HOSTS_FILE = `${APP_DATA_DIR}/${HOSTS_STORE_PATH}`;
+/** Every store file other than the host list - the `.bak` snapshot, mostly.
+ *  Kept as raw text because nothing here inspects it. */
+const otherStoreFiles = new Map<string, string>();
+/** Live `plugin:event|listen` subscriptions, by their event id, holding the
+ *  `transformCallback` id to fire. */
+const eventListeners = new Map<number, number>();
+
+async function handleInvoke(cmd: string, args: Record<string, unknown>): Promise<unknown> {
+  calls.push({ cmd, args });
+  switch (cmd) {
+    // The host store is a whole JSON file read and written through these two
+    // commands (`lib/fileKeyValueStore.ts`), not a key/value plugin. `sshRows`
+    // stays the harness's view of it so a test can still seed and inspect rows.
+    case "plugin:path|resolve_directory":
+      return APP_DATA_DIR;
+    case "fs_read_file": {
+      const path = args.path as string;
+      const content =
+        path === HOSTS_FILE ? JSON.stringify({ [HOSTS_KEY]: sshRows }) : otherStoreFiles.get(path);
+      // Absent is an ERROR from the real command, and `tauriStoreFileIo.read`'s
+      // catch is what sorts it into `missing`. It sorts on the `(os error N)`
+      // suffix, so the wording is load-bearing: without it this reads as a file
+      // that is there and would not open. Returning a value here would be read
+      // as corruption instead.
+      if (content === undefined) throw new Error("No such file or directory (os error 2)");
+      return { kind: "text", content, size: content.length };
+    }
+    case "fs_write_file": {
+      const path = args.path as string;
+      const content = args.content as string;
+      if (path === HOSTS_FILE) {
+        const parsed = JSON.parse(content) as Record<string, unknown>;
+        sshRows = (parsed[HOSTS_KEY] as Row[] | undefined) ?? [];
+      } else otherStoreFiles.set(path, content);
+      return undefined;
+    }
+    case "plugin:event|emit":
+      return undefined;
+    case "plugin:event|listen": {
+      // Registered for real, not stubbed away: the store's cache is dropped by
+      // a change event and nothing else, so a harness that swallowed these would
+      // hold the first `reset`'s rows for the whole run.
+      const id = nextCallbackId++;
+      eventListeners.set(id, args.handler as number);
+      return id;
+    }
+    case "plugin:event|unlisten":
+      eventListeners.delete(args.eventId as number);
+      return undefined;
+    case "secrets_get_all":
+      return (args.accounts as string[]).map((a) => secrets[a] ?? null);
+    case "ssh_open": {
+      const channelId = (args.onEvent as { id: number }).id;
+      const input = args.input as Record<string, unknown>;
+      const id = await new Promise<number>((resolve, reject) => {
+        parkedOpens.push({ input, channelId, resolve, reject });
+        if (autoAnswerOpen) resolve(nextSessionId++);
+      });
+      return { id, fingerprint: `SHA256:served-${id}` };
+    }
+    case "ssh_shell_open":
+      return nextShellId++;
+    case "ssh_shell_write":
+    case "ssh_shell_resize":
+    case "ssh_shell_close":
+      return undefined;
+    // Answers the way `session.rs`'s forward does: a pinned port is bound
+    // literally and comes back as itself, while `0` means "the OS picks" and
+    // comes back as whatever it chose. Returning a fresh number either way
+    // would make the port ASKED FOR and the port BOUND indistinguishable, and
+    // `ssh_forward_close` takes the bound one.
+    //
+    // And it answers with a GENERATION beside the port, because
+    // `SshForwardHandle` is a pair: a mock that returned the bare port would
+    // typecheck through `invoke`'s generic and leave every close below carrying
+    // `undefined` for the field the backend compares.
+    case "ssh_forward_open": {
+      const session = args.id as number;
+      const generation = forwardGenerations.get(session) ?? 1;
+      forwardGenerations.set(session, generation + 1);
+      return { boundPort: (args.localPort as number) || nextLocalPort++, generation };
+    }
+    case "ssh_forward_close":
+      if (parkedForwardCloses) {
+        // Executor form, like `ssh_open`'s stub above: this tsconfig's lib
+        // predates `Promise.withResolvers`.
+        const queue = parkedForwardCloses;
+        return new Promise((resolve) => queue.push(() => resolve(true)));
+      }
+      return true;
+    case "ssh_close":
+      return undefined;
+    case "ssh_confirm_host_key":
+      return undefined;
+    default:
+      throw new Error(`unexpected command in this harness: ${cmd}`);
+  }
+}
+
+(globalThis as { window?: unknown }).window = {
+  __TAURI_INTERNALS__: {
+    transformCallback: (cb: (payload: unknown) => void) => {
+      const id = nextCallbackId++;
+      callbacks.set(id, cb);
+      return id;
+    },
+    unregisterCallback: (id: number) => callbacks.delete(id),
+    invoke: (cmd: string, args: Record<string, unknown>) => handleInvoke(cmd, args ?? {}),
+  },
+};
+
+const { closeForwardForConnection, openForwardForConnection, openShellForConnection } =
+  await import("../src/modules/ssh/tunnel");
+const { openRdpDialTarget, rdpOpenInput } = await import("../src/modules/rdp/dial");
+const { useHostKeyPrompt } = await import("../src/modules/ssh/hostKeyPrompt");
+type RdpHostFixture = Parameters<typeof rdpOpenInput>[0];
+
+// ---------------------------------------------------------------------------
+
+let failed = 0;
+function check(label: string, got: unknown, want: unknown): void {
+  if (JSON.stringify(got) === JSON.stringify(want)) {
+    console.log(`  ok: ${label}`);
+  } else {
+    console.error(`  FAIL: ${label} = ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+    failed++;
+  }
+}
+function assert(cond: boolean, msg: string): void {
+  if (cond) console.log(`  ok: ${msg}`);
+  else {
+    console.error(`  FAIL: ${msg}`);
+    failed++;
+  }
+}
+
+/** Let every queued microtask and store write settle. The pin path is
+ *  read-modify-write through a serialized queue, so one tick is not enough. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0));
+}
+
+/**
+ * Emit one backend event on a dial's event channel, the way the Rust side does.
+ *
+ * Tauri's `Channel` keys ordering off `index` and QUEUES anything out of turn,
+ * so a second event reusing index 0 is silently swallowed - hence a counter per
+ * channel rather than a literal at each call site.
+ */
+const emittedPerChannel = new Map<number, number>();
+function emitOnChannel(channelId: number, message: Record<string, unknown>): void {
+  const index = emittedPerChannel.get(channelId) ?? 0;
+  emittedPerChannel.set(channelId, index + 1);
+  callbacks.get(channelId)!({ index, message });
+}
+/** Emit on a parked `ssh_open`'s own channel - the common case below. */
+function emitOn(open: ParkedOpen, message: Record<string, unknown>): void {
+  emitOnChannel(open.channelId, message);
+}
+
+function countOf(cmd: string): number {
+  return calls.filter((c) => c.cmd === cmd).length;
+}
+function lastOf(cmd: string): Call | undefined {
+  return [...calls].reverse().find((c) => c.cmd === cmd);
+}
+/** Every call of `cmd`, in the order the module made them, so a check can say
+ *  what each one carried rather than only what the last one did. Two forwards
+ *  differ in their arguments and not in their count, so a count alone would
+ *  pass on two binds of the same port. */
+function allOf(cmd: string): Call[] {
+  return calls.filter((c) => c.cmd === cmd);
+}
+
+type RowOverrides = Partial<Omit<SshHost, "id" | "protocol" | "credential">> & {
+  id: string;
+  user?: string;
+  authMode?: VaultAuthMode;
+  hasPassword?: boolean;
+  hasPrivateKey?: boolean;
+  hasKeyPassphrase?: boolean;
+};
+
+/** One saved SSH host. The credential's `hostId` always tracks the row's own
+ *  `id` - the store refuses a mismatch, and a fixture that got this wrong would
+ *  fail every scenario below for the wrong reason. */
+function row(over: RowOverrides): Row {
+  const {
+    id,
+    user = "ubuntu",
+    authMode = "agent",
+    hasPassword = false,
+    hasPrivateKey = false,
+    hasKeyPassphrase = false,
+    ...base
+  } = over;
+  return {
+    protocol: "ssh",
+    name: id,
+    host: `${id}.example.com`,
+    port: 22,
+    lastFingerprint: `SHA256:pin-${id}`,
+    ...base,
+    id,
+    credential: {
+      kind: "inline",
+      hostId: id,
+      user,
+      authMode,
+      hasPassword,
+      hasPrivateKey,
+      hasKeyPassphrase,
+    },
+  };
+}
+
+/** Fresh world: no calls recorded, no live sessions. Every scenario below ends
+ *  by releasing what it opened, so the module's own maps start empty too. */
+function reset(rows: Row[]): void {
+  calls.length = 0;
+  parkedOpens = [];
+  autoAnswerOpen = true;
+  parkedForwardCloses = null;
+  secrets = {};
+  sshRows = rows;
+  // Replacing the file behind a live store is what another window's commit
+  // looks like, so say so. Without this the whole-file store keeps the rows it
+  // read first and every scenario after the first is dialling the wrong world.
+  for (const handler of eventListeners.values()) {
+    callbacks.get(handler)?.({ event: "tervia://hosts-changed", id: handler, payload: null });
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("[auth] the connect payload carries references, never a plaintext");
+// `sshKeychainCredentials(mode, fields, service, owner)`
+// (`src/modules/vault/resolve.ts`), reached from `dialSession`'s
+// `resolveSshAuth` call. This is the only place a real `ssh_open` payload is
+// captured end to end, so it is where "no saved SSH secret enters the webview"
+// is actually observed rather than argued.
+{
+  reset([row({ id: "c-pass", authMode: "password", hasPassword: true })]);
+  secrets["c-pass::password"] = "s3cret";
+  const forward = await openForwardForConnection("c-pass", "10.0.0.9", 3389);
+  const input = lastOf("ssh_open")?.args.input as Record<string, unknown>;
+  check("a password connection sends a reference to its password", input.password, {
+    kind: "keychain",
+    service: "tervia-hosts",
+    account: "c-pass::password",
+  });
+  // The seeded plaintext is still in the fake keychain; the dial never asked
+  // for it. That is the whole property, and it is free to check here because
+  // the harness records every invoke.
+  check("having read no secret at all", countOf("secrets_get_all"), 0);
+  check("and not the agent", input.useAgent, false);
+  check("and no key", [input.privateKey, input.privateKeyPassphrase], [null, null]);
+  check(
+    "pinned, so a changed key fails instead of prompting",
+    input.expectedFingerprint,
+    "SHA256:pin-c-pass",
+  );
+  check("a forward dial opens no shell", countOf("ssh_shell_open"), 0);
+  const fwd = lastOf("ssh_forward_open")?.args;
+  check(
+    "the forward binds an OS-chosen local port to the target",
+    [fwd?.localPort, fwd?.remoteHost, fwd?.remotePort],
+    [0, "10.0.0.9", 3389],
+  );
+  await closeForwardForConnection("c-pass", "10.0.0.9", 3389, 0, forward.claim);
+}
+{
+  reset([row({ id: "c-key", authMode: "key", hasPrivateKey: true, hasKeyPassphrase: true })]);
+  secrets["c-key::privateKey"] = "-----BEGIN OPENSSH PRIVATE KEY-----";
+  secrets["c-key::keyPassphrase"] = "hunter2";
+  const forward = await openForwardForConnection("c-key", "10.0.0.9", 3389);
+  const input = lastOf("ssh_open")?.args.input as Record<string, unknown>;
+  check(
+    "a key connection references the key and its passphrase",
+    [input.privateKey, input.privateKeyPassphrase],
+    [
+      { kind: "keychain", service: "tervia-hosts", account: "c-key::privateKey" },
+      { kind: "keychain", service: "tervia-hosts", account: "c-key::keyPassphrase" },
+    ],
+  );
+  check("without reading the key body", countOf("secrets_get_all"), 0);
+  check("and no password", input.password, null);
+  await closeForwardForConnection("c-key", "10.0.0.9", 3389, 0, forward.claim);
+}
+{
+  reset([row({ id: "c-agent" })]);
+  const forward = await openForwardForConnection("c-agent", "10.0.0.9", 3389);
+  const input = lastOf("ssh_open")?.args.input as Record<string, unknown>;
+  check(
+    "an agent connection asks for the agent and nothing else",
+    [input.useAgent, input.password, input.privateKey],
+    [true, null, null],
+  );
+  await closeForwardForConnection("c-agent", "10.0.0.9", 3389, 0, forward.claim);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[sharing] two forwards over one bastion cost ONE session");
+{
+  reset([row({ id: "c-bastion" })]);
+  const a = await openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  const b = await openForwardForConnection("c-bastion", "10.10.11.30", 5432);
+  check("one dial", countOf("ssh_open"), 1);
+  check("two forwards", countOf("ssh_forward_open"), 2);
+  assert(a.localPort !== b.localPort, "each target gets its own local port");
+  check("on the same session", a.sessionId, b.sessionId);
+
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, a.claim);
+  check("releasing one forward does not close the session", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.10.11.30", 5432, 0, b.claim);
+  await settle();
+  check("the last one does", countOf("ssh_close"), 1);
+
+  // And the session is forgotten with it, so the next consumer dials afresh
+  // rather than being handed a port nothing is listening on.
+  const later = await openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  check("a later consumer opens a new session", countOf("ssh_open"), 2);
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, later.claim);
+}
+
+// ---------------------------------------------------------------------------
+console.log(
+  "\n[local ports] two rules onto one target through different local ports are two forwards",
+);
+// `forwardKey` was `connId|host|port`, so the local port a caller ASKED FOR was
+// no part of a forward's identity. The second rule took the reuse branch, was
+// handed the first one's bound port and the first one's claim, and nothing
+// reported it: a rule pinned to 18081 ran on 18080 and looked fine.
+{
+  reset([row({ id: "c-bastion" })]);
+  const a = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, { localPort: 18080 });
+  const b = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, { localPort: 18081 });
+  check("two forwards, not one reused", countOf("ssh_forward_open"), 2);
+  check(
+    "each one asked the backend for its OWN port, in order",
+    allOf("ssh_forward_open").map((c) => c.args.localPort),
+    [18080, 18081],
+  );
+  check("and a pinned port is bound literally", [a.localPort, b.localPort], [18080, 18081]);
+  assert(a.claim !== b.claim, "two entries, so two claims - a release names one of them");
+  check("over one session", [countOf("ssh_open"), a.sessionId === b.sessionId], [1, true]);
+
+  // Each rule releases with its own port AND its own claim: the port finds the
+  // entry, the claim proves it is the one this caller took its reference from.
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, a.claim);
+  await settle();
+  check("releasing one rule leaves the other's session up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18081, b.claim);
+  await settle();
+  check("and the second one closes it - neither reference was lost", countOf("ssh_close"), 1);
+}
+{
+  // The other direction, so the fix is not over-applied into "a forward per
+  // caller". `0` is a value like any other in the key and means "the OS picks":
+  // two auto-port callers onto one target legitimately share one forward, which
+  // is what the RDP path has always done.
+  reset([row({ id: "c-bastion" })]);
+  const a = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  const b = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  check("two auto-port callers share one forward", countOf("ssh_forward_open"), 1);
+  check("one entry, so one claim", a.claim, b.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, a.claim);
+  await settle();
+  check("the first of them letting go leaves the session up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, b.claim);
+  await settle();
+  check("the second closes it", countOf("ssh_close"), 1);
+}
+{
+  // Same again for a pinned port, which is the case a rule actually is: two
+  // consumers of ONE rule reuse its listener rather than fighting over the bind.
+  reset([row({ id: "c-bastion" })]);
+  const a = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, { localPort: 18080 });
+  const b = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, { localPort: 18080 });
+  check("and so do two callers pinning the SAME port", countOf("ssh_forward_open"), 1);
+  check(
+    "one entry, one claim, one port",
+    [a.claim === b.claim, a.localPort, b.localPort],
+    [true, 18080, 18080],
+  );
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, a.claim);
+  await settle();
+  check("the first release leaves it up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, b.claim);
+  await settle();
+  check("the second closes it", countOf("ssh_close"), 1);
+}
+{
+  // The rest of the key still counts, and this is the half nothing else pins:
+  // the `[sharing]` group's two targets differ in HOST as well as port, so a key
+  // that dropped `remotePort` would still tell them apart there. Two ports on
+  // ONE remote host through auto-ports is the case that catches it - a database
+  // and an SSH shell on the same box behind a bastion.
+  reset([row({ id: "c-bastion" })]);
+  const db = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  const shell = await openForwardForConnection("c-bastion", "10.0.0.9", 22);
+  check("two remote ports on one host are two forwards", countOf("ssh_forward_open"), 2);
+  assert(db.localPort !== shell.localPort, "each with a local port of its own");
+  assert(db.claim !== shell.claim, "and an entry of its own");
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, db.claim);
+  await settle();
+  check("releasing one leaves the other up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 22, 0, shell.claim);
+  await settle();
+  check("and the second closes the session", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[stop] releasing the last reference frees the port");
+// An entry at zero references used to be KEPT, because `ssh_forward_open` had no
+// counterpart and the port stayed bound while the session lived. With a Stop
+// button on the page that is a rule whose own port is still held, so the next
+// Start asks for it and the bind fails - the exact complaint
+// `ssh_forward_close` was added for.
+{
+  reset([row({ id: "c-bastion" })]);
+  // A SECOND rule on the same bastion, so the session outlives the stop. Without
+  // it the last release calls `dropSession`, which clears the map wholesale, and
+  // the rebind below would pass even with the entry kept at zero refs.
+  const keep = await openForwardForConnection("c-bastion", "10.0.0.9", 22, { localPort: 18443 });
+  const stopped = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, stopped.claim);
+  await settle();
+  check("the backend is told to close ONE listener", countOf("ssh_forward_close"), 1);
+  // The port is written out rather than read back off `stopped`, so a close that
+  // named the session's other listener - or a forward re-opened on an OS-chosen
+  // port - is a failure and not a tautology. Same for the generation: `stopped`
+  // is the SECOND open on this session (`keep` took the first), so 2 is the
+  // number the backend must have answered with and reading `stopped.generation`
+  // would assert only that the module echoed something.
+  check(
+    "naming the session, the port that was bound, and that bind's generation",
+    lastOf("ssh_forward_close")?.args,
+    {
+      id: stopped.sessionId,
+      boundPort: 18080,
+      generation: 2,
+    },
+  );
+  check("and the session stays up for the rule that is still running", countOf("ssh_close"), 0);
+
+  // Start again. The entry went with the port, so this binds rather than being
+  // handed a port nothing is listening on.
+  const restarted = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  check("a later Start binds the port again", countOf("ssh_forward_open"), 3);
+  assert(restarted.claim !== stopped.claim, "as a new entry, with a claim of its own");
+  check("still on the one session", countOf("ssh_open"), 1);
+
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, restarted.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 22, 18443, keep.claim);
+  await settle();
+  check("both listeners closed in the end", countOf("ssh_forward_close"), 3);
+  check("and the session with the last of them", countOf("ssh_close"), 1);
+}
+{
+  // A teardown that fires twice. The entry is deleted the moment its last
+  // reference goes, so the second call has nothing to find - and either way it
+  // must not tell the backend to close that port again, which after a Start
+  // would be the NEW listener's.
+  reset([row({ id: "c-bastion" })]);
+  const one = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, { localPort: 18080 });
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, one.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, one.claim);
+  await settle();
+  check("one close reaches the backend, not two", countOf("ssh_forward_close"), 1);
+  check("and one session close", countOf("ssh_close"), 1);
+}
+{
+  // The same stray release with the SESSION still up, which is the shape the
+  // `[reuse]` group cannot express: there the last release closes the session,
+  // so `dropSession` clears the map wholesale and the extra call has nothing to
+  // find for that reason instead of this one.
+  //
+  // Two things have to hold together here. The entry is DELETED at zero refs, so
+  // the stray call finds nothing; and the refs-at-zero guard above the decrement
+  // still refuses one that does. Keep the entry and drop the guard and this is a
+  // second decrement landing on the SESSION - which is at one reference for the
+  // rule still running, so the stray teardown of a stopped rule takes the live
+  // one's bastion with it.
+  reset([row({ id: "c-bastion" })]);
+  const keep = await openForwardForConnection("c-bastion", "10.0.0.9", 22, { localPort: 18443 });
+  const stopped = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, stopped.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, stopped.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, stopped.claim);
+  await settle();
+  check(
+    "one listener closed, however many times the teardown fires",
+    countOf("ssh_forward_close"),
+    1,
+  );
+  check("and the rule still running keeps its bastion", countOf("ssh_close"), 0);
+
+  // Which the survivor then closes on its own, so the guard has not simply
+  // disabled releasing.
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 22, 18443, keep.claim);
+  await settle();
+  check("until it lets go itself", [countOf("ssh_forward_close"), countOf("ssh_close")], [2, 1]);
+}
+{
+  // The auto-port case, and it is the one that separates the port ASKED FOR from
+  // the port BOUND: a rule that pins nothing sends 0 and the backend answers
+  // with what it chose. `ssh_forward_close` takes the bound one - 0 names no
+  // listener, and a close carrying it would leave the port held.
+  reset([row({ id: "c-bastion" })]);
+  const auto = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  assert(auto.localPort > 0, "the OS picked a port");
+  check("which is not the one that was asked for", lastOf("ssh_forward_open")?.args.localPort, 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, auto.claim);
+  await settle();
+  check(
+    "and the close names the BOUND port, not the requested 0",
+    lastOf("ssh_forward_close")?.args,
+    {
+      id: auto.sessionId,
+      boundPort: auto.localPort,
+      // The only open on this session, so the first generation it mints.
+      generation: 1,
+    },
+  );
+}
+{
+  // The claim's second consequence. `dropSession` deletes a connection's entries
+  // when the bastion dies and the next consumer builds fresh ones under the same
+  // key, so a release that only matched the key would hand the SUCCESSOR's bound
+  // port to `ssh_forward_close` - dropping a listener the new pane is using, on
+  // a port it legitimately re-bound.
+  reset([row({ id: "c-bastion" })]);
+  const paneA = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  emitOn(parkedOpens[0], { type: "disconnected" });
+  await settle();
+  const paneB = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  assert(paneA.claim !== paneB.claim, "the re-created entry is a different generation");
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, paneA.claim);
+  await settle();
+  check("pane A's stale release closes no listener at all", countOf("ssh_forward_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, paneB.claim);
+  await settle();
+  check("pane B's own release closes its own", countOf("ssh_forward_close"), 1);
+  // Generation 1, because the bastion died and pane B's forward is the first on
+  // a BRAND-NEW session - so it carries the same generation pane A's did on the
+  // old one. The session id is what separates them here, which is the whole
+  // reason the backend's counter is per session and a close names both.
+  check("naming pane B's session", lastOf("ssh_forward_close")?.args, {
+    id: paneB.sessionId,
+    boundPort: 18080,
+    generation: 1,
+  });
+}
+{
+  // A close and a re-open in the SAME tick: the entry is deleted before the
+  // backend is told anything, so the caller that re-creates it under the same
+  // key owns what it built. The in-flight close must not take the new entry with
+  // it - `forwards.delete` is guarded on the entry still being ours for exactly
+  // this interleaving.
+  reset([row({ id: "c-bastion" })]);
+  const keep = await openForwardForConnection("c-bastion", "10.0.0.9", 22, { localPort: 18443 });
+  const first = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  // Not awaited: the release is synchronous down to the delete, and the close it
+  // schedules on the backend runs a microtask later.
+  const releasing = closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, first.claim);
+  const second = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  await releasing;
+  await settle();
+  assert(second.claim !== first.claim, "the re-open built a new entry");
+  const third = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  check("which survived the close that was already in flight", third.claim, second.claim);
+  check("so a third caller reuses it instead of rebinding", countOf("ssh_forward_open"), 3);
+
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, second.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, third.claim);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 22, 18443, keep.claim);
+  await settle();
+  check("and every listener is closed once", countOf("ssh_forward_close"), 3);
+}
+{
+  // The release WAITS for the backend, rather than firing the close and
+  // resolving on the spot. That is this module's contract to the page's Stop,
+  // which will not let the row offer Start again until the release resolves: a
+  // Stop that returned early would re-enable Start against a port still bound.
+  //
+  // What the await does NOT have to carry any more is the stale close itself -
+  // the generation does that, and `[wire]` below is where it is asserted. The
+  // two are separate properties and this fixture is about the first one.
+  //
+  // Every fixture above closes a forward whose open has already RESOLVED, and
+  // for those the fire-and-forget form is INDISTINGUISHABLE from this one: its
+  // `.then` callback is queued on an already-settled promise, so it runs before
+  // the caller's own `await` resumes and the count has arrived either way. What
+  // separates them is a stop while the dial is still IN FLIGHT - which is the
+  // honest reading of the port's lifetime, since the port is not free until the
+  // open that binds it has finished.
+  reset([row({ id: "c-bastion" }), row({ id: "c-parked" })]);
+  // A claim only ever comes out of a RESOLVED `SshForward`, so an entry whose
+  // open is still parked has none that a caller could be holding. Claims are
+  // monotonic and never reused (`nextClaim` in `src/modules/ssh/tunnel.ts`), so
+  // the entry built next
+  // carries this one's plus one - which is how this fixture can name an entry it
+  // cannot await. The page reaches the same state legitimately: its Start
+  // publishes nothing until the open resolves, and its Stop then finds no claim
+  // recorded at all.
+  const probe = await openForwardForConnection("c-bastion", "10.0.0.9", 22, { localPort: 18443 });
+  autoAnswerOpen = false;
+  const opening = openForwardForConnection("c-parked", "10.0.0.9", 5432, { localPort: 18080 });
+  await settle();
+  check("a second bastion's dial is parked mid-handshake", parkedOpens.length, 2);
+
+  const stopping = closeForwardForConnection("c-parked", "10.0.0.9", 5432, 18080, probe.claim + 1);
+  // The parked handshake finishes, the way it does when the user finally answers
+  // a host-key question - or when a teardown abandons it and the dial fails.
+  const parkedSession = nextSessionId++;
+  parkedOpens[1].resolve(parkedSession);
+  await stopping;
+  // No `settle()` here on purpose: a settle would let the fire-and-forget form's
+  // microtask land too, and the claim is about WHEN this call resolves.
+  check("the close is awaited, not fired and forgotten", countOf("ssh_forward_close"), 1);
+  // Generation 1: the parked dial's session is fresh and this is its only
+  // forward. Written out rather than read off `late` below, because `late` has
+  // not resolved yet at this point and awaiting it would settle the very
+  // microtask this fixture is holding back.
+  check("naming the port the parked open went on to bind", lastOf("ssh_forward_close")?.args, {
+    id: parkedSession,
+    boundPort: 18080,
+    generation: 1,
+  });
+
+  // The abandoned Start still resolves - it bound its port before the release
+  // reached it - and its claim now names an entry nobody holds, which is
+  // exactly why the page's Start hands it straight back.
+  const late = await opening;
+  check(
+    "the open it was racing still resolves",
+    [late.localPort, late.claim],
+    [18080, probe.claim + 1],
+  );
+  await settle();
+  check("and the abandoned dial's session is closed with it", countOf("ssh_close"), 1);
+
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 22, 18443, probe.claim);
+  await settle();
+  check("the other bastion closes on its own release", countOf("ssh_close"), 2);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[reuse] a second consumer of the SAME target takes its own reference");
+// The defect this replaces: reuse returned a port without incrementing, so the
+// first close tore the session out from under the second consumer.
+{
+  reset([row({ id: "c-bastion" })]);
+  const first = await openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  const second = await openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  check("the port is reused, not rebound", countOf("ssh_forward_open"), 1);
+  check("both consumers get the same forward", first, second);
+
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, first.claim);
+  await settle();
+  check("the first consumer letting go leaves the session up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, second.claim);
+  await settle();
+  check("the second one closes it", countOf("ssh_close"), 1);
+
+  // Over-release is the mirror image of the same bug: a stray extra close must
+  // not spend a reference this target does not hold.
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, second.claim);
+  await closeForwardForConnection("c-bastion", "never.opened", 3389, 0, second.claim);
+  await settle();
+  check("releasing more than was taken closes nothing extra", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[reincarnation] a stale release cannot spend a NEW entry's reference");
+// The over-release above is the SPENT case, which the refs-at-zero guard
+// catches. This is the re-created one, which it cannot: `dropSession` deletes
+// both entries when the bastion dies, and the next consumer of the same target
+// builds fresh ones under the same key.
+{
+  reset([row({ id: "c-bastion" })]);
+  const paneA = await openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  check("pane A dials", countOf("ssh_open"), 1);
+
+  // The bastion drops on its own: the session channel's `disconnected` fires
+  // and `dropSession` clears both maps. Pane A is told nothing - its RDP
+  // session is still riding the dead forward, and a parked TCP connection
+  // only fails on a keepalive, so its own `disconnected` can lag by a long
+  // way.
+  emitOn(parkedOpens[0], { type: "disconnected" });
+  await settle();
+
+  // Pane B opens the same target (or the user hits Reconnect): fresh session,
+  // fresh forward, SAME key.
+  const paneB = await openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  check("pane B gets a second session, not the dead one", countOf("ssh_open"), 2);
+  assert(paneA.claim !== paneB.claim, "and a claim of its own, because it is a different entry");
+
+  // Pane A's teardown finally fires. Keyed by target this found pane B's entry
+  // at one reference, decremented it to zero and closed pane B's bastion out
+  // from under it - a black pane for the survivor.
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, paneA.claim);
+  await settle();
+  check("pane A's late release closes nothing", countOf("ssh_close"), 0);
+  // Nor does a token that names no entry at all.
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, -1);
+  await settle();
+  check("and neither does a claim from nowhere", countOf("ssh_close"), 0);
+
+  // The guard must not have simply disabled releasing.
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, paneB.claim);
+  await settle();
+  check("pane B's own release still closes its session", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[concurrency] two connects in one tick share one dial");
+{
+  reset([row({ id: "c-bastion" })]);
+  autoAnswerOpen = false;
+  const first = openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  const second = openForwardForConnection("c-bastion", "10.10.11.30", 3389);
+  await settle();
+  check("only one dial is in flight", parkedOpens.length, 1);
+  parkedOpens[0].resolve(nextSessionId++);
+  const [a, b] = await Promise.all([first, second]);
+  check(
+    "both rode the same session",
+    [countOf("ssh_open"), a.sessionId === b.sessionId],
+    [1, true],
+  );
+
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, a.claim);
+  check("and one of them letting go does not close it", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.10.11.30", 3389, 0, b.claim);
+  await settle();
+  check("the second does", countOf("ssh_close"), 1);
+}
+{
+  // Same tick, same TARGET: two panes on one host behind one bastion, restored
+  // together. Both must land on one bound port and one session, and both
+  // references must be releasable - the failure mode being one port bound twice
+  // and a map entry that replaces the other consumer's, so its release finds
+  // nothing and the session is never closed.
+  reset([row({ id: "c-bastion" })]);
+  autoAnswerOpen = false;
+  const first = openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  const second = openForwardForConnection("c-bastion", "10.10.11.26", 3389);
+  await settle();
+  parkedOpens[0].resolve(nextSessionId++);
+  const [a, b] = await Promise.all([first, second]);
+  check(
+    "one dial, one bind, one port",
+    [countOf("ssh_open"), countOf("ssh_forward_open"), a.localPort === b.localPort],
+    [1, 1, true],
+  );
+
+  check("and one claim, because it is one entry", a.claim, b.claim);
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, a.claim);
+  await settle();
+  check("the first release leaves it up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.10.11.26", 3389, 0, b.claim);
+  await settle();
+  check("and the second one closes it - neither reference was lost", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[trust] an unverified bastion refuses by default");
+{
+  reset([row({ id: "c-nopin", name: "jump box", lastFingerprint: undefined })]);
+  let message = "";
+  await openForwardForConnection("c-nopin", "10.10.11.26", 3389).catch((e) => {
+    message = e instanceof Error ? e.message : String(e);
+  });
+  assert(message.includes("no verified host key yet"), "it refuses, with the reason");
+  assert(message.includes("jump box"), "and names the host by its saved name");
+  check("nothing was dialled", countOf("ssh_open"), 0);
+}
+{
+  // A pinned target reached through an UNPINNED jump host is the same hazard one
+  // hop further out: `resolveJumpHops` would send no expected fingerprint for
+  // that hop, the backend would raise a prompt, and a caller that cannot show
+  // one leaves it parked for the full confirm timeout.
+  reset([
+    row({ id: "c-target", proxyJumpId: "c-hop" }),
+    row({ id: "c-hop", name: "entry", lastFingerprint: undefined }),
+  ]);
+  let message = "";
+  await openForwardForConnection("c-target", "10.10.11.26", 3389).catch((e) => {
+    message = e instanceof Error ? e.message : String(e);
+  });
+  assert(message.includes("entry"), "an unpinned JUMP host refuses too, naming the hop");
+  check("and still nothing was dialled", countOf("ssh_open"), 0);
+}
+
+// ---------------------------------------------------------------------------
+console.log(
+  "\n[trust] every local pre-dial refusal in dialSession is a typed SshLocalConnectError, not a bare Error - so controller.ts's backoff ladder parks it instead of retrying",
+);
+{
+  reset([]);
+  let error: unknown;
+  await openForwardForConnection("nowhere", "10.10.11.26", 3389).catch((e) => {
+    error = e;
+  });
+  assert(error instanceof SshLocalConnectError, "a missing connection id is typed local");
+  check("nothing was dialled", countOf("ssh_open"), 0);
+}
+{
+  const rdpOnlyRow: RdpHostFixture = {
+    id: "r-refused",
+    name: "win-refused",
+    host: "10.10.11.27",
+    port: 3389,
+    protocol: "rdp",
+    credential: {
+      kind: "inline",
+      hostId: "r-refused",
+      username: "Administrator",
+      hasPassword: true,
+    },
+    desktopWidth: 1280,
+    desktopHeight: 800,
+    sizeMode: "preset",
+  };
+  reset([rdpOnlyRow] as unknown as Row[]);
+  let error: unknown;
+  await openForwardForConnection("r-refused", "10.10.11.26", 3389).catch((e) => {
+    error = e;
+  });
+  assert(error instanceof SshLocalConnectError, "an RDP host is typed local, not merely refused");
+  check("nothing was dialled", countOf("ssh_open"), 0);
+}
+{
+  // A jump host the chain names but the store no longer has - `resolveJumpHops`
+  // (`hosts/jumps.ts`) throws a plain `Error` here; `dialSession`'s own
+  // whole-block catch is what attributes it as local rather than transport.
+  reset([row({ id: "c-target2", proxyJumpId: "c-gone" })]);
+  let error: unknown;
+  await openForwardForConnection("c-target2", "10.10.11.26", 3389).catch((e) => {
+    error = e;
+  });
+  assert(error instanceof SshLocalConnectError, "a removed jump host is typed local");
+  check("nothing was dialled", countOf("ssh_open"), 0);
+}
+{
+  // A credential binding `resolveSshAuth` (`vault/resolve.ts`) can no longer
+  // resolve - the identity itself was deleted. Also a plain `Error` before
+  // `dialSession`'s own catch.
+  const orphanRow: Row = {
+    id: "c-orphan",
+    protocol: "ssh",
+    name: "orphan",
+    host: "orphan.example.com",
+    port: 22,
+    lastFingerprint: "SHA256:pin-orphan",
+    credential: { kind: "identity", identityId: "gone" },
+  };
+  reset([orphanRow]);
+  let error: unknown;
+  await openForwardForConnection("c-orphan", "10.10.11.26", 3389).catch((e) => {
+    error = e;
+  });
+  assert(error instanceof SshLocalConnectError, "a deleted identity binding is typed local");
+  check("nothing was dialled", countOf("ssh_open"), 0);
+}
+
+console.log("\n[trust] a caller that can ask gets the prompt, and the pin lands");
+{
+  reset([row({ id: "c-nopin", lastFingerprint: undefined })]);
+  autoAnswerOpen = false;
+  const seen: string[] = [];
+  const opening = openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => seen.push(id),
+  });
+  await settle();
+  check("it dials", parkedOpens.length, 1);
+  check(
+    "with no expected fingerprint, so the backend asks instead of failing",
+    parkedOpens[0].input.expectedFingerprint,
+    null,
+  );
+
+  // The backend raises the question mid-handshake, before any credential.
+  emitOn(parkedOpens[0], {
+    type: "hostKeyPrompt",
+    promptId: "hk-1",
+    fingerprint: "SHA256:fresh",
+    host: "c-nopin.example.com",
+  });
+  check("the shared dialog queue has it", useHostKeyPrompt.getState().queue.length, 1);
+  check("and the caller was told the id, so a teardown can answer it", seen, ["hk-1"]);
+
+  useHostKeyPrompt.getState().resolve("hk-1", true);
+  await settle();
+  check("the backend hears the answer", lastOf("ssh_confirm_host_key")?.args, {
+    promptId: "hk-1",
+    accept: true,
+  });
+  check(
+    "and trusting it pins the key on the saved row",
+    sshRows.find((r) => r.id === "c-nopin")?.lastFingerprint,
+    "SHA256:fresh",
+  );
+
+  parkedOpens[0].resolve(nextSessionId++);
+  const forward = await opening;
+  assert(forward.localPort > 0, "the forward then opens as usual");
+  await closeForwardForConnection("c-nopin", "10.10.11.26", 3389, 0, forward.claim);
+  await settle();
+  check("and releases normally", countOf("ssh_close"), 1);
+}
+{
+  // Rejecting must leave nothing behind: no half-registered session, and the
+  // next attempt dials again rather than handing back a dead one.
+  reset([row({ id: "c-nopin", lastFingerprint: undefined })]);
+  autoAnswerOpen = false;
+  const opening = openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+  });
+  await settle();
+  parkedOpens[0].reject(new Error("ssh: host key rejected"));
+  let message = "";
+  await opening.catch((e) => {
+    message = e instanceof Error ? e.message : String(e);
+  });
+  assert(message.includes("rejected"), "the caller sees the rejection");
+  check("no forward was bound", countOf("ssh_forward_open"), 0);
+
+  autoAnswerOpen = true;
+  const retry = await openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+  });
+  check("and the next attempt dials a fresh session", countOf("ssh_open"), 2);
+  await closeForwardForConnection("c-nopin", "10.10.11.26", 3389, 0, retry.claim);
+}
+
+console.log("\n[trust] a caller that JOINS a dial learns its prompt ids too");
+{
+  // A DIFFERENT target, so the joiner re-enters `sessionFor` and takes its reuse
+  // branch. The question is already on screen when it arrives, which is the
+  // workspace-restore shape: the second pane's effect runs a tick later.
+  reset([row({ id: "c-nopin", lastFingerprint: undefined })]);
+  autoAnswerOpen = false;
+  const firstSeen: string[] = [];
+  const joinerSeen: string[] = [];
+  const lateSeen: string[] = [];
+  const first = openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => firstSeen.push(id),
+  });
+  await settle();
+  emitOn(parkedOpens[0], {
+    type: "hostKeyPrompt",
+    promptId: "hk-join",
+    fingerprint: "SHA256:fresh",
+    host: "c-nopin.example.com",
+  });
+  check("the caller that started the dial hears it", firstSeen, ["hk-join"]);
+
+  const joiner = openForwardForConnection("c-nopin", "10.10.11.30", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => joinerSeen.push(id),
+  });
+  await settle();
+  check("the joiner rides the one dial", parkedOpens.length, 1);
+  check("and is caught up on the question already on screen", joinerSeen, ["hk-join"]);
+  check(
+    "and it is still one prompt in the shared queue, not one per caller",
+    useHostKeyPrompt.getState().queue.length,
+    1,
+  );
+
+  // One answer serves both, because it is one handshake.
+  useHostKeyPrompt.getState().resolve("hk-join", true);
+  await settle();
+  check("answering it pins the key once", countOf("ssh_confirm_host_key"), 1);
+
+  // A caller arriving AFTER the answer is not handed a settled question: it has
+  // nothing to abandon, and the id would read as though it could undo a
+  // decision that is already made.
+  const late = openForwardForConnection("c-nopin", "10.10.11.31", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => lateSeen.push(id),
+  });
+  await settle();
+  check("a caller joining after the answer is told nothing", lateSeen, []);
+
+  parkedOpens[0].resolve(nextSessionId++);
+  const [a, b, c] = await Promise.all([first, joiner, late]);
+  check(
+    "all three rode one session",
+    [countOf("ssh_open"), a.sessionId === b.sessionId, b.sessionId === c.sessionId],
+    [1, true, true],
+  );
+  await closeForwardForConnection("c-nopin", "10.10.11.26", 3389, 0, a.claim);
+  await closeForwardForConnection("c-nopin", "10.10.11.30", 3389, 0, b.claim);
+  check("and it survives until the last of them lets go", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-nopin", "10.10.11.31", 3389, 0, c.claim);
+  await settle();
+  check("then closes", countOf("ssh_close"), 1);
+}
+{
+  // The SAME target, which reuses the forward and never reaches `sessionFor` -
+  // the commonest joiner there is, and the one that would otherwise learn no
+  // prompt ids at all.
+  reset([row({ id: "c-nopin", lastFingerprint: undefined })]);
+  autoAnswerOpen = false;
+  const seenA: string[] = [];
+  const seenB: string[] = [];
+  const paneA = openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => seenA.push(id),
+  });
+  const paneB = openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => seenB.push(id),
+  });
+  await settle();
+  check("one dial for both panes", parkedOpens.length, 1);
+  emitOn(parkedOpens[0], {
+    type: "hostKeyPrompt",
+    promptId: "hk-same",
+    fingerprint: "SHA256:fresh",
+    host: "c-nopin.example.com",
+  });
+  check("both panes on one target hear the question", [seenA, seenB], [["hk-same"], ["hk-same"]]);
+
+  useHostKeyPrompt.getState().resolve("hk-same", true);
+  await settle();
+  parkedOpens[0].resolve(nextSessionId++);
+  const [a, b] = await Promise.all([paneA, paneB]);
+  await closeForwardForConnection("c-nopin", "10.10.11.26", 3389, 0, a.claim);
+  await closeForwardForConnection("c-nopin", "10.10.11.26", 3389, 0, b.claim);
+  await settle();
+  check("and both references release normally", countOf("ssh_close"), 1);
+}
+{
+  // The accepted consequence, pinned so it stays a decision rather than a
+  // surprise: ANY caller riding one dial can fail it for all of them by
+  // abandoning, because a rejected host key aborts the shared handshake. That
+  // is the fail-safe direction - see `SshForwardOptions.onHostKeyPrompt` for why
+  // the alternative cannot be built on the refcount.
+  reset([row({ id: "c-nopin", lastFingerprint: undefined })]);
+  autoAnswerOpen = false;
+  const joinerSeen: string[] = [];
+  const first = openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+  });
+  const joiner = openForwardForConnection("c-nopin", "10.10.11.30", 3389, {
+    promptForHostKey: true,
+    onHostKeyPrompt: (id) => joinerSeen.push(id),
+  });
+  await settle();
+  emitOn(parkedOpens[0], {
+    type: "hostKeyPrompt",
+    promptId: "hk-abandon",
+    fingerprint: "SHA256:fresh",
+    host: "c-nopin.example.com",
+  });
+  check("the joiner has an id to abandon", joinerSeen, ["hk-abandon"]);
+
+  // The joiner's teardown, with the question still up. Before the fix it had
+  // nothing to abandon here, so the leak could only ever be closed by the other
+  // caller.
+  useHostKeyPrompt.getState().abandon("hk-abandon");
+  await settle();
+  check("the backend is told to reject", lastOf("ssh_confirm_host_key")?.args, {
+    promptId: "hk-abandon",
+    accept: false,
+  });
+  check("and the prompt leaves the shared queue", useHostKeyPrompt.getState().queue.length, 0);
+
+  // Which is the backend aborting the handshake both callers were riding.
+  parkedOpens[0].reject(new Error("ssh: host key rejected"));
+  const messages: string[] = [];
+  for (const p of [first, joiner]) {
+    await p.catch((e) => messages.push(e instanceof Error ? e.message : String(e)));
+  }
+  check("BOTH dials fail, deliberately", messages, [
+    "ssh: host key rejected",
+    "ssh: host key rejected",
+  ]);
+  check("nothing was bound", countOf("ssh_forward_open"), 0);
+
+  // And nothing is left behind, so Reconnect - which is what the cost of the
+  // rejection actually is - dials afresh and asks again.
+  autoAnswerOpen = true;
+  const again = await openForwardForConnection("c-nopin", "10.10.11.26", 3389, {
+    promptForHostKey: true,
+  });
+  check("a retry dials a fresh session", countOf("ssh_open"), 2);
+  await closeForwardForConnection("c-nopin", "10.10.11.26", 3389, 0, again.claim);
+  await settle();
+  check("and releases normally", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[dial] the tunnel changes the address and nothing else");
+
+const rdpRow: RdpHostFixture = {
+  id: "r-win",
+  name: "win-build-01",
+  host: "10.10.11.26",
+  port: 3389,
+  protocol: "rdp",
+  credential: {
+    kind: "inline",
+    hostId: "r-win",
+    username: "Administrator",
+    domain: "CORP",
+    hasPassword: true,
+  },
+  desktopWidth: 1280,
+  desktopHeight: 800,
+  sizeMode: "preset",
+  certFingerprint: "49:67:09:05",
+};
+
+{
+  const direct = await rdpOpenInput(rdpRow, { host: rdpRow.host, port: rdpRow.port });
+  const tunnelled = await rdpOpenInput(rdpRow, { host: "127.0.0.1", port: 45123 });
+  check("the address differs", [tunnelled.host, tunnelled.port], ["127.0.0.1", 45123]);
+  check(
+    "the pinned certificate does not",
+    [direct.expectedCertFingerprint, tunnelled.expectedCertFingerprint],
+    ["49:67:09:05", "49:67:09:05"],
+  );
+  check(
+    "and neither does anything else",
+    { ...direct, host: "", port: 0 },
+    { ...tunnelled, host: "", port: 0 },
+  );
+  check("the password travels as a keychain reference, never a value", direct.credential, {
+    kind: "keychain",
+    service: "tervia-hosts",
+    account: "r-win::password",
+  });
+}
+
+{
+  reset([row({ id: "c-bastion" })]);
+  const target = await openRdpDialTarget({ host: rdpRow.host, port: rdpRow.port });
+  check(
+    "a row with no tunnel dials the host itself",
+    [target.host, target.port, target.viaTunnel],
+    ["10.10.11.26", 3389, false],
+  );
+  await target.release();
+  await settle();
+  check("and releasing it touches no SSH session", countOf("ssh_open") + countOf("ssh_close"), 0);
+}
+
+{
+  reset([row({ id: "c-bastion" })]);
+  const tunnelled = { ...rdpRow, tunnel: { sshHostId: "c-bastion" } };
+  // Two panes on one host through one bastion - the shape the reuse defect
+  // broke, seen from the RDP side.
+  const one = await openRdpDialTarget(tunnelled);
+  const two = await openRdpDialTarget(tunnelled);
+  check("both dial loopback", [one.host, two.host], ["127.0.0.1", "127.0.0.1"]);
+  check("on the same forward", one.port, two.port);
+  check("over one session", countOf("ssh_open"), 1);
+  assert(one.viaTunnel && two.viaTunnel, "and both know they are tunnelled");
+
+  // Idempotent release: a pane's teardown fires it without knowing whether an
+  // error path already did, and a second release would spend the OTHER pane's
+  // reference.
+  await one.release();
+  await one.release();
+  await one.release();
+  await settle();
+  check("releasing one pane, twice over, leaves the other's tunnel up", countOf("ssh_close"), 0);
+  await two.release();
+  await settle();
+  check("the last pane out closes the session", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[wire] the close names the listener its own open bound");
+// The half this section exists for: `tsc` and `cargo check` both pass over a
+// tree where the backend reads a `generation` the frontend never sends, because
+// the field is then simply absent from the payload and nothing inspects the
+// payload until a real close runs on a real session. Nothing else in the suite
+// drives `ssh_forward_close`'s arguments across the IPC boundary at all.
+{
+  reset([row({ id: "c-bastion" })]);
+  // A second rule on the same bastion, so the session - and its generation
+  // counter - outlives the stop below. Without it every release closes the
+  // session, the next open dials a fresh one, and the re-open's generation
+  // starts from 1 again: the two closes would carry the same number and the
+  // last check here would pass for the wrong reason.
+  const keep = await openForwardForConnection("c-bastion", "10.0.0.9", 22, { localPort: 18443 });
+  const first = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  // Written out, not read back: 1 and 2 are what the session's counter must
+  // have answered for its first and second open, and reading `first.generation`
+  // into its own assertion would say only that the module echoes itself.
+  check("the open's generation reaches the caller", [keep.generation, first.generation], [1, 2]);
+
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, first.claim);
+  await settle();
+  // BY KEY as well as by value, and that is the point of this section. A
+  // payload that dropped the field entirely compares equal to one carrying
+  // `undefined` under every deep-equal check in this file, because
+  // `JSON.stringify` omits an undefined value - so "the frontend SENDS it" has
+  // to be said with the key list.
+  check(
+    "and the close sends it, under that name",
+    Object.keys(lastOf("ssh_forward_close")?.args ?? {}).sort(),
+    ["boundPort", "generation", "id"],
+  );
+  check("carrying what its own open was given", lastOf("ssh_forward_close")?.args.generation, 2);
+
+  // Stop, then Start on the SAME pinned port: two listeners under one key in
+  // sequence, which is the state the port alone cannot describe and the reason
+  // the generation exists. The two closes must not name the same one.
+  const second = await openForwardForConnection("c-bastion", "10.0.0.9", 5432, {
+    localPort: 18080,
+  });
+  check("a re-open on that port is a NEW generation", second.generation, 3);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 18080, second.claim);
+  await settle();
+  check(
+    "so the two closes of one port name different listeners",
+    allOf("ssh_forward_close").map((c) => [c.args.boundPort, c.args.generation]),
+    [
+      [18080, 2],
+      [18080, 3],
+    ],
+  );
+
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 22, 18443, keep.claim);
+  await settle();
+  check("and the rule that was never stopped closes its own", countOf("ssh_forward_close"), 3);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[shared session] terminal tabs ride the bastion's one session");
+// Every scenario releases what it opens.
+
+/** Endings every scenario's shells report, cleared at the start of each one. */
+let exits: { code: number; reason: SshExitReason }[] = [];
+function shellOpts(over: Partial<SshShellOptions> = {}): SshShellOptions {
+  return {
+    promptForHostKey: true,
+    cols: 80,
+    rows: 24,
+    onData: () => {},
+    onExit: (code, reason) => exits.push({ code, reason }),
+    ...over,
+  };
+}
+
+// S1: two tabs to one host share one session.
+{
+  reset([row({ id: "c-bastion" })]);
+  exits = [];
+  const a = await openShellForConnection("c-bastion", shellOpts());
+  const b = await openShellForConnection("c-bastion", shellOpts());
+  check("one dial for two tabs", countOf("ssh_open"), 1);
+  check("two shell channels", countOf("ssh_shell_open"), 2);
+  check("both claims share a session", a.sessionId, b.sessionId);
+  check(
+    "every ssh_shell_open names that session",
+    allOf("ssh_shell_open").map((c) => c.args.id),
+    [a.sessionId, b.sessionId],
+  );
+
+  await a.close();
+  await settle();
+  check(
+    "closing one tab closes its shell, not the session",
+    [countOf("ssh_shell_close"), countOf("ssh_close")],
+    [1, 0],
+  );
+  await b.close();
+  await settle();
+  check("the last tab out closes the session", countOf("ssh_close"), 1);
+}
+
+// S2: a tab and a forward share one session, in both release orders.
+{
+  reset([row({ id: "c-bastion" })]);
+  exits = [];
+  const tab = await openShellForConnection("c-bastion", shellOpts());
+  const forward = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  check("one dial for the tab and the forward", countOf("ssh_open"), 1);
+  check("they share a session", tab.sessionId, forward.sessionId);
+
+  await tab.close();
+  await settle();
+  check("the tab closing first leaves it up", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, forward.claim);
+  await settle();
+  check("the forward releasing it after closes it", countOf("ssh_close"), 1);
+
+  const tab2 = await openShellForConnection("c-bastion", shellOpts());
+  const forward2 = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  check("the reversed order dials fresh", countOf("ssh_open"), 2);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, forward2.claim);
+  await settle();
+  check("the forward closing first leaves it up", countOf("ssh_close"), 1);
+  await tab2.close();
+  await settle();
+  check("the tab releasing it after closes it", countOf("ssh_close"), 2);
+}
+
+// S3: a shell that ends on its own gives back exactly one reference.
+{
+  reset([row({ id: "c-bastion" })]);
+  exits = [];
+  const tab = await openShellForConnection("c-bastion", shellOpts());
+  const forward = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  const tabChannel = (allOf("ssh_shell_open")[0].args.onEvent as { id: number }).id;
+  emitOnChannel(tabChannel, { type: "exit", code: 0 });
+  await settle();
+  check("the tab's shell reports its own ending, once", exits, [
+    { code: 0, reason: { kind: "exit", code: 0 } },
+  ]);
+
+  await tab.close();
+  await settle();
+  check("closing the already-ended tab spends no second reference", countOf("ssh_close"), 0);
+  await closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, forward.claim);
+  await settle();
+  check("the forward releasing it closes it once, not twice", countOf("ssh_close"), 1);
+}
+
+// S4: reconnecting tabs coalesce onto one dial. Proves only that the re-opens
+// SHARE a dial - the per-tab 1s/3s/7s ladder itself lives in ssh-session.ts,
+// unreachable from here, and stays pinned by ssh-retry-verify.ts.
+{
+  reset([row({ id: "c-bastion" })]);
+  exits = [];
+  const a = await openShellForConnection("c-bastion", shellOpts());
+  const b = await openShellForConnection("c-bastion", shellOpts());
+  const oldSessionId = a.sessionId;
+  check("both tabs share the session before it drops", b.sessionId, oldSessionId);
+  const sessionChannel = parkedOpens[0].channelId;
+  const shellChannels = allOf("ssh_shell_open").map((c) => (c.args.onEvent as { id: number }).id);
+  emitOnChannel(sessionChannel, { type: "disconnected" });
+  for (const ch of shellChannels) emitOnChannel(ch, { type: "disconnected" });
+  await settle();
+  check(
+    "both tabs' shells end as disconnected",
+    exits.map((x) => x.reason),
+    [{ kind: "disconnected" }, { kind: "disconnected" }],
+  );
+
+  const [c, d] = await Promise.all([
+    openShellForConnection("c-bastion", shellOpts()),
+    openShellForConnection("c-bastion", shellOpts()),
+  ]);
+  check("the two re-opens share one new dial", countOf("ssh_open"), 2);
+  check("on a session different from the dead one", c.sessionId === oldSessionId, false);
+  check("shared between them", c.sessionId, d.sessionId);
+  check("with two new shells on it", countOf("ssh_shell_open"), 4);
+
+  // A re-open while the session is alive (only a shell ended) joins it.
+  const e = await openShellForConnection("c-bastion", shellOpts());
+  check(
+    "a further re-open joins the live session, no new dial",
+    [countOf("ssh_open"), e.sessionId],
+    [2, c.sessionId],
+  );
+
+  await c.close();
+  await d.close();
+  await e.close();
+  await settle();
+  check("releasing every tab closes the new session", countOf("ssh_close"), 1);
+}
+
+// S5: a late end or release from a dead session never touches its successor.
+{
+  reset([row({ id: "c-bastion" })]);
+  exits = [];
+  const a = await openShellForConnection("c-bastion", shellOpts());
+  const firstChannel = parkedOpens[0].channelId;
+  emitOnChannel(firstChannel, { type: "disconnected" });
+  await settle();
+
+  const b = await openShellForConnection("c-bastion", shellOpts());
+  check("a new tab dials a fresh session", countOf("ssh_open"), 2);
+
+  await a.close();
+  await settle();
+  check("A's late close spends no reference on B's session", countOf("ssh_close"), 0);
+
+  emitOnChannel(firstChannel, { type: "disconnected" });
+  await settle();
+  const c = await openShellForConnection("c-bastion", shellOpts());
+  check("a second late end from the dead dial still dials nothing new", countOf("ssh_open"), 2);
+  check("C joined B's session", c.sessionId, b.sessionId);
+
+  await b.close();
+  await c.close();
+  await settle();
+  check("closing B and C closes it once", countOf("ssh_close"), 1);
+}
+
+// S6: hop events reach both the originator and a joiner.
+{
+  reset([row({ id: "c-jump" }), row({ id: "c-tgt", proxyJumpId: "c-jump" })]);
+  exits = [];
+  autoAnswerOpen = false;
+  const hopsA: [string, string][] = [];
+  const hopsB: [string, string][] = [];
+  const openingA = openShellForConnection(
+    "c-tgt",
+    shellOpts({ onJumpConnected: (c, f) => hopsA.push([c, f]) }),
+  );
+  await settle();
+  const openingB = openShellForConnection(
+    "c-tgt",
+    shellOpts({ onJumpConnected: (c, f) => hopsB.push([c, f]) }),
+  );
+  await settle();
+  check("the joiner rides the one parked dial", parkedOpens.length, 1);
+  emitOn(parkedOpens[0], {
+    type: "jumpConnected",
+    connectionId: "c-jump",
+    fingerprint: "SHA256:j",
+  });
+  check("the originator hears the hop", hopsA, [["c-jump", "SHA256:j"]]);
+  check("and so does the joiner", hopsB, [["c-jump", "SHA256:j"]]);
+  check("still one dial", countOf("ssh_open"), 1);
+
+  parkedOpens[0].resolve(nextSessionId++);
+  const [a, b] = await Promise.all([openingA, openingB]);
+  await a.close();
+  await b.close();
+  await settle();
+  check("both release normally", countOf("ssh_close"), 1);
+}
+
+// S7: host-key and wire boundary through the real openSsh.
+{
+  reset([row({ id: "c-unpinned", lastFingerprint: undefined })]);
+  exits = [];
+  autoAnswerOpen = false;
+
+  // A REFUSED host key parks locally, whatever the wire rejects with.
+  let opening = openShellForConnection("c-unpinned", shellOpts());
+  await settle();
+  emitOn(parkedOpens[0], {
+    type: "hostKeyPrompt",
+    promptId: "hk-s7a",
+    fingerprint: "SHA256:fresh",
+    host: "c-unpinned.example.com",
+  });
+  useHostKeyPrompt.getState().resolve("hk-s7a", false);
+  await settle();
+  parkedOpens[0].reject("ssh: connection closed");
+  let error: unknown;
+  await opening.catch((e) => {
+    error = e;
+  });
+  assert(error instanceof SshLocalConnectError, "a REFUSED host key parks locally");
+
+  // An UNANSWERED prompt under a dropped link is not a local refusal, and the
+  // dead prompt must not shadow the next attempt's dialog.
+  opening = openShellForConnection("c-unpinned", shellOpts());
+  await settle();
+  emitOn(parkedOpens[1], {
+    type: "hostKeyPrompt",
+    promptId: "hk-s7b",
+    fingerprint: "SHA256:fresh",
+    host: "c-unpinned.example.com",
+  });
+  parkedOpens[1].reject(new Error("ssh: connection closed"));
+  error = undefined;
+  await opening.catch((e) => {
+    error = e;
+  });
+  assert(!(error instanceof SshLocalConnectError), "an unanswered prompt is not a refusal");
+  check(
+    "the dead prompt leaves the queue",
+    useHostKeyPrompt.getState().queue.some((p) => p.promptId === "hk-s7b"),
+    false,
+  );
+
+  // The server's own refusal reaches the caller typed, straight through the
+  // real openSsh -> sshConnectErrorFrom boundary.
+  opening = openShellForConnection("c-unpinned", shellOpts());
+  await settle();
+  parkedOpens[2].reject({ kind: "auth", message: "ssh: authentication rejected" });
+  error = undefined;
+  await opening.catch((e) => {
+    error = e;
+  });
+  assert(error instanceof SshAuthRejectedError, "an authentication refusal is typed, not local");
+}
+
+// S8: a forward release still in flight when the bastion drops never spends
+// the reference a re-dialled tab took on the successor session.
+{
+  reset([row({ id: "c-bastion" })]);
+  exits = [];
+  const forward = await openForwardForConnection("c-bastion", "10.0.0.9", 5432);
+  const closes: (() => void)[] = [];
+  parkedForwardCloses = closes;
+  const releasing = closeForwardForConnection("c-bastion", "10.0.0.9", 5432, 0, forward.claim);
+  await settle();
+  emitOn(parkedOpens[0], { type: "disconnected" });
+  await settle();
+  const tab = await openShellForConnection("c-bastion", shellOpts());
+  check("the tab re-dials after the drop", countOf("ssh_open"), 2);
+
+  parkedForwardCloses = null;
+  for (const answer of closes) answer();
+  await releasing;
+  await settle();
+  check(
+    "the late forward release spends no reference on the tab's session",
+    countOf("ssh_close"),
+    0,
+  );
+  await tab.close();
+  await settle();
+  check("the tab's own close still closes it", countOf("ssh_close"), 1);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[source-text] the two sides of the forward and shell wire name the same arguments");
+// The one class the behavioural section above cannot see: a rename on ONE side.
+// The frontend would keep sending `generation` while the backend asked for
+// something else, `tsc` and `cargo check` would both stay green, and the
+// failure would surface only as a close that rejects at runtime. So the Rust
+// parameter list and the `invoke` payload are compared to each other, in order,
+// through Tauri's own snake_case-to-camelCase convention.
+{
+  const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
+  const rustSource = read("src-tauri/src/modules/ssh/mod.rs");
+  const bridgeSource = read("src/modules/ssh/bridge.ts");
+
+  /** The parameters one `#[tauri::command]` declares, in order, minus the
+   *  `tauri::State` handle the frontend never sends. Filtered to identifiers so
+   *  the comma inside `tauri::State<'_, SshState>` cannot contribute a
+   *  fragment of its own. */
+  const rustParams = (command: string): string[] => {
+    const at = rustSource.indexOf(`pub async fn ${command}(`);
+    if (at < 0) return [];
+    const open = rustSource.indexOf("(", at);
+    return rustSource
+      .slice(open + 1, rustSource.indexOf(")", open))
+      .split(",")
+      .map((p) => p.split(":")[0].trim())
+      .filter((p) => /^[a-z_][a-z0-9_]*$/.test(p) && p !== "state");
+  };
+
+  /** The keys of the object literal one `invoke` call sends. */
+  const invokeKeys = (command: string): string[] => {
+    const at = bridgeSource.indexOf(`"${command}"`);
+    if (at < 0) return [];
+    const open = bridgeSource.indexOf("{", at);
+    return bridgeSource
+      .slice(open + 1, bridgeSource.indexOf("}", open))
+      .split(",")
+      .map((k) => k.split(":")[0].trim())
+      .filter((k) => k.length > 0);
+  };
+
+  const camel = (s: string) => s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+
+  // BOTH EXTRACTORS PROVED FIRST, in the direction that matters: two empty
+  // lists compare equal, so a regex that quietly stopped matching would turn
+  // the comparison below into a check that cannot fail. These name the values
+  // they must find.
+  check("the Rust reader finds the close's parameters", rustParams("ssh_forward_close"), [
+    "id",
+    "bound_port",
+    "generation",
+  ]);
+  check("and the bridge reader finds the close's payload", invokeKeys("ssh_forward_close"), [
+    "id",
+    "boundPort",
+    "generation",
+  ]);
+  check(
+    "and reports nothing for a command that is not there, so an empty result means absent",
+    [rustParams("ssh_nope"), invokeKeys("ssh_nope")],
+    [[], []],
+  );
+
+  for (const command of [
+    "ssh_forward_open",
+    "ssh_forward_close",
+    "ssh_shell_open",
+    "ssh_shell_write",
+    "ssh_shell_resize",
+    "ssh_shell_close",
+  ]) {
+    check(
+      `${command}: every parameter the backend declares is a key the frontend sends`,
+      invokeKeys(command),
+      rustParams(command).map(camel),
+    );
+  }
+}
+
+console.log(failed === 0 ? "\nAll rdp-tunnel checks passed." : `\n${failed} check(s) FAILED.`);
+process.exit(failed === 0 ? 0 : 1);

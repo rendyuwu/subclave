@@ -1,0 +1,1160 @@
+import { useCallback, useRef, useState } from "react";
+import { basename } from "@/lib/path";
+import {
+  buildPaneTree,
+  cloneLeafState,
+  findLeaf,
+  hasLeaf,
+  leafIds,
+  leaves,
+  movePaneLeafToEdge as movePaneLeafToEdgeInTree,
+  nextLeafId,
+  normalizePaneTree,
+  removeLeaf,
+  reorderLeafInTree,
+  rotateLeafWithNeighbor,
+  setLeafActiveTool as setLeafActiveToolInTree,
+  setLeafCwd as setLeafCwdInTree,
+  setLeafPtyId as setLeafPtyIdInTree,
+  setLeafCustomTitle as setLeafCustomTitleInTree,
+  setLeafTerminalTheme as setLeafTerminalThemeInTree,
+  setSplitSizes as setSplitSizesInTree,
+  siblingLeafOf,
+  splitLeaf,
+  updateEditorLeaf,
+  type EditorLeafState,
+  type LeafState,
+  type PaneEdge,
+  type PaneLayout,
+  type PaneLeaf,
+  type PaneNode,
+  type SplitDir,
+  type TerminalLeafState,
+} from "@/modules/terminal/lib/panes";
+import type { AiCliKind } from "@/modules/terminal/lib/aiCliStatus";
+import { type PaneTab, type Tab } from "./tabTypes";
+import { leafCloseRefusal, tabCloseRefusal } from "./closable";
+import { syncPaneMirror } from "./tabHelpers";
+import { useAuxTabs } from "./useAuxTabs";
+import { type RailViewKind } from "./pages";
+import {
+  focusTabView,
+  INITIAL_TAB_VIEW,
+  rehomeTabView,
+  showTabsIn,
+  toggleRailViewIn,
+  type TabView,
+} from "./tabView";
+
+// Re-export the tab types from their new home so existing imports of
+// `@/modules/tabs/lib/useTabs` (and the `@/modules/tabs` barrel) keep working.
+export type { PaneTab, Tab } from "./tabTypes";
+
+// Re-export the active-leaf discriminators from their new home so callers that
+// import them from this module (or the barrel) are unaffected by the move.
+export { activeLeaf, activeLeafKind, isTerminalLikeTab, isEditorLikeTab } from "./tabHelpers";
+
+// Browsers cap WebGL contexts at ~16. One xterm renderer per terminal leaf.
+// 6 panes per tab leaves headroom for multiple tabs.
+export const MAX_PANES_PER_TAB = 6;
+
+/**
+ * Which host an editor leaf's file lives on: the saved SSH profile when there
+ * is one, else the ad-hoc session, else local. Two leaves show the same file
+ * only when this AND the path match, so opening a local file never lands on a
+ * remote leaf that happens to share its path - including a restored remote leaf,
+ * which has no session id yet and would otherwise read as local.
+ */
+function editorRemoteKey(l: Pick<EditorLeafState, "hostId" | "sshSessionId">) {
+  return l.hostId ?? l.sshSessionId ?? null;
+}
+
+export function useTabs() {
+  // Empty on mount, deliberately: workspace restore hasn't run yet, and a
+  // seeded terminal here would be indistinguishable from "nothing to
+  // restore" once it does. The Hosts-page fallback (and the real
+  // restore) both apply AFTER restore resolves, in `useWorkspacePersistence`
+  // - never here, and never twice.
+  const [tabs, setTabs] = useState<Tab[]>(() => []);
+  /**
+   * The active tab AND the rail view covering it, as one value - see
+   * `./tabView.ts` for why they cannot be two. `activeId` starts at 0, which
+   * matches no tab (ids allocated below start at 1), so nothing is "active"
+   * until restore populates the list.
+   *
+   * `setView` is the ONLY raw writer, and it is called from exactly the four
+   * funnels below: `setActiveId` (every route into the tab area),
+   * `rehomeActiveId` (a removal re-pointing the active id), `showTabs`, and
+   * `toggleRailView`. Nothing else in this file - and nothing outside it - may
+   * touch it, which is what makes "activating a tab leaves the rail view" true
+   * of every caller instead of the nine that remembered.
+   */
+  const [view, setView] = useState<TabView>(INITIAL_TAB_VIEW);
+  const { activeId, railView } = view;
+  const nextIdRef = useRef(1);
+  // Sync ref of `tabs` so callbacks can read the latest array without relying
+  // on React's eager state computation (skipped when the fiber already has
+  // other pending updates).
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  // Monotonic FIFO counter for the terminal chip number. New terminals from
+  // any path pick the next unused integer. Drag/reorder doesn't bump this;
+  // the ordinal belongs to the leaf, not its position.
+  const nextOrdinalRef = useRef(2);
+
+  /**
+   * Activate tab `id` and show the tabs. THE write of `activeId` - every mint,
+   * chord, click and restore in this file (and every consumer of the returned
+   * api) goes through it, which is what leaves the rail view exactly once,
+   * rather than at the ten call sites that would each have to remember.
+   *
+   * `(id: number)`, not `Dispatch<SetStateAction<number>>`: the functional form
+   * is how the two removal paths below used to write this state, and it read
+   * identically to a focus. Passing one is now a type error, and a removal says
+   * `rehomeActiveId` instead.
+   */
+  const setActiveId = useCallback((id: number) => {
+    setView((curr) => focusTabView(curr, id));
+  }, []);
+
+  /**
+   * Re-point `activeId` after the entry holding it was closed. Takes the updater
+   * (the reducer that computes it needs the CURRENT active id, and a `[]`-dep
+   * callback cannot read it from a closure) but is a different function from
+   * `setActiveId`, because it is a different thing: it must NOT leave the rail
+   * view. See `rehomeTabView`.
+   */
+  const rehomeActiveId = useCallback((pick: (active: number) => number) => {
+    setView((curr) => rehomeTabView(curr, pick(curr.activeId)));
+  }, []);
+
+  /** Show the tabs without changing which one is active. */
+  const showTabs = useCallback(() => {
+    setView(showTabsIn);
+  }, []);
+
+  /** Rail button: the lit one goes back to the tabs. */
+  const toggleRailView = useCallback((next: RailViewKind) => {
+    setView((curr) => toggleRailViewIn(curr, next));
+  }, []);
+
+  // Non-pane tab openers. Extracted into a sub-hook for size; the callbacks
+  // close over the same setters/refs and are spread into this hook's return
+  // object below with identical keys.
+  const { openBoardTab, newRdpTab, openPageTab } = useAuxTabs({
+    setTabs,
+    setActiveId,
+    nextIdRef,
+    tabsRef,
+  });
+
+  /** Highest `terminalOrdinal` currently in use. */
+  const peekMaxOrdinal = useCallback((curr: Tab[]): number => {
+    let max = 0;
+    for (const t of curr) {
+      if (t.kind !== "pane") continue;
+      for (const l of leaves(t.paneTree)) {
+        if (l.leafKind === "terminal" && typeof l.terminalOrdinal === "number") {
+          if (l.terminalOrdinal > max) max = l.terminalOrdinal;
+        }
+      }
+    }
+    return max;
+  }, []);
+
+  /** Returns the next ordinal and advances the counter. */
+  const allocOrdinal = useCallback(
+    (curr: Tab[]): number => {
+      const max = Math.max(nextOrdinalRef.current - 1, peekMaxOrdinal(curr));
+      const ord = max + 1;
+      nextOrdinalRef.current = ord + 1;
+      return ord;
+    },
+    [peekMaxOrdinal],
+  );
+
+  const newTab = useCallback(
+    (cwd?: string, opts?: { savedPtyId?: string }) => {
+      const tabId = nextIdRef.current++;
+      const leafId = nextIdRef.current++;
+      setTabs((curr) => {
+        const leaf: PaneLeaf = {
+          kind: "leaf",
+          id: leafId,
+          leafKind: "terminal",
+          cwd,
+          terminalOrdinal: allocOrdinal(curr),
+          // Adopt an existing daemon session: the restore path in
+          // openPtyForSession sees `savedPtyId` and calls reattachPty instead
+          // of spawning a fresh shell. Used by useAdoptDaemonSessions.
+          ...(opts?.savedPtyId ? { savedPtyId: opts.savedPtyId } : {}),
+        };
+        return [
+          ...curr,
+          syncPaneMirror({
+            id: tabId,
+            kind: "pane",
+            title: "shell",
+            paneTree: leaf,
+            activeLeafId: leafId,
+          }),
+        ];
+      });
+      setActiveId(tabId);
+      return tabId;
+    },
+    [allocOrdinal, setActiveId],
+  );
+
+  /**
+   * Open one tab holding `count` terminals arranged by `layout`. Used by the
+   * `+` -> Agent spawn, which needs shapes `splitActivePane` cannot express (a
+   * 2x2, or one pane beside a stacked pair) and needs every leaf to exist before
+   * any of them is written to. The tree is built in a single state update, so
+   * the leaf ids are stable and in visual order.
+   */
+  const newPaneGroupTab = useCallback(
+    (count: number, layout: PaneLayout, cwd?: string, title = "shell"): number => {
+      const tabId = nextIdRef.current++;
+      setTabs((curr) => {
+        const n = Math.max(1, Math.min(count, MAX_PANES_PER_TAB));
+        const states: TerminalLeafState[] = Array.from({ length: n }, () => ({
+          leafKind: "terminal",
+          cwd,
+          terminalOrdinal: allocOrdinal(curr),
+        }));
+        const paneTree = buildPaneTree(states, layout, () => nextIdRef.current++);
+        return [
+          ...curr,
+          syncPaneMirror({
+            id: tabId,
+            kind: "pane",
+            title,
+            paneTree,
+            activeLeafId: leafIds(paneTree)[0],
+          }),
+        ];
+      });
+      setActiveId(tabId);
+      return tabId;
+    },
+    [allocOrdinal, setActiveId],
+  );
+
+  /** Open a tab whose initial terminal leaf is bound to a saved SSH connection. Routes through `ssh_open`. */
+  const newSshTab = useCallback(
+    (hostId: string, title: string) => {
+      const tabId = nextIdRef.current++;
+      const leafId = nextIdRef.current++;
+      setTabs((curr) => {
+        const leaf: PaneLeaf = {
+          kind: "leaf",
+          id: leafId,
+          leafKind: "terminal",
+          hostId,
+          terminalOrdinal: allocOrdinal(curr),
+        };
+        return [
+          ...curr,
+          syncPaneMirror({
+            id: tabId,
+            kind: "pane",
+            title,
+            paneTree: leaf,
+            activeLeafId: leafId,
+          }),
+        ];
+      });
+      setActiveId(tabId);
+      return tabId;
+    },
+    [allocOrdinal, setActiveId],
+  );
+
+  /** Find a pane tab with an editor leaf matching `predicate`. Used by openFileTab for dedup. */
+  const findEditorLeafIn = useCallback(
+    (
+      curr: Tab[],
+      path: string,
+      predicate: (l: PaneLeaf & EditorLeafState) => boolean = () => true,
+      remoteKey: string | number | null = null,
+    ): { tab: PaneTab; leaf: PaneLeaf & EditorLeafState } | null => {
+      for (const t of curr) {
+        if (t.kind !== "pane") continue;
+        for (const l of leaves(t.paneTree)) {
+          if (l.leafKind !== "editor") continue;
+          if (l.path !== path) continue;
+          // Same path on a different host (or local vs remote) is a different
+          // file. Only dedup when the host matches.
+          if (editorRemoteKey(l) !== remoteKey) continue;
+          if (!predicate(l)) continue;
+          return { tab: t, leaf: l };
+        }
+      }
+      return null;
+    },
+    [],
+  );
+
+  /**
+   * Opens a file in an editor leaf.
+   * `pin = true`: persistent. Reuses an existing leaf (promoting from preview if needed) or creates a new tab.
+   * `pin = false`: VSCode-style preview slot.
+   */
+  const openFileTab = useCallback(
+    (
+      path: string,
+      pin = true,
+      remote?: {
+        /** Saved profile of the host, when the session came from one. Absent for
+         *  an ad-hoc connection, which then cannot survive a restart. */
+        hostId?: string;
+        sshSessionId: number;
+        sshHostLabel: string;
+      },
+    ) => {
+      let targetTabId: number | null = null;
+      const remoteKey = remote ? editorRemoteKey(remote) : null;
+      setTabs((curr) => {
+        if (pin) {
+          const hit = findEditorLeafIn(curr, path, undefined, remoteKey);
+          if (hit) {
+            targetTabId = hit.tab.id;
+            return curr.map((t) => {
+              if (t.id !== hit.tab.id || t.kind !== "pane") return t;
+              let tree = t.paneTree;
+              if (hit.leaf.preview) {
+                tree = updateEditorLeaf(tree, hit.leaf.id, { preview: false });
+              }
+              return syncPaneMirror({
+                ...t,
+                paneTree: tree,
+                activeLeafId: hit.leaf.id,
+              });
+            });
+          }
+          const id = nextIdRef.current++;
+          const leafId = nextIdRef.current++;
+          targetTabId = id;
+          const leaf: PaneLeaf = {
+            kind: "leaf",
+            id: leafId,
+            leafKind: "editor",
+            path,
+            dirty: false,
+            preview: false,
+            ...(remote && {
+              ...(remote.hostId ? { hostId: remote.hostId } : {}),
+              sshSessionId: remote.sshSessionId,
+              sshHostLabel: remote.sshHostLabel,
+            }),
+          };
+          return [
+            ...curr,
+            syncPaneMirror({
+              id,
+              kind: "pane",
+              title: basename(path),
+              paneTree: leaf,
+              activeLeafId: leafId,
+            }),
+          ];
+        }
+
+        // Preview open
+        const persistent = findEditorLeafIn(curr, path, (l) => !l.preview, remoteKey);
+        if (persistent) {
+          targetTabId = persistent.tab.id;
+          return curr.map((t) => {
+            if (t.id !== persistent.tab.id || t.kind !== "pane") return t;
+            return syncPaneMirror({
+              ...t,
+              activeLeafId: persistent.leaf.id,
+            });
+          });
+        }
+        const existingPreview = findEditorLeafIn(curr, path, (l) => l.preview, remoteKey);
+        if (existingPreview) {
+          targetTabId = existingPreview.tab.id;
+          return curr.map((t) => {
+            if (t.id !== existingPreview.tab.id || t.kind !== "pane") return t;
+            return syncPaneMirror({
+              ...t,
+              activeLeafId: existingPreview.leaf.id,
+            });
+          });
+        }
+        // Find the existing single-leaf editor preview tab to reuse.
+        const previewIdx = curr.findIndex(
+          (t) =>
+            t.kind === "pane" &&
+            leafIds(t.paneTree).length === 1 &&
+            (() => {
+              const l = findLeaf(t.paneTree, t.activeLeafId);
+              return l?.leafKind === "editor" && l.preview;
+            })(),
+        );
+        const id = nextIdRef.current++;
+        const leafId = nextIdRef.current++;
+        targetTabId = id;
+        const leaf: PaneLeaf = {
+          kind: "leaf",
+          id: leafId,
+          leafKind: "editor",
+          path,
+          dirty: false,
+          preview: true,
+          ...(remote && {
+            ...(remote.hostId ? { hostId: remote.hostId } : {}),
+            sshSessionId: remote.sshSessionId,
+            sshHostLabel: remote.sshHostLabel,
+          }),
+        };
+        const tab: PaneTab = syncPaneMirror({
+          id,
+          kind: "pane",
+          title: basename(path),
+          paneTree: leaf,
+          activeLeafId: leafId,
+        });
+        if (previewIdx === -1) return [...curr, tab];
+        const next = [...curr];
+        next[previewIdx] = tab;
+        return next;
+      });
+      if (targetTabId !== null) setActiveId(targetTabId);
+      return targetTabId as number | null;
+    },
+    [findEditorLeafIn, setActiveId],
+  );
+
+  /** Promote the active leaf of `id` out of preview. */
+  const pinTab = useCallback((id: number) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.id !== id || t.kind !== "pane") return t;
+        const leaf = findLeaf(t.paneTree, t.activeLeafId);
+        if (!leaf || leaf.leafKind !== "editor" || !leaf.preview) return t;
+        const paneTree = updateEditorLeaf(t.paneTree, leaf.id, {
+          preview: false,
+        });
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  const closeTab = useCallback(
+    (id: number) => {
+      setTabs((curr) => {
+        // The mutation-site half of the close rule (`lib/closable.ts`). The render
+        // gates keep the X buttons off an unclosable tab; this is what a caller
+        // that never asked runs into, so the rule cannot be routed around.
+        if (tabCloseRefusal(curr, id) !== null) return curr;
+        const idx = curr.findIndex((t) => t.id === id);
+        const next = curr.filter((t) => t.id !== id);
+        // A removal, not a route into the tab area: `rehomeActiveId` leaves the
+        // rail view alone, so closing a tab in the strip while the Vault is up
+        // does not throw the user out of the Vault.
+        //
+        // `?? 0` (= no tab active) rather than indexing blind: `tabCloseRefusal`
+        // refuses the last entry, so `next` cannot be empty today - but a rule
+        // enforced one layer up should not be the only thing between a typo in
+        // that predicate and a TypeError thrown INSIDE a `setTabs` reducer, which
+        // is an unhandled render crash rather than a misplaced focus.
+        const landing = next[Math.max(0, idx - 1)] ?? next[0];
+        rehomeActiveId((active) => (id === active ? (landing?.id ?? 0) : active));
+        return next;
+      });
+    },
+    [rehomeActiveId],
+  );
+
+  const selectByIndex = useCallback(
+    (idx: number) => {
+      const t = tabs[idx];
+      if (t) setActiveId(t.id);
+    },
+    [tabs, setActiveId],
+  );
+
+  /** Update a terminal leaf's cwd. Mirrors to the tab when the leaf is active. */
+  const setLeafCwd = useCallback((leafId: number, cwd: string) => {
+    setTabs((curr) => {
+      // OSC 7 repeats on every prompt (and the SSH bootstrap makes that every
+      // remote Enter), so bail when the cwd is unchanged. Without this, `curr.map`
+      // allocates a fresh tabs array per prompt, which re-runs every tabs-keyed
+      // memo and re-serializes the workspace to disk.
+      const owner = curr.find((t) => t.kind === "pane" && hasLeaf(t.paneTree, leafId));
+      if (owner?.kind === "pane") {
+        const leaf = findLeaf(owner.paneTree, leafId);
+        if (leaf?.leafKind === "terminal" && leaf.cwd === cwd) return curr;
+      }
+      return curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        if (!hasLeaf(t.paneTree, leafId)) return t;
+        const paneTree = setLeafCwdInTree(t.paneTree, leafId, cwd);
+        return syncPaneMirror({ ...t, paneTree });
+      });
+    });
+  }, []);
+
+  /**
+   * Set (or clear, with `null`) a terminal leaf's per-pane theme override.
+   * `themeId` is a `TERMINAL_PRESETS` id. The leaf's `TerminalPane` repaints
+   * in that palette; the serializer persists the choice. No-op for non-terminal
+   * leaves or when the value is unchanged.
+   */
+  /**
+   * Set or clear a leaf's user-chosen tab name (the tab strip's right-click
+   * "Rename"). `null` or blank clears it, so the entry falls back to its derived
+   * label instead of rendering as an empty tab. Persisted by the workspace
+   * serializer, so it survives a restart.
+   */
+  const renameLeaf = useCallback((leafId: number, title: string | null) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        if (!hasLeaf(t.paneTree, leafId)) return t;
+        const paneTree = setLeafCustomTitleInTree(t.paneTree, leafId, title);
+        if (paneTree === t.paneTree) return t;
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  const setLeafTerminalTheme = useCallback((leafId: number, themeId: string | null) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        if (!hasLeaf(t.paneTree, leafId)) return t;
+        const paneTree = setLeafTerminalThemeInTree(t.paneTree, leafId, themeId);
+        if (paneTree === t.paneTree) return t;
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  /**
+   * Stamp the daemon-side PTY UUID returned by `pty_open` / `pty_attach`
+   * onto a terminal leaf so the workspace serializer can persist it.
+   * Clears any `savedPtyId` set by the restore path - the leaf is now
+   * authoritative and a manual respawn must spawn fresh, not re-attach.
+   */
+  const setLeafPtyId = useCallback((leafId: number, ptyId: string) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        if (!hasLeaf(t.paneTree, leafId)) return t;
+        const paneTree = setLeafPtyIdInTree(t.paneTree, leafId, ptyId);
+        if (paneTree === t.paneTree) return t;
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  /**
+   * Record the AI CLI kind detected in a terminal leaf (or `null` to clear).
+   * Fires on every detector transition, so it bails at the top when the tool
+   * is unchanged - the frequent working<->idle flips must not churn the tabs
+   * array or re-serialize the workspace. The serializer persists it (for
+   * reattachable local leaves) so a still-running agent resumes its badge on
+   * the next launch.
+   */
+  const setLeafActiveTool = useCallback((leafId: number, tool: AiCliKind | null) => {
+    setTabs((curr) => {
+      const owner = curr.find((t) => t.kind === "pane" && hasLeaf(t.paneTree, leafId));
+      if (owner?.kind === "pane") {
+        const leaf = findLeaf(owner.paneTree, leafId);
+        if (leaf?.leafKind === "terminal" && (leaf.activeTool ?? null) === tool) return curr;
+      }
+      return curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        if (!hasLeaf(t.paneTree, leafId)) return t;
+        const paneTree = setLeafActiveToolInTree(t.paneTree, leafId, tool);
+        if (paneTree === t.paneTree) return t;
+        return syncPaneMirror({ ...t, paneTree });
+      });
+    });
+  }, []);
+
+  /**
+   * Store per-child size percentages on a split node so a restored workspace
+   * keeps its divider positions. Wired to react-resizable-panels'
+   * `onLayoutChanged` (only on genuine user drags), and `setSplitSizesInTree`
+   * bails on unchanged sizes, so a stray layout echo can't churn state.
+   */
+  const setSplitSizes = useCallback((splitId: number, sizes: number[]) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        const paneTree = setSplitSizesInTree(t.paneTree, splitId, sizes);
+        if (paneTree === t.paneTree) return t;
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  const setEditorLeafDirty = useCallback((leafId: number, dirty: boolean) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        const leaf = findLeaf(t.paneTree, leafId);
+        if (!leaf || leaf.leafKind !== "editor") return t;
+        const patch: Partial<Pick<EditorLeafState, "dirty" | "preview">> = {
+          dirty,
+        };
+        if (dirty && leaf.preview) patch.preview = false;
+        const paneTree = updateEditorLeaf(t.paneTree, leafId, patch);
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  const setEditorLeafPath = useCallback((leafId: number, path: string) => {
+    setTabs((curr) =>
+      curr.map((t) => {
+        if (t.kind !== "pane") return t;
+        const leaf = findLeaf(t.paneTree, leafId);
+        if (!leaf || leaf.leafKind !== "editor") return t;
+        const paneTree = updateEditorLeaf(t.paneTree, leafId, { path });
+        return syncPaneMirror({ ...t, paneTree });
+      }),
+    );
+  }, []);
+
+  /**
+   * Focus a leaf inside a tab. Shows the tabs for the same reason `setActiveId`
+   * does: every caller is a deliberate "put me in that pane" - a pane click, the
+   * header's entry list, `focusLeafInTab` - and a focus that lands under a rail
+   * view is a focus the user cannot see.
+   *
+   * Hands `curr` straight back when no tab moved. `.map` alone will not: it
+   * allocates a new array whether or not any element changed, and a fresh `tabs`
+   * IDENTITY is exactly what `useWorkspacePersistence`'s `[tabs, activeId, ...]`
+   * effect watches. The chip's own unconditional click route is what made that
+   * cost real - a strip chip now
+   * reaches here TWICE per click (Radix activates on `mousedown`, then the
+   * chip's own unconditional `onClick` runs), so without this every click on a
+   * terminal or editor chip re-ran `serializeTabs` + `wsSaveTabs` and
+   * re-rendered the strip twice. The three early `return t` branches already say
+   * when nothing changes; this only makes the array agree with them.
+   *
+   * `showTabs()` above stays unconditional and stays first - section 8 of
+   * `scripts/rail-views-verify.ts` enumerates `focusPane` as a route that must
+   * funnel, and `showTabsIn` already returns `curr` for the no-op case itself.
+   */
+  const focusPane = useCallback(
+    (tabId: number, leafId: number) => {
+      showTabs();
+      setTabs((curr) => {
+        let moved = false;
+        const next = curr.map((t) => {
+          if (t.id !== tabId || t.kind !== "pane") return t;
+          if (!hasLeaf(t.paneTree, leafId)) return t;
+          if (t.activeLeafId === leafId) return t;
+          moved = true;
+          return syncPaneMirror({ ...t, activeLeafId: leafId });
+        });
+        return moved ? next : curr;
+      });
+    },
+    [showTabs],
+  );
+
+  /**
+   * Ctrl+] / Ctrl+[. A chord whose whole purpose is "show me that pane".
+   * A single-pane tab is a no-op, and handing back `curr` keeps that no-op from
+   * costing a workspace write (same reason as `focusPane`).
+   */
+  const focusNextPaneInTab = useCallback(
+    (tabId: number, delta: 1 | -1) => {
+      showTabs();
+      setTabs((curr) => {
+        let moved = false;
+        const next = curr.map((t) => {
+          if (t.id !== tabId || t.kind !== "pane") return t;
+          const nextLeaf = nextLeafId(t.paneTree, t.activeLeafId, delta);
+          if (nextLeaf === t.activeLeafId) return t;
+          moved = true;
+          return syncPaneMirror({ ...t, activeLeafId: nextLeaf });
+        });
+        return moved ? next : curr;
+      });
+    },
+    [showTabs],
+  );
+
+  /**
+   * Split the active leaf of `tabId` along `dir`. New leaf defaults to a
+   * terminal regardless of the active leaf, so Ctrl+D from an editor still
+   * spawns a shell. Pass `newKind = "editor"` for side-by-side code.
+   * All combinations (terminal/editor, editor/editor) are allowed.
+   *
+   * Mints a pane and focuses it, so it shows the tabs too: Ctrl+D under an open
+   * rail view would otherwise spawn a shell the user never sees.
+   */
+  const splitActivePane = useCallback(
+    (
+      tabId: number,
+      dir: SplitDir,
+      newKind?: "terminal" | "editor",
+      cwdOverride?: string,
+    ): number | null => {
+      let newLeafId: number | null = null;
+      showTabs();
+      setTabs((curr) =>
+        curr.map((t) => {
+          if (t.id !== tabId || t.kind !== "pane") return t;
+          if (leafIds(t.paneTree).length >= MAX_PANES_PER_TAB) return t;
+          const active = findLeaf(t.paneTree, t.activeLeafId);
+          if (!active) return t;
+
+          // Default to terminal so Ctrl+D from an editor still produces a shell.
+          const kind: "terminal" | "editor" = newKind ?? "terminal";
+
+          const splitId = nextIdRef.current++;
+          const leafId = nextIdRef.current++;
+          newLeafId = leafId;
+          let state: LeafState;
+          if (kind === "terminal") {
+            // Caller-supplied cwd wins; falls back to focused terminal's cwd, then tab mirror.
+            const cwd = cwdOverride ?? (active.leafKind === "terminal" ? active.cwd : t.cwd);
+            const ts: TerminalLeafState = {
+              leafKind: "terminal",
+              cwd,
+              terminalOrdinal: allocOrdinal(curr),
+            };
+            state = ts;
+          } else {
+            // Duplicate the active editor; fall back to any editor in the tab.
+            // No editor in the tab means nothing to clone, so the split is a no-op.
+            const source =
+              active.leafKind === "editor"
+                ? active
+                : leaves(t.paneTree).find(
+                    (l): l is PaneLeaf & EditorLeafState => l.leafKind === "editor",
+                  );
+            if (!source) {
+              newLeafId = null;
+              return t;
+            }
+            const es: EditorLeafState = {
+              leafKind: "editor",
+              path: source.path,
+              dirty: false,
+              preview: false,
+              // Carry the host with the path. Cloning the path alone would open
+              // a REMOTE path against the local disk in the new pane.
+              ...(source.hostId ? { hostId: source.hostId } : {}),
+              ...(source.sshSessionId !== undefined ? { sshSessionId: source.sshSessionId } : {}),
+              ...(source.sshHostLabel ? { sshHostLabel: source.sshHostLabel } : {}),
+            };
+            state = es;
+          }
+          const paneTree = splitLeaf(t.paneTree, t.activeLeafId, splitId, leafId, dir, state);
+          return syncPaneMirror({ ...t, paneTree, activeLeafId: leafId });
+        }),
+      );
+      return newLeafId;
+    },
+    [allocOrdinal, showTabs],
+  );
+
+  const closePaneByLeaf = useCallback(
+    (leafId: number): void => {
+      setTabs((curr) => {
+        const tab = curr.find((t) => t.kind === "pane" && hasLeaf(t.paneTree, leafId));
+        if (!tab || tab.kind !== "pane") return curr;
+        // Both halves of the close rule, at the mutation itself - see
+        // `lib/closable.ts`. `leafCloseRefusal` subsumes the `curr.length <= 1`
+        // guard this used to carry inline (it refuses whenever the workspace is
+        // down to one entry), and adds the permanent-page rule the inline guard
+        // could not express.
+        if (leafCloseRefusal(curr, leafId) !== null) return curr;
+        const newTree = removeLeaf(tab.paneTree, leafId);
+        if (newTree === null) {
+          const idx = curr.findIndex((x) => x.id === tab.id);
+          const next = curr.filter((x) => x.id !== tab.id);
+          // Same two points as `closeTab`: a removal keeps the rail view, and the
+          // landing tab is looked up defensively rather than indexed blind.
+          const landing = next[Math.max(0, idx - 1)] ?? next[0];
+          rehomeActiveId((active) => (active === tab.id ? (landing?.id ?? 0) : active));
+          return next;
+        }
+        const remaining = leafIds(newTree);
+        let newActive = tab.activeLeafId;
+        if (tab.activeLeafId === leafId) {
+          const sib = siblingLeafOf(tab.paneTree, leafId);
+          newActive = sib && remaining.includes(sib) ? sib : remaining[0];
+        }
+        return curr.map((x) => {
+          if (x.id !== tab.id || x.kind !== "pane") return x;
+          return syncPaneMirror({
+            ...x,
+            paneTree: newTree,
+            activeLeafId: newActive,
+          });
+        });
+      });
+    },
+    [rehomeActiveId],
+  );
+
+  /**
+   * Workspace switch. Replaces the tab list and active id atomically,
+   * rebases `nextIdRef`, and backfills `terminalOrdinal` on legacy leaves
+   * in tab/tree order so older state numbers like a fresh creation.
+   */
+  const replaceAllTabs = useCallback(
+    (nextTabs: Tab[], nextActiveId: number | null) => {
+      let maxId = 0;
+      let maxOrdinal = 0;
+      for (const t of nextTabs) {
+        if (t.id > maxId) maxId = t.id;
+        if (t.kind === "pane") {
+          for (const l of leaves(t.paneTree)) {
+            if (l.id > maxId) maxId = l.id;
+            if (l.leafKind === "terminal" && typeof l.terminalOrdinal === "number") {
+              if (l.terminalOrdinal > maxOrdinal) maxOrdinal = l.terminalOrdinal;
+            }
+          }
+        }
+      }
+      let nextOrdinal = maxOrdinal + 1;
+      const stamp = (node: PaneNode): PaneNode => {
+        if (node.kind === "leaf") {
+          if (node.leafKind === "terminal" && node.terminalOrdinal == null) {
+            return { ...node, terminalOrdinal: nextOrdinal++ };
+          }
+          return node;
+        }
+        return { ...node, children: node.children.map(stamp) };
+      };
+      const stamped = nextTabs.map((t) =>
+        t.kind === "pane" ? syncPaneMirror({ ...t, paneTree: stamp(t.paneTree) }) : t,
+      );
+      setTabs(stamped);
+      // The whole tab list changed under it, so the tabs are what to show either
+      // way: with a target, focusing it leaves the rail view; with none (a
+      // workspace whose restore produced nothing to focus) the view still has to
+      // go, or the switch lands behind it.
+      if (nextActiveId !== null) setActiveId(nextActiveId);
+      else showTabs();
+      nextIdRef.current = Math.max(nextIdRef.current, maxId + 1);
+      nextOrdinalRef.current = nextOrdinal;
+    },
+    [setActiveId, showTabs],
+  );
+
+  /** Allocate a fresh id from the same counter as tabs and leaves. */
+  const allocId = useCallback(() => nextIdRef.current++, []);
+
+  /**
+   * Move a leaf into `targetTabId` as a horizontal split. Preserves the
+   * leaf id so PTY/editor session stays attached. Drops the source tab if
+   * it ends up empty.
+   * Returns `"ok"`, `"full"` (target at `MAX_PANES_PER_TAB`), or
+   * `"invalid"` (not found, source = target, target isn't a pane tab).
+   */
+  const moveLeafToTab = useCallback(
+    (leafId: number, targetTabId: number): "ok" | "full" | "invalid" => {
+      type MoveResult = "ok" | "full" | "invalid";
+      // Cast so TS doesn't narrow `result` to literal `"invalid"`. The setTabs
+      // callback mutates it via closure, which CFA can't see.
+      let result = "invalid" as MoveResult;
+      setTabs((curr) => {
+        const source = curr.find(
+          (t): t is PaneTab => t.kind === "pane" && hasLeaf(t.paneTree, leafId),
+        );
+        if (!source) return curr;
+        if (source.id === targetTabId) return curr;
+        const target = curr.find((t): t is PaneTab => t.kind === "pane" && t.id === targetTabId);
+        if (!target) return curr;
+        if (leafIds(target.paneTree).length >= MAX_PANES_PER_TAB) {
+          result = "full";
+          return curr;
+        }
+        const leaf = findLeaf(source.paneTree, leafId);
+        if (!leaf) return curr;
+        // Reuse the leaf's state verbatim so cwd, hostId, ordinal,
+        // dirty, and preview travel with it. Leaf id is preserved so App.tsx's
+        // per-leaf refs keep their mapping.
+        const state: LeafState = cloneLeafState(leaf);
+        const newSourceTree = removeLeaf(source.paneTree, leafId);
+        const splitId = nextIdRef.current++;
+        const newTargetTree = splitLeaf(
+          target.paneTree,
+          target.activeLeafId,
+          splitId,
+          leafId,
+          "row",
+          state,
+        );
+        result = "ok";
+        const next: Tab[] = [];
+        for (const t of curr) {
+          if (t.kind !== "pane") {
+            next.push(t);
+            continue;
+          }
+          if (t.id === source.id) {
+            // Source emptied: drop the tab.
+            if (newSourceTree === null) continue;
+            const remaining = leafIds(newSourceTree);
+            let newActive = t.activeLeafId;
+            if (t.activeLeafId === leafId) {
+              const sib = siblingLeafOf(t.paneTree, leafId);
+              newActive = sib && remaining.includes(sib) ? sib : remaining[0];
+            }
+            next.push(
+              syncPaneMirror({
+                ...t,
+                paneTree: newSourceTree,
+                activeLeafId: newActive,
+              }),
+            );
+            continue;
+          }
+          if (t.id === targetTabId) {
+            next.push(
+              syncPaneMirror({
+                ...t,
+                paneTree: newTargetTree,
+                activeLeafId: leafId,
+              }),
+            );
+            continue;
+          }
+          next.push(t);
+        }
+        return next;
+      });
+      // Focus the destination so the moved leaf lands in view.
+      if (result === "ok") setActiveId(targetTabId);
+      return result;
+    },
+    [],
+  );
+
+  /**
+   * Extract a leaf into a new top-level pane tab. Preserves leaf id and
+   * state so the underlying session survives. Returns `"invalid"` when
+   * `leafId` isn't inside a multi-leaf split, `"ok"` on success.
+   */
+  const moveLeafToNewTab = useCallback((leafId: number): "ok" | "invalid" => {
+    type MoveResult = "ok" | "invalid";
+    let result = "invalid" as MoveResult;
+    let newTabId: number | null = null;
+    setTabs((curr) => {
+      const source = curr.find(
+        (t): t is PaneTab => t.kind === "pane" && hasLeaf(t.paneTree, leafId),
+      );
+      if (!source) return curr;
+      // Only meaningful for split tabs. Single-leaf extract would just rename and waste an id.
+      const sourceLeafIds = leafIds(source.paneTree);
+      if (sourceLeafIds.length < 2) return curr;
+      const leaf = findLeaf(source.paneTree, leafId);
+      if (!leaf) return curr;
+      const state: LeafState = cloneLeafState(leaf);
+      const newSourceTree = removeLeaf(source.paneTree, leafId);
+      // Source has 2+ leaves so removing one leaves something. Guard anyway.
+      if (newSourceTree === null) return curr;
+      const tabId = nextIdRef.current++;
+      const newLeaf: PaneLeaf = {
+        kind: "leaf",
+        id: leafId,
+        ...state,
+      };
+      const remaining = leafIds(newSourceTree);
+      let sourceActive = source.activeLeafId;
+      if (source.activeLeafId === leafId) {
+        const sib = siblingLeafOf(source.paneTree, leafId);
+        sourceActive = sib && remaining.includes(sib) ? sib : remaining[0];
+      }
+      result = "ok";
+      newTabId = tabId;
+      const next: Tab[] = [];
+      for (const t of curr) {
+        next.push(t);
+        if (t.id === source.id) {
+          next[next.length - 1] = syncPaneMirror({
+            ...source,
+            paneTree: newSourceTree,
+            activeLeafId: sourceActive,
+          });
+          // Insert the new tab right after the source so the user can track the move.
+          next.push(
+            syncPaneMirror({
+              id: tabId,
+              kind: "pane",
+              title: source.title,
+              paneTree: newLeaf,
+              activeLeafId: leafId,
+            }),
+          );
+        }
+      }
+      return next;
+    });
+    if (result === "ok" && newTabId !== null) setActiveId(newTabId);
+    return result;
+  }, []);
+
+  /**
+   * Rotate `leafId` by pairing it with its immediate sibling in a sub-split
+   * of the opposite direction. Other siblings stay put, so rotating B in
+   * `[A, B, C]` affects only B and C. The tree is normalized afterwards
+   * so a second click cleanly undoes the change.
+   *
+   * Shows the tabs, and this is one of the two the rail-view sweep found by
+   * enumerating pane-tree WRITES instead of chords: it is reached from
+   * the header's entry menu, which stays on screen while a rail view covers the
+   * workspace, so rotating from there rearranged panes nobody could see. The
+   * rearrangement IS the whole result, so showing it is the only thing the
+   * action can mean.
+   */
+  const rotateLeafSplit = useCallback(
+    (leafId: number) => {
+      showTabs();
+      setTabs((curr) =>
+        curr.map((t) => {
+          if (t.kind !== "pane") return t;
+          if (!hasLeaf(t.paneTree, leafId)) return t;
+          const splitId = nextIdRef.current++;
+          const rotated = rotateLeafWithNeighbor(t.paneTree, leafId, splitId);
+          if (rotated === null) return t;
+          return syncPaneMirror({
+            ...t,
+            paneTree: normalizePaneTree(rotated),
+          });
+        }),
+      );
+    },
+    [showTabs],
+  );
+
+  /**
+   * Reorder a leaf within its own split group. Places `leafId` before
+   * `beforeLeafId`, or at the end when null. No-op when the two leaves
+   * aren't direct siblings. Use Move to New Tab / Join Group for cross-group.
+   *
+   * Shows the tabs for the same reason `rotateLeafSplit` does: the drag that
+   * drives it happens in the header's entry list, which a rail view does not
+   * cover, and the reorder it produces is only visible in the panes.
+   */
+  const reorderLeafInGroup = useCallback(
+    (leafId: number, beforeLeafId: number | null) => {
+      showTabs();
+      setTabs((curr) =>
+        curr.map((t) => {
+          if (t.kind !== "pane") return t;
+          if (!hasLeaf(t.paneTree, leafId)) return t;
+          const paneTree = reorderLeafInTree(t.paneTree, leafId, beforeLeafId);
+          if (paneTree === t.paneTree) return t;
+          return syncPaneMirror({ ...t, paneTree });
+        }),
+      );
+    },
+    [showTabs],
+  );
+
+  /**
+   * Drag-and-drop a leaf onto one edge of another leaf in the same tab.
+   * Repositions the source as a left/right/top/bottom sibling of the target,
+   * preserving its id (and thus its PTY / editor session). No-op across tabs
+   * or when the move can't apply.
+   *
+   * Shows the tabs like the other pane-tree writes, even though the drag that
+   * starts it is inside the covered surface and so cannot begin while a rail
+   * view is up. That is an unreachability claim about affordances, and the
+   * whole point of sweeping by state write is not to rest on one: it also moves
+   * focus to the dragged leaf, which is a route into the tab area whatever
+   * started it. A no-op when no view is showing.
+   */
+  const movePaneLeafToEdge = useCallback(
+    (sourceLeafId: number, targetLeafId: number, edge: PaneEdge) => {
+      if (sourceLeafId === targetLeafId) return;
+      showTabs();
+      setTabs((curr) =>
+        curr.map((t) => {
+          if (t.kind !== "pane") return t;
+          if (!hasLeaf(t.paneTree, sourceLeafId) || !hasLeaf(t.paneTree, targetLeafId)) return t;
+          const splitId = nextIdRef.current++;
+          const moved = movePaneLeafToEdgeInTree(
+            t.paneTree,
+            sourceLeafId,
+            targetLeafId,
+            edge,
+            splitId,
+          );
+          if (moved === null || moved === t.paneTree) return t;
+          return syncPaneMirror({ ...t, paneTree: moved, activeLeafId: sourceLeafId });
+        }),
+      );
+    },
+    [showTabs],
+  );
+
+  /**
+   * Reorder tabs: move `fromTabId` before `beforeTabId`, or append when null.
+   *
+   * Does NOT show the tabs, and is one of the writes the sweep deliberately
+   * leaves alone: it changes neither a pane tree nor which tab is active, only
+   * the order of the strip - and the strip is the one part of the tab area a
+   * rail view does not cover, so the result is already on screen.
+   */
+  const reorderTabs = useCallback((fromTabId: number, beforeTabId: number | null) => {
+    setTabs((curr) => {
+      const from = curr.find((t) => t.id === fromTabId);
+      if (!from) return curr;
+      const others = curr.filter((t) => t.id !== fromTabId);
+      if (beforeTabId === null) return [...others, from];
+      const idx = others.findIndex((t) => t.id === beforeTabId);
+      if (idx < 0) return [...others, from];
+      const result = [...others];
+      result.splice(idx, 0, from);
+      return result;
+    });
+  }, []);
+
+  return {
+    tabs,
+    activeId,
+    setActiveId,
+    // The rail view rides with `activeId` because it is the other half of "what
+    // the workspace area is showing". App renders it; only the funnels above
+    // write it, and `toggleRailView` is the one way IN.
+    railView,
+    toggleRailView,
+    newTab,
+    newPaneGroupTab,
+    newSshTab,
+    newRdpTab,
+    openFileTab,
+    pinTab,
+    openBoardTab,
+    openPageTab,
+    closeTab,
+    selectByIndex,
+    setLeafCwd,
+    renameLeaf,
+    setLeafTerminalTheme,
+    setLeafPtyId,
+    setLeafActiveTool,
+    setSplitSizes,
+    setEditorLeafDirty,
+    setEditorLeafPath,
+    focusPane,
+    focusNextPaneInTab,
+    splitActivePane,
+    closePaneByLeaf,
+    moveLeafToTab,
+    moveLeafToNewTab,
+    rotateLeafSplit,
+    replaceAllTabs,
+    allocId,
+    reorderTabs,
+    reorderLeafInGroup,
+    movePaneLeafToEdge,
+  };
+}

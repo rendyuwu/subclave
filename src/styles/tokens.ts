@@ -1,0 +1,69 @@
+/**
+ * Resolves shadcn CSS custom properties to rgb strings.
+ *
+ * globals.css uses oklch(), which xterm.js (WebGL) and CodeMirror's static
+ * theme builder can't read. Setting `color: var(--x)` on a probe element
+ * forces computed `color` into rgb form, which both consumers accept.
+ *
+ * Tokens are read on each call. Re-invoke after a theme change.
+ */
+
+let probe: HTMLDivElement | null = null;
+
+function resolve(varName: string): string {
+  if (!probe) {
+    probe = document.createElement("div");
+    probe.style.position = "absolute";
+    probe.style.visibility = "hidden";
+    probe.style.pointerEvents = "none";
+    document.body.appendChild(probe);
+  }
+  probe.style.color = `var(--${varName})`;
+  return getComputedStyle(probe).color;
+}
+
+/**
+ * Terminal-owned tokens, kept SEPARATE from the app chrome tokens above. The
+ * terminal reads its own `--tervia-term-*` vars so it can be themed independently
+ * of the app. In `follow-app` mode those vars default (in globals.css) to the
+ * app tokens, so this still resolves to the chrome palette without any coupling
+ * in the read path.
+ */
+const TERM_ANSI_NAMES = [
+  "black",
+  "red",
+  "green",
+  "yellow",
+  "blue",
+  "magenta",
+  "cyan",
+  "white",
+  "bright-black",
+  "bright-red",
+  "bright-green",
+  "bright-yellow",
+  "bright-blue",
+  "bright-magenta",
+  "bright-cyan",
+  "bright-white",
+] as const;
+
+export type TerminalTokens = {
+  bg: string;
+  fg: string;
+  cursor: string;
+  selection: string;
+  ansi: Record<(typeof TERM_ANSI_NAMES)[number], string>;
+};
+
+export function readTerminalTokens(): TerminalTokens {
+  const ansi = {} as Record<(typeof TERM_ANSI_NAMES)[number], string>;
+  for (const name of TERM_ANSI_NAMES) ansi[name] = resolve(`tervia-term-ansi-${name}`);
+  return {
+    bg: resolve("tervia-term-bg"),
+    fg: resolve("tervia-term-fg"),
+    cursor: resolve("tervia-term-cursor"),
+    selection: resolve("tervia-term-selection"),
+    ansi,
+  };
+}

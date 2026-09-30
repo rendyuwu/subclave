@@ -1,0 +1,517 @@
+/**
+ * Self-check for the three things in the RDP frontend that must not outlive
+ * their owner: a trust prompt, a held key, and a Test probe.
+ * Run: `pnpm verify rdp-lifetime`.
+ *
+ * Source text, not imports, and for the same reason `toast-verify.ts` gives:
+ * these live inside a React component's effects and event handlers, and there is
+ * no DOM or renderer in this suite to drive them through. What is checkable
+ * without one is the STRUCTURE, and structure is exactly what all three
+ * regressions were - a branch that returned instead of answering, a set that was
+ * not in a guard, a state write with no staleness check. Each check below names
+ * the failure it exists to catch, and each one is verified to fail when the
+ * corresponding line is removed.
+ *
+ * 1. A CERTIFICATE PROMPT THAT LANDS AFTER THE PANE IS GONE IS REJECTED. The
+ *    pane's teardown answers the id it recorded, and the id is recorded INSIDE
+ *    the prompt handler - so a handler that returns early on `!alive` records
+ *    nothing and the teardown has nothing to answer. The window is the TCP
+ *    connect plus the TLS handshake, and closing a tab that says "Connecting…"
+ *    is an ordinary thing to do. Behind an unanswered prompt the backend's
+ *    verifier is parked on its full confirm timeout, holding the socket, the
+ *    in-flight handshake and - because it blocks - a displaced runtime thread,
+ *    once per open/close cycle. `rdp_open` has not returned, so no session id
+ *    exists and `rdp_close` cannot help: the rejection is the only way out.
+ *
+ * 2. EVERY HELD SET IS COVERED BY `releaseAll`. A key with no scancode goes out
+ *    as `unicodeDown`, so it never reaches `heldKeys`; while that was the only
+ *    record, `releaseAll` saw nothing held on blur and sent no marker at all.
+ *    The stranded character then stays pressed in the backend's own record, and
+ *    since `Database::apply` suppresses no-op transitions its next real press
+ *    emits nothing either - a key gone dead rather than merely stuck. So the
+ *    check is not "is there a unicode set" but the general form: every held set
+ *    the pane declares is in `releaseAll`'s guard, cleared by it, and cleared
+ *    when a redial resets state - which also fails for a FOURTH set added later
+ *    and forgotten. The forward-looking half ("a new press-side kind records
+ *    what it pressed") reads the STATEMENT LIST the write sits in, not a fixed
+ *    number of characters behind it: with comments stripped, the 220 this used
+ *    to look back reached out of `unicodeDown`'s own branch into `keyDown`'s and
+ *    borrowed its `heldKeys.current.add`, so deleting the unicode record passed.
+ *
+ * 3. A TEST PROBE CANNOT WRITE TO A ROW IT NO LONGER BELONGS TO. The merged host
+ *    editor (`HostEditorDialog`, which used to be `RdpConnectionDialog`) is
+ *    mounted persistently once latched and the trust prompt is global, so
+ *    closing the dialog neither cancels a probe nor hides its question: row A ->
+ *    Test -> cancel -> open row B -> answer, and an ungated write into the draft
+ *    pin map puts A's certificate (or SSH host key) into B's form state, which
+ *    Save then persists onto B. It fails closed (B's next connect aborts as a
+ *    mismatch) but it is a pinned key on a row the user never tested.
+ *
+ *    One `runTest` and one `onTrusted` serve both protocols now, and the two
+ *    success writes are reached through their OWN arm of the protocol branch
+ *    rather than by searching for `kind: "ok"` - which occurs twice, so a single
+ *    search examined the SSH write and the RDP one could lose its guard in
+ *    silence.
+ *
+ *    There used to be a SECOND pin write here, straight to the store, gated on
+ *    the saved record still naming the address the probe dialled. It is gone
+ *    rather than re-gated: the gate stopped a cancelled dialog leaving a foreign
+ *    machine's fingerprint on a record, and did nothing about Forget (a draft
+ *    edit) making the next Test TOFU over the address the record DOES name, so
+ *    accepting replaced the stored pin and Cancel kept the replacement. Nothing
+ *    in this dialog persists a pin now; Save does. So the only trust write left
+ *    is the form's own, and the row guard below is what keeps a probe that
+ *    outlived its row from putting A's certificate into B's form.
+ *    `host-editor-verify.ts`'s section [3] owns the absence rule in full; what
+ *    is here is that the row guard covers EVERY such write, counted, rather
+ *    than the first.
+ *
+ * 4. THE `pagehide` BACKSTOP ANSWERS BOTH PROTOCOLS. `HostKeyPromptDialog` is
+ *    shared, so its backstop fires for an SSH host key as well as an RDP
+ *    certificate. That is deliberate - `ssh_open` waits on the same 120 seconds
+ *    holding the same mid-handshake socket - and it is pinned here because it
+ *    reads like an accident of sharing, so the obvious "tidy-up" is to scope it
+ *    back to certificates. This check makes that argue with the comment first.
+ *
+ * Two things every check below depends on, and both are load-bearing rather than
+ * tidiness.
+ *
+ * COMMENTS ARE REMOVED FIRST. Every guard here is described in prose directly
+ * above itself, in detail, in the same identifiers: "an ungated write puts A's
+ * certificate into B's pin state" satisfies a search for the guard it describes.
+ * A sibling script's whole suite passed against `const keepPin = true; // was:
+ * const keepPin = !existing || existing.host === host;` for exactly that reason,
+ * so trailing comments go as well as whole-line ones - and the stripper is
+ * quote-aware, because a `//` inside a string literal is not a comment.
+ *
+ * GUARD SCOPE IS READ BY WALKING BRACES, not by measuring distance. Two proxies
+ * for "this write is inside that guard" have now failed in this file. A fixed
+ * 90-character lookback found the PREVIOUS statement's guard and called a
+ * deliberately ungated write gated. The `;`-counting rule that replaced it
+ * passed BOTH halves of section [3] - the positive AND the negative - against
+ * the exact regression the negative half exists to catch, because a write that
+ * is the second statement inside a guard has a `;` behind it and one that is the
+ * first does not. Section [0] holds the replacements to samples whose answers
+ * are known: a structural check nobody has watched fail is a comment.
+ */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { stripComments, stripperSelfTest } from "./lib/source";
+import { guardAt, guardAtSelfTest, scopeOf } from "./lib/scope";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const read = (p: string) => readFileSync(join(root, p), "utf8");
+
+let failed = 0;
+function check(name: string, ok: boolean, detail?: unknown): void {
+  if (ok) {
+    console.log(`  ok: ${name}`);
+    return;
+  }
+  console.error(`  FAIL: ${name}`, detail === undefined ? "" : JSON.stringify(detail));
+  failed++;
+}
+
+/**
+ * The source between two anchors, or "" if either is missing.
+ *
+ * Anchored on code rather than line numbers so an edit above does not move the
+ * region, and the "region was found" check below is what catches an anchor that
+ * has been renamed out from under this file - otherwise every check over an
+ * empty string would pass for the wrong reason.
+ */
+function between(src: string, from: string, to: string): string {
+  const start = src.indexOf(from);
+  if (start < 0) return "";
+  const end = src.indexOf(to, start + from.length);
+  if (end < 0) return "";
+  return src.slice(start, end);
+}
+
+/** The statements of that list, with the partial one `at` itself sits in dropped. */
+function statementsBefore(src: string, at: number): string[] {
+  const parts = scopeOf(src, at).before.split(";");
+  // Whatever follows the last `;` is the statement in progress - the one `at` is
+  // inside - however far into it `at` happens to point.
+  parts.pop();
+  return parts.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/**
+ * `guardAt` for the first occurrence of `needle`. The needle must name a
+ * STATEMENT (`setTest({`, not `kind: "ok"`) or the statement text read back is
+ * a fragment of an argument list.
+ */
+function enclosingGuard(region: string, needle: string): string {
+  return guardAt(region, region.indexOf(needle));
+}
+
+/**
+ * The same answer for EVERY occurrence of `needle`, in source order.
+ *
+ * The all-matches rule, which this file already follows for
+ * `kind: "ok"` by reaching each protocol arm separately. The form it exists for is
+ * the other one: a second write of the same kind added beside a correctly guarded
+ * first one, which `enclosingGuard` reports nothing about. A caller asserts the
+ * COUNT as well, because `[].every(...)` is true - a write that disappears must not
+ * pass either.
+ */
+function enclosingGuards(region: string, needle: string): string[] {
+  const out: string[] = [];
+  for (let at = region.indexOf(needle); at >= 0; at = region.indexOf(needle, at + 1)) {
+    out.push(guardAt(region, at));
+  }
+  return out;
+}
+
+function count(src: string, re: RegExp): number {
+  return [...src.matchAll(re)].length;
+}
+
+const paneRaw = read("src/modules/rdp/RdpPane.tsx");
+const editorRaw = read("src/modules/hosts/HostEditorDialog.tsx");
+const promptDialogRaw = read("src/modules/ssh/HostKeyPromptDialog.tsx");
+const paneSrc = stripComments(paneRaw);
+const editorSrc = stripComments(editorRaw);
+const promptDialogSrc = stripComments(promptDialogRaw);
+
+// ---------------------------------------------------------------------------
+console.log("[0] the helpers the checks below depend on");
+{
+  // The walk itself; its probes live with it in scripts/lib/scope.ts and the
+  // verdicts are counted here.
+  for (const t of guardAtSelfTest()) check(t.label, t.ok);
+
+  // The all-matches form, and the false pass it exists to remove: a second write
+  // of the same kind added beside a correctly guarded first one.
+  {
+    const two = "if (a === b) writeIt();\nwriteIt();\n";
+    check(
+      "enclosingGuards reports every occurrence, not just the one enclosingGuard finds",
+      enclosingGuard(two, "writeIt()") === "a === b" &&
+        JSON.stringify(enclosingGuards(two, "writeIt()")) === JSON.stringify(["a === b", ""]),
+      { first: enclosingGuard(two, "writeIt()"), all: enclosingGuards(two, "writeIt()") },
+    );
+    check(
+      "and an empty list for a needle that is not there, which no caller may read as a pass",
+      enclosingGuards("x();\n", "writeIt()").length === 0,
+    );
+  }
+
+  const sample = 'if (a) {\n  mark();\n  send({ kind: "x" });\n}\n';
+  check(
+    "statementsBefore walks out of an argument position to the block the call is in",
+    statementsBefore(sample, sample.indexOf('kind: "x"')).join(" | ") === "mark()",
+    statementsBefore(sample, sample.indexOf('kind: "x"')),
+  );
+  const sibling = 'if (a) { mark(); }\nsend({ kind: "x" });\n';
+  check(
+    "and does not report a statement from a nested block that merely precedes it in the text",
+    !statementsBefore(sibling, sibling.indexOf('kind: "x"')).join(" | ").includes("mark()"),
+    statementsBefore(sibling, sibling.indexOf('kind: "x"')),
+  );
+  const literal = 'f({ kind: "yDown" });\nsend({ kind: "x" });\n';
+  check(
+    "a nested literal's fields are not statements of the list either",
+    !statementsBefore(literal, literal.indexOf('kind: "x"')).join(" | ").includes("yDown"),
+    statementsBefore(literal, literal.indexOf('kind: "x"')),
+  );
+  const two = "a();\nb();\n";
+  check(
+    "and the statement the needle itself sits in is not reported as preceding it",
+    statementsBefore(two, two.indexOf("b()")).join(" | ") === "a()",
+    statementsBefore(two, two.indexOf("b()")),
+  );
+  const arrow = "h = (e) => {\n  mark(e);\n  send({ k: 1 });\n}";
+  check(
+    "an arrow body counts as a statement list, which is what every handler here is",
+    statementsBefore(arrow, arrow.indexOf("k: 1")).join(" | ") === "mark(e)",
+    statementsBefore(arrow, arrow.indexOf("k: 1")),
+  );
+
+  check(
+    "stripComments drops a comment that merely NAMES a guard",
+    !stripComments("// if (a === b)\nwriteIt();").includes("a === b"),
+  );
+  check(
+    "and drops it when it TRAILS the line that removed the guard",
+    !stripComments("const keep = true; // was: keep = a === b;").includes("a === b"),
+    stripComments("const keep = true; // was: keep = a === b;"),
+  );
+  check(
+    "but leaves a // that is inside a string, which is not a comment",
+    stripComments('const s = "a // b";').includes("a // b"),
+  );
+  check("and keeps the code around it", stripComments("// x\nwriteIt();").includes("writeIt();"));
+
+  // The JSX-comment branch, both directions. The probe lives with the shared
+  // stripper; the `ok:` lines are counted here.
+  for (const t of stripperSelfTest()) check(t.label, t.ok);
+
+  for (const [path, raw, stripped] of [
+    ["RdpPane.tsx", paneRaw, paneSrc],
+    ["HostEditorDialog.tsx", editorRaw, editorSrc],
+    ["HostKeyPromptDialog.tsx", promptDialogRaw, promptDialogSrc],
+  ] as const) {
+    check(
+      `${path} survived stripping, and something was removed from it`,
+      stripped.length > 1000 && stripped.length < raw.length,
+      [stripped.length, raw.length],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[1] a certificate prompt raised after the teardown is ANSWERED");
+{
+  const handler = between(paneSrc, "onCertPrompt: (prompt) => {", "onResize:");
+  check("the cert-prompt handler was found", handler.length > 100, handler.length);
+
+  const guard = handler.indexOf("if (!alive)");
+  const records = handler.indexOf("promptId = prompt.promptId");
+  check("it guards on liveness", guard >= 0);
+  check("and records the id for the teardown to answer", records > guard, [guard, records]);
+
+  // The whole finding in one assertion: the rejection is what the liveness
+  // branch DOES, and it has to be, because that branch runs before the id exists
+  // anywhere the teardown can reach.
+  check(
+    "the liveness branch rejects the prompt itself",
+    enclosingGuard(handler, "confirmRdpCert(prompt.promptId, false)") === "!alive",
+    enclosingGuard(handler, "confirmRdpCert(prompt.promptId, false)"),
+  );
+  check(
+    "and does not merely return, which would drop it with nobody to answer",
+    !/if \(!alive\) return;/.test(handler),
+  );
+}
+{
+  // The other half of the invariant, unchanged by this fix and pinned so it
+  // stays: a prompt the pane DID record is answered on the way out, and the
+  // tunnel's host-key questions with it.
+  const teardown = between(paneSrc, "return () => {\n      alive = false;", "}, [connectionId");
+  check("the session effect's teardown was found", teardown.length > 100, teardown.length);
+  check(
+    "a recorded certificate prompt is abandoned on the way out",
+    /if \(promptId\) useHostKeyPrompt\.getState\(\)\.abandon\(promptId\);/.test(teardown),
+  );
+  check(
+    "and so is every tunnel host-key prompt this attempt raised",
+    /for \(const id of sshPromptIds\) useHostKeyPrompt\.getState\(\)\.abandon\(id\);/.test(
+      teardown,
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[2] every held set the pane keeps is released on blur");
+{
+  // Whatever they are called and however many there are. A fourth set added
+  // later and left out of any of the three places below fails this.
+  const held = [...paneSrc.matchAll(/const (held\w+) = useRef</g)].map((m) => m[1]);
+  check("the pane's held sets were found", held.length >= 3, held);
+  check("including one for keys with no scancode", held.includes("heldUnicode"), held);
+
+  const releaseAll = between(
+    paneSrc,
+    "const releaseAll = useCallback(() => {",
+    "}, [queueInputNow]);",
+  );
+  check("releaseAll was found", releaseAll.length > 50, releaseAll.length);
+  // The early return is the bug's location: it decides whether the marker is
+  // sent at all, and a set missing from it is a set that cannot trigger one.
+  const guard = between(releaseAll, "if (", "{\n      return;");
+  check("its early return guard was found", guard.length > 20, guard);
+  for (const set of held) {
+    check(`${set} is in the guard, so holding only it still sends the marker`, guard.includes(set));
+    check(`${set} is cleared by releaseAll`, releaseAll.includes(`${set}.current.clear()`));
+  }
+
+  // A redial starts from nothing held: the server has a fresh session and the
+  // old record would make the first release of a carried-over key a no-op.
+  const reset = between(paneSrc, 'setStatus({ kind: "connecting" });', "void (async () => {");
+  check("the redial reset was found", reset.length > 50, reset.length);
+  for (const set of held) {
+    check(`${set} is cleared when the pane redials`, reset.includes(`${set}.current.clear()`));
+  }
+
+  // Forward-looking: a new "down" input kind must record what it pressed, or
+  // `releaseAll` cannot know about it however many sets exist.
+  //
+  // Ctrl+Alt+Del is the one exemption, and a real one rather than an oversight:
+  // it synthesises its own matching ups in the same batch, so nothing is ever
+  // left held for a blur to release. `rdp-frame-verify.ts` is where that pairing
+  // is asserted ("released in reverse", "nothing is left held"), so skipping it
+  // here does not leave it unchecked.
+  const cadFrom = paneSrc.indexOf("const sendCtrlAltDel = useCallback(");
+  const cadTo = paneSrc.indexOf("}, [queueInput]);", cadFrom);
+  check(
+    "the Ctrl+Alt+Del synthesiser was found, so the exemption is real",
+    cadFrom >= 0 && cadTo > cadFrom,
+    [cadFrom, cadTo],
+  );
+  const downKinds = [...paneSrc.matchAll(/kind: "(\w+Down)"/g)]
+    .map((m) => ({ kind: m[1], at: m.index ?? 0 }))
+    .filter(({ at }) => at < cadFrom || at > cadTo);
+  check(
+    "the pane's press-side input kinds were found",
+    downKinds.length >= 3,
+    downKinds.map((d) => d.kind),
+  );
+  const isRecord = (stmt: string) => /held\w+\.current\.add\(/.test(stmt);
+  for (const { kind, at } of downKinds) {
+    // The statement list this write sits in, not a window of characters behind
+    // it: the record is taken before the event is queued, which is a fact about
+    // the block and not about how much prose the handler carries.
+    const before = statementsBefore(paneSrc, at);
+    check(`${kind} records what it pressed in a held set`, before.some(isRecord), before.slice(-3));
+    // Adjacency, deliberately: a fourth kind bolted on AFTER an existing
+    // record/queue pair sits in the same block as that record and would borrow
+    // it. The pairing is one statement wide in all three handlers, and a
+    // refactor that separates them should have to say why here.
+    check(
+      `and takes that record immediately before queueing ${kind}, not somewhere above it`,
+      isRecord(before[before.length - 1] ?? ""),
+      before.slice(-2),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[3] a Test probe cannot write to a row it no longer belongs to");
+{
+  check(
+    "the editor tracks the target it is showing right now",
+    /applied\.current = token;/.test(editorSrc),
+  );
+
+  const runTest = between(editorSrc, "const runTest = async () => {", "const save = async () => {");
+  check("runTest was found", runTest.length > 500, runTest.length);
+  check("a probe captures the token it started on", /const probeToken = token;/.test(runTest));
+
+  // The row guard by what it IS, not by the name it goes by: a callable, so it
+  // is evaluated when the answer arrives rather than captured with the probe,
+  // comparing the target on screen against that capture. Reading the name out of
+  // the source is also what keeps a rename from turning the four guard checks
+  // below into searches for a string no longer in the file.
+  const rowGuard =
+    /const (\w+) = \(\) => applied\.current === probeToken;/.exec(runTest)?.[1] ?? "";
+  check(
+    "and the row guard compares the target on screen against that capture, live",
+    rowGuard.length > 0,
+    runTest.slice(0, 600),
+  );
+  const onRow = `${rowGuard}()`;
+
+  const onTrusted = between(runTest, "const onTrusted = (fingerprint: string) => {", "\n    try {");
+  check("its trust callback was found", onTrusted.length > 50, onTrusted.length);
+
+  // EVERY write to the form's pins, with the count asserted: the first-match form
+  // this replaces reports the guard of the one that is still correct and says
+  // nothing about a second one added beside it, and an empty list would satisfy
+  // `every` if the write were deleted outright.
+  const formPins = enclosingGuards(onTrusted, "setPins(");
+  check("the callback holds exactly one write to the form's pins", formPins.length === 1, formPins);
+  check(
+    "and every one of them is written only while the editor is still on the row that was probed",
+    formPins.length > 0 && formPins.every((g) => g === onRow),
+    formPins,
+  );
+
+  // The other half of the split is GONE rather than guarded, so the check is the
+  // absence. Gating the store write on the saved address closed the cancelled-dialog
+  // case where a FOREIGN fingerprint landed on a record and left the one
+  // where it lands on the address the record does name: Forget removes the pin from
+  // the draft, so Test TOFUs instead of raising the mismatch, accepting overwrites
+  // the stored pin because the addresses agree, and Cancel keeps it. Save is the
+  // only thing that commits a pin now.
+  check(
+    "the trust callback persists nothing, so a cancelled dialog cannot change a stored pin",
+    !onTrusted.includes("pinFingerprint("),
+    onTrusted.trim(),
+  );
+  check(
+    "and the editor does not reach the store's pin writer from anywhere",
+    !editorSrc.includes("pinFingerprint"),
+    /.*pinFingerprint.*/.exec(editorSrc)?.[0],
+  );
+
+  // Both protocol arms, reached separately. `kind: "ok"` occurs twice, so one
+  // search over `runTest` examined the SSH write and left the RDP guard
+  // unchecked; the `setTest` count per arm is what keeps a drifted anchor from
+  // quietly merging them again.
+  const arms = [
+    {
+      what: "the SSH probe's success",
+      region: between(
+        runTest,
+        'if (protocol === "ssh") {',
+        "const credential = rdpCredentialForTest(",
+      ),
+      kind: 'kind: "ok"',
+    },
+    {
+      what: "the RDP probe's success",
+      region: between(runTest, "const result = await runRdpProbe(", "} catch (e) {"),
+      kind: 'kind: "ok"',
+    },
+    {
+      what: "either probe's failure",
+      region: between(runTest, "} catch (e) {", "\n  };"),
+      kind: 'kind: "fail"',
+    },
+  ];
+  for (const { what, region, kind } of arms) {
+    check(`${what} arm was found`, region.length > 50, region.length);
+    check(
+      `${what} arm holds exactly one result write, so this is that arm's own`,
+      count(region, /setTest\(/g) === 1,
+      count(region, /setTest\(/g),
+    );
+    check(`${what} arm writes ${kind}`, region.includes(kind), region.trim().slice(0, 120));
+    check(
+      `${what} is reported only while the editor is still on the row that was probed`,
+      enclosingGuard(region, "setTest({") === onRow,
+      enclosingGuard(region, "setTest({"),
+    );
+  }
+
+  // The synchronous one at the top of the probe is deliberately not gated: it
+  // runs before any await, so it cannot be stale.
+  check(
+    "the probe's own 'running' state is not gated, being written before any await",
+    enclosingGuard(runTest, 'setTest({ kind: "running" })') === "",
+    enclosingGuard(runTest, 'setTest({ kind: "running" })'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[4] the pagehide backstop answers BOTH protocols' prompts");
+{
+  const backstop = between(promptDialogSrc, "const abandonAll = () => {", "};");
+  check("the backstop was found", backstop.length > 50, backstop.length);
+  check(
+    "it walks the whole queue",
+    /for \(const p of \[\.\.\.pending\]\) abandon\(p\.promptId\);/.test(backstop),
+  );
+  // The decision this pins: an SSH host key is answered on the way out too, not
+  // only an RDP certificate. Scoping it to `certificate` would leave `ssh_open`
+  // parked on its own 120-second wait for the same reason, so a later narrowing
+  // has to argue with the comment above the effect rather than slip through.
+  // Comments are gone by here, so the prose that explains the decision cannot be
+  // mistaken for the filter it is arguing against.
+  check(
+    "and does not filter on the field that distinguishes the two",
+    !backstop.includes("certificate"),
+    backstop.trim(),
+  );
+  check(
+    "on pagehide rather than this component's unmount, which live panes survive",
+    /addEventListener\("pagehide", abandonAll\)/.test(promptDialogSrc) &&
+      !/return \(\) => abandonAll\(\)/.test(promptDialogSrc),
+  );
+}
+
+console.log(failed === 0 ? "\nAll rdp-lifetime checks passed." : `\n${failed} check(s) FAILED.`);
+process.exit(failed === 0 ? 0 : 1);

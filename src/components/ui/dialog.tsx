@@ -1,0 +1,183 @@
+import * as React from "react";
+import { Dialog as DialogPrimitive } from "radix-ui";
+
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { X } from "lucide-react";
+import { openModal } from "@/modules/shortcuts/lib/modalRegistry";
+
+function Dialog({
+  open,
+  modalName,
+  ...props
+}: React.ComponentProps<typeof DialogPrimitive.Root> & {
+  /** Registers this dialog under a name so `isTopModal` can be asked about it.
+   *  Only the Command Palette needs one: it is the single chord
+   *  allowed through the modal gate, and only while its own dialog is the one
+   *  on top. Everything else stays anonymous - being counted is all the gate
+   *  needs from it. Not forwarded to Radix, which has no such prop. */
+  modalName?: string;
+}) {
+  // Registered here, at the shared primitive, so every dialog built
+  // on top of it suppresses global shortcuts while open - see modalRegistry.ts.
+  // Keyed on `open` rather than an onOpenChange hook: every dialog in this
+  // codebase is controlled (grep confirms there is no DialogTrigger-driven
+  // uncontrolled usage), so the resolved `open` prop is the one signal that
+  // covers mount-already-open, ordinary close, AND a force-unmount that skips
+  // the close transition - the effect's cleanup runs on unmount regardless of
+  // why. A future fully-uncontrolled dialog (open only via DialogTrigger, no
+  // `open` prop) would NOT be covered by this and would need its own fix.
+  React.useEffect(() => {
+    if (!open) return;
+    return openModal(modalName);
+  }, [open, modalName]);
+
+  return <DialogPrimitive.Root data-slot="dialog" open={open} {...props} />;
+}
+
+function DialogTrigger({ ...props }: React.ComponentProps<typeof DialogPrimitive.Trigger>) {
+  return <DialogPrimitive.Trigger data-slot="dialog-trigger" {...props} />;
+}
+
+function DialogPortal({ ...props }: React.ComponentProps<typeof DialogPrimitive.Portal>) {
+  return <DialogPrimitive.Portal data-slot="dialog-portal" {...props} />;
+}
+
+function DialogClose({ ...props }: React.ComponentProps<typeof DialogPrimitive.Close>) {
+  return <DialogPrimitive.Close data-slot="dialog-close" {...props} />;
+}
+
+function DialogOverlay({
+  className,
+  ...props
+}: React.ComponentProps<typeof DialogPrimitive.Overlay>) {
+  return (
+    <DialogPrimitive.Overlay
+      data-slot="dialog-overlay"
+      className={cn(
+        "data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0 fixed inset-0 isolate z-50 bg-black/30 duration-100 supports-backdrop-filter:backdrop-blur-sm",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+function DialogContent({
+  className,
+  children,
+  showCloseButton = true,
+  overlayClassName,
+  ...props
+}: React.ComponentProps<typeof DialogPrimitive.Content> & {
+  showCloseButton?: boolean;
+  /** Extra classes for this dialog's backdrop, merged over the shared scrim. */
+  overlayClassName?: string;
+}) {
+  return (
+    <DialogPortal>
+      <DialogOverlay className={overlayClassName} />
+      <DialogPrimitive.Content
+        data-slot="dialog-content"
+        className={cn(
+          "bg-popover text-popover-foreground ring-foreground/5 dark:ring-foreground/10 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 fixed top-1/2 left-1/2 z-50 flex max-h-[calc(100dvh-2rem)] w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col gap-6 overflow-hidden p-6 text-sm shadow-xl ring-1 duration-100 outline-none sm:max-w-md",
+          className,
+        )}
+        {...props}
+      >
+        {children}
+        {showCloseButton && (
+          <DialogPrimitive.Close data-slot="dialog-close" asChild>
+            <Button
+              variant="ghost"
+              className="bg-secondary hover:bg-destructive/10 hover:text-destructive absolute top-4 right-4"
+              size="icon-sm"
+            >
+              <X strokeWidth={2} />
+              <span className="sr-only">Close</span>
+            </Button>
+          </DialogPrimitive.Close>
+        )}
+      </DialogPrimitive.Content>
+    </DialogPortal>
+  );
+}
+
+function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div data-slot="dialog-header" className={cn("flex flex-col gap-1.5", className)} {...props} />
+  );
+}
+
+function DialogFooter({
+  className,
+  showCloseButton = false,
+  children,
+  ...props
+}: React.ComponentProps<"div"> & {
+  showCloseButton?: boolean;
+}) {
+  return (
+    <div
+      data-slot="dialog-footer"
+      // Full-width buttons: each footer button grows to split the row evenly
+      // (one fills, two go 50/50, three thirds) instead of hugging the right.
+      // Matches AlertDialogFooter. Override with `sm:[&>button]:flex-none` for a
+      // bespoke footer layout (see HostEditorDialog).
+      className={cn("flex flex-col-reverse gap-2 sm:flex-row sm:[&>button]:flex-1", className)}
+      {...props}
+    >
+      {children}
+      {showCloseButton && (
+        <DialogPrimitive.Close asChild>
+          <Button variant="outline">Close</Button>
+        </DialogPrimitive.Close>
+      )}
+    </div>
+  );
+}
+
+function DialogTitle({ className, ...props }: React.ComponentProps<typeof DialogPrimitive.Title>) {
+  return (
+    <DialogPrimitive.Title
+      data-slot="dialog-title"
+      className={cn("font-heading text-base leading-none font-medium", className)}
+      {...props}
+    />
+  );
+}
+
+function DialogDescription({
+  className,
+  ...props
+}: React.ComponentProps<typeof DialogPrimitive.Description>) {
+  return (
+    <DialogPrimitive.Description
+      data-slot="dialog-description"
+      className={cn(
+        "text-muted-foreground *:[a]:hover:text-foreground text-sm *:[a]:underline *:[a]:underline-offset-3",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/** Shared width for the wide editor dialogs (system prompts, sub-agents,
+ *  built-in agents, debug viewer): near-full-width on desktop with a small-screen
+ *  gutter. One source of truth so these editors can't drift apart. */
+export const WIDE_DIALOG_WIDTH =
+  "w-[min(96rem,calc(100vw-2rem))] sm:max-w-[min(96rem,calc(100vw-3rem))]";
+
+export {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+  DialogTrigger,
+};

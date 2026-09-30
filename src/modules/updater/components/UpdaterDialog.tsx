@@ -1,0 +1,279 @@
+import { Button } from "@/components/ui/button";
+import { formatBytes } from "@/lib/format";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Progress } from "@/components/ui/progress";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useState } from "react";
+import type { UpdaterState } from "../lib/useUpdater";
+import { ReleaseNotes } from "./ReleaseNotes";
+
+type Props = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  state: UpdaterState;
+  onInstall: () => void;
+  onRelaunch: () => void;
+  onRetry?: () => void;
+};
+
+type DistroKey = "debian" | "fedora";
+
+function distroCommand(key: DistroKey, version: string): string {
+  switch (key) {
+    case "debian":
+      return `sudo apt install ./Tervia_${version}_amd64.deb`;
+    case "fedora":
+      return `sudo dnf install ./Tervia-${version}-1.x86_64.rpm`;
+    default: {
+      const _exhaustive: never = key;
+      return _exhaustive;
+    }
+  }
+}
+
+const DISTROS: { key: DistroKey; label: string }[] = [
+  { key: "debian", label: "Debian / Ubuntu" },
+  { key: "fedora", label: "Fedora / RHEL" },
+];
+
+export function UpdaterDialog({
+  open,
+  onOpenChange,
+  state,
+  onInstall,
+  onRelaunch,
+  onRetry,
+}: Props) {
+  const [copied, setCopied] = useState(false);
+  const [distro, setDistro] = useState<DistroKey>("debian");
+  const manualVersion = state.kind === "manual-available" ? state.version : "";
+  const activeCommand = distroCommand(distro, manualVersion);
+
+  const copyCommand = async () => {
+    if (!navigator?.clipboard?.writeText) return;
+    try {
+      await navigator.clipboard.writeText(activeCommand);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{titleFor(state)}</DialogTitle>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-3 text-[12px] leading-relaxed">
+          {state.kind === "available" && (
+            <>
+              <p className="text-muted-foreground">
+                A new version of Tervia is available.{" "}
+                <span className="text-foreground font-medium">v{state.currentVersion}</span> →{" "}
+                <span className="text-foreground font-medium">v{state.version}</span>
+                {state.date ? (
+                  <span className="text-muted-foreground"> · {formatReleaseDate(state.date)}</span>
+                ) : null}
+              </p>
+              {state.notes ? (
+                <div className="border-border/60 bg-muted/40 max-h-64 overflow-auto rounded-md border p-3 text-[12px] leading-relaxed">
+                  <ReleaseNotes notes={state.notes} />
+                </div>
+              ) : null}
+            </>
+          )}
+
+          {state.kind === "manual-available" && (
+            <>
+              <p className="text-muted-foreground">
+                You're on{" "}
+                <span className="text-foreground font-medium">v{state.currentVersion}</span> - v
+                <span className="text-foreground font-medium">{state.version}</span> is available.
+                Pick your distro and run the command, or grab the package from GitHub.
+              </p>
+              <div className="bg-muted/40 flex gap-1 rounded-md p-1">
+                {DISTROS.map((d) => (
+                  <button
+                    key={d.key}
+                    type="button"
+                    onClick={() => setDistro(d.key)}
+                    className={`flex-1 rounded px-2 py-1 text-[11px] transition-colors ${
+                      distro === d.key
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {d.label}
+                  </button>
+                ))}
+              </div>
+              <div className="border-border/60 bg-muted/40 flex items-center gap-2 rounded-md border px-3 py-2 font-mono text-[12px]">
+                <span className="flex-1 select-all">$ {activeCommand}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => void copyCommand()}
+                >
+                  {copied ? "Copied" : "Copy"}
+                </Button>
+              </div>
+              {state.notes ? (
+                <div className="border-border/60 bg-muted/40 max-h-64 overflow-auto rounded-md border p-3 text-[12px] leading-relaxed">
+                  <ReleaseNotes notes={state.notes} />
+                </div>
+              ) : null}
+            </>
+          )}
+
+          {state.kind === "downloading" && (
+            <>
+              <p className="text-muted-foreground">Downloading v{state.version}…</p>
+              <Progress
+                value={
+                  state.total && state.total > 0
+                    ? Math.min(100, (state.received / state.total) * 100)
+                    : undefined
+                }
+              />
+              <p className="text-muted-foreground text-[11px]">
+                {formatBytes(state.received)}
+                {state.total ? ` / ${formatBytes(state.total)}` : ""}
+              </p>
+            </>
+          )}
+
+          {state.kind === "ready" && (
+            <p className="text-muted-foreground">
+              v{state.version} is installed. Restart Tervia to apply the update.
+            </p>
+          )}
+
+          {state.kind === "error" && (
+            <>
+              <p className="text-destructive">{state.message}</p>
+              <p className="text-muted-foreground text-[11px]">
+                If this persists, grab the latest build manually from the GitHub releases page.
+              </p>
+            </>
+          )}
+
+          {state.kind === "checking" && (
+            <p className="text-muted-foreground">Checking for updates…</p>
+          )}
+
+          {state.kind === "idle" && (
+            <p className="text-muted-foreground">You're on the latest version of Tervia.</p>
+          )}
+        </div>
+
+        <DialogFooter>
+          {state.kind === "available" && (
+            <>
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                Later
+              </Button>
+              <Button onClick={onInstall}>Download & install</Button>
+            </>
+          )}
+          {state.kind === "manual-available" && (
+            <>
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                Later
+              </Button>
+              <Button onClick={() => void openUrl(state.releaseUrl)}>Download package</Button>
+            </>
+          )}
+          {state.kind === "downloading" && (
+            <Button variant="outline" disabled>
+              Installing…
+            </Button>
+          )}
+          {state.kind === "ready" && (
+            <>
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                Later
+              </Button>
+              <Button onClick={onRelaunch}>Restart now</Button>
+            </>
+          )}
+          {state.kind === "error" && (
+            <>
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                Close
+              </Button>
+              {onRetry ? <Button onClick={onRetry}>Retry</Button> : null}
+            </>
+          )}
+          {state.kind === "idle" && onRetry ? (
+            <>
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                Close
+              </Button>
+              <Button onClick={onRetry}>Check again</Button>
+            </>
+          ) : null}
+          {state.kind === "checking" && (
+            <Button variant="outline" disabled>
+              Checking…
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function titleFor(state: UpdaterState): string {
+  switch (state.kind) {
+    case "available":
+      return "Update available";
+    case "manual-available":
+      return "Update available";
+    case "downloading":
+      return "Downloading update";
+    case "ready":
+      return "Update ready";
+    case "error":
+      return "Update check failed";
+    case "checking":
+      return "Checking for updates";
+    case "idle":
+      return "You're up to date";
+    default:
+      return "Update";
+  }
+}
+
+const RELEASE_DATE_FORMAT = new Intl.DateTimeFormat("en-GB", {
+  day: "2-digit",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+/** Tauri's updater emits dates like "2024-01-15 12:34:56.000 +00:00:00". Normalize to ISO first; falls back to raw on parse failure. */
+function formatReleaseDate(raw: string): string {
+  const iso = raw
+    .replace(" ", "T")
+    .replace(/\.\d+/, "")
+    .replace(/([+-]\d{2}):(\d{2}):\d{2}$/, "$1:$2");
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    const fallback = new Date(raw);
+    if (Number.isNaN(fallback.getTime())) return raw;
+    return RELEASE_DATE_FORMAT.format(fallback);
+  }
+  return RELEASE_DATE_FORMAT.format(d);
+}

@@ -1,0 +1,4646 @@
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use russh::client::{
+    self, AuthResult, Config, Handle, Handler, KeyboardInteractiveAuthResponse, Msg,
+};
+use russh::keys::agent::client::{AgentClient, AgentStream};
+use russh::keys::agent::AgentIdentity;
+use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::AgentAuthError;
+use russh::{ChannelMsg, ChannelWriteHalf, Disconnect};
+use russh_sftp::client::SftpSession;
+use serde::Serialize;
+use tauri::ipc::Channel as IpcChannel;
+use tokio::sync::{oneshot, watch, Mutex};
+use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
+
+use super::sftp::open_sftp_on_handle;
+use super::{SshOpenInput, SshSecrets};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Host-key / public-key signature algorithms we accept, in preference order.
+/// This is russh's vetted default set MINUS bare `ssh-rsa` (RSA with SHA-1
+/// signatures): SHA-1 is collision-broken and OpenSSH has disabled `ssh-rsa`
+/// by default since 8.8. Every server from OpenSSH 7.2 (2016) onward offers
+/// ed25519 / ecdsa / rsa-sha2-*, so dropping it costs no realistic
+/// compatibility while removing the one weak item left in russh 0.60's default
+/// host-key list. KEX, ciphers, MACs and compression stay at russh's defaults
+/// (modern KEX including OpenSSH strict-kex / Terrapin mitigation, AEAD + CTR
+/// ciphers, SHA-2-only MACs). Pinning the set here also freezes the posture
+/// across russh version bumps.
+const HOST_KEY_ALGOS: &[Algorithm] = &[
+    Algorithm::Ed25519,
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP256,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP384,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP521,
+    },
+    Algorithm::Rsa {
+        hash: Some(HashAlg::Sha512),
+    },
+    Algorithm::Rsa {
+        hash: Some(HashAlg::Sha256),
+    },
+];
+
+#[derive(Serialize, Clone, Debug)]
+// `rename_all` only camelCases the variant TAGS (e.g. `hostKeyPrompt`); it does
+// NOT touch the fields inside struct variants - that needs `rename_all_fields`.
+// Without it, `HostKeyPrompt::prompt_id` went over the IPC channel as snake_case
+// `prompt_id`, so the frontend's `event.promptId` was `undefined`. The
+// first-connect host-key dialog still rendered (it reads single-word
+// `fingerprint`/`host`), but "Trust & connect" then called
+// `ssh_confirm_host_key(undefined)` - which fails silently - so the paused
+// handshake never got the user's answer and hung for the full 120 s confirm
+// timeout before failing. It also rewrites the `JumpConnected::connection_id`
+// field added below to `connectionId`, which the frontend's `event.connectionId`
+// (bridge.ts) relies on to pin each jump hop - so the attribute is load-bearing,
+// not just for `prompt_id`. The remaining variant fields are single words
+// (`fingerprint`, `data`, `code`, `host`), so camelCasing is a no-op for them.
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SshEvent {
+    /// A jump host in a ProxyJump chain authenticated. Carries the saved
+    /// connection id it came from so the frontend pins the hop's fingerprint on
+    /// the right connection (the target's fingerprint comes back in
+    /// `ssh_open`'s result instead). Emitted once per hop, in connect order.
+    JumpConnected {
+        connection_id: String,
+        fingerprint: String,
+    },
+    /// First-connect host-key confirmation request, emitted from
+    /// `check_server_key` when no fingerprint is pinned - BEFORE any credential
+    /// is sent. The handshake blocks until the frontend answers via
+    /// `ssh_confirm_host_key(prompt_id, accept)`; reject aborts the connect.
+    HostKeyPrompt {
+        prompt_id: String,
+        fingerprint: String,
+        host: String,
+    },
+    /// Base64-encoded stdout chunk from the remote shell.
+    Data { data: String },
+    /// Base64-encoded stderr chunk. Rare for an interactive shell but
+    /// possible with server-side `2>&1` suppression.
+    Stderr { data: String },
+    /// The remote reported its own exit status (`ChannelMsg::ExitStatus`)
+    /// before the channel closed - a deliberate, in-band termination. `code`
+    /// 0 is e.g. the user typing `exit`; nonzero is the process's own
+    /// failure code. Mirrors `PtyEvent::Exit` so the frontend can reuse its
+    /// handler shape. Distinct from `Disconnected` below: the frontend must
+    /// NOT treat this as a dropped connection (no reconnect).
+    Exit { code: i32 },
+    /// The remote process was killed by a signal (`ChannelMsg::ExitSignal`)
+    /// before the channel closed. Also a deliberate, in-band termination -
+    /// the process died for a reason on the REMOTE side (OOM killer, `kill`,
+    /// a crash), not because the transport dropped - so this is likewise not
+    /// reconnect-eligible. There is no numeric exit code in this message
+    /// (RFC 4254 6.10: a channel gets exactly one of exit-status or
+    /// exit-signal), so the frontend names the signal instead.
+    Signal { name: String, core_dumped: bool },
+    /// The channel ended - `Eof`/`Close`, or the read loop's `wait()`
+    /// returning `None` for a peer that hung up mid-read - without EITHER
+    /// `Exit` or `Signal` ever being reported first. This is the genuinely
+    /// ambiguous case: the remote may have exited cleanly (a fast `exit` can
+    /// race Eof/Close ahead of exit-status on some servers - dropbear
+    /// always, OpenSSH whenever the child's stdout closes before it is
+    /// reaped; see the ordering note on `exec_capture`) or the transport may
+    /// really have died. Only this variant is reconnect-eligible on the
+    /// frontend.
+    ///
+    /// Also sent exactly once on the SESSION channel (the one `ssh_open` was
+    /// given) when the connection itself ends on its own - remote disconnect,
+    /// transport error, keepalive timeout - and never for an explicit
+    /// `ssh_close`. See the janitor in `ssh_open`.
+    Disconnected,
+}
+
+/// Which side's fact ended a connect attempt, decided HERE - at the site that
+/// knows it - rather than guessed at from the message text on the other side of
+/// the wire.
+///
+/// The frontend's reconnect ladder is the consumer. It runs 1s + 3s + 7s of
+/// retries for a failure that might go differently next time, and parks
+/// immediately for one that cannot. Before this kind existed every failure
+/// reached it as a bare string, so a server that refused a password was
+/// indistinguishable from a link that blinked, and a wrong credential cost four
+/// authentication attempts over about eleven seconds before the user was told
+/// anything.
+///
+/// Placing a new failure site: pick by what a retry with the same saved host
+/// would do, not by how far the attempt got.
+///
+///   - `Config`: the attempt could not be assembled from what this app and this
+///     machine hold, or a recorded pin refuses it. A retry reproduces it byte
+///     for byte.
+///   - `Auth`: the server was asked and said no. Deterministic for the same
+///     credential; the user must change the credential, not wait.
+///   - `Transport`: anything else. The next attempt genuinely may go
+///     differently. This is the default for an unrecognised failure, and the
+///     direction is deliberate - over-parking a blip is a worse outcome than
+///     over-laddering a rejection.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SshConnectErrorKind {
+    Config,
+    Auth,
+    Transport,
+}
+
+/// The error type of every function on the connect path, and the one thing
+/// `ssh_open` rejects with.
+///
+/// Serialized whole: Tauri turns a `Serialize` command error into a JSON value
+/// and the webview's `invoke` rejects with the parsed object, so the frontend
+/// receives `{kind, message}` rather than a string. `openSsh` in
+/// src/modules/ssh/bridge.ts is the single place that reads it back and rethrows
+/// a typed `Error`, so nothing downstream of that boundary ever sees this shape.
+///
+/// `message` carries the same text this path always produced, verbatim, because
+/// callers still match on it - `isHostKeyMismatchError` reads the
+/// `ssh: host key mismatch:` prefix off it, and every banner prints it.
+///
+/// THERE MUST BE NO `impl From<String> for SshConnectError`. A blanket `From`
+/// lets `?` compile at a site that named no kind, and whichever kind that impl
+/// picked would become the silent default for every failure added afterwards.
+/// The compiler error at each `?` is what makes "no site is forgotten" a fact
+/// rather than a review promise; a `From` impl deletes it.
+///
+/// The fields are private for the same reason: with them public a caller could
+/// write the struct literal directly and pick a kind without going through a
+/// constructor, and a relay could rewrite `kind` while re-wording `message`.
+/// The three constructors and `map_message` are the whole API, and none of them
+/// can change a kind that has already been decided.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConnectError {
+    kind: SshConnectErrorKind,
+    message: String,
+}
+
+impl SshConnectError {
+    pub fn config(message: impl Into<String>) -> Self {
+        Self {
+            kind: SshConnectErrorKind::Config,
+            message: message.into(),
+        }
+    }
+
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self {
+            kind: SshConnectErrorKind::Auth,
+            message: message.into(),
+        }
+    }
+
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            kind: SshConnectErrorKind::Transport,
+            message: message.into(),
+        }
+    }
+
+    /// Re-word an error that is being relayed - adding the host label a caller
+    /// knows and the raising site did not - WITHOUT touching its kind. The
+    /// alternative at those sites is a fresh constructor call, which silently
+    /// re-decides whose fact ended the attempt; that is how an absent ssh-agent
+    /// ended up on the reconnect ladder.
+    pub fn map_message(mut self, f: impl FnOnce(&str) -> String) -> Self {
+        self.message = f(&self.message);
+        self
+    }
+}
+
+/// The sentence on its own, for the callers that have no use for the kind:
+/// `ssh_agent_keys` flattens back to a `String` for the dialog's agent panel.
+/// The `ssh_open` log line deliberately does NOT use this - it formats `{e:?}`,
+/// which keeps the kind in the log where it is the interesting half.
+///
+/// `std::error::Error` is not implemented, but not because it would give `?` a
+/// conversion path - it would not; `?` converts through `From<E> for
+/// SshConnectError`, and the guard against that is simply that no such impl
+/// exists. It is left off because nothing needs it: no caller boxes this into a
+/// `dyn Error` or an `anyhow::Error`, and adding a trait with no consumer is one
+/// more thing a future change has to keep true.
+impl std::fmt::Display for SshConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Decide the one terminal `SshEvent` for a channel from whatever exit
+/// status / signal the pump observed before the channel actually ended
+/// (Close, or `wait()` returning `None`). Kept as a free function so the
+/// three-way decision is unit-testable without a live channel - see
+/// `exit_classification_tests` below.
+fn build_exit_event(exit_status: Option<i32>, exit_signal: Option<(String, bool)>) -> SshEvent {
+    if let Some((name, core_dumped)) = exit_signal {
+        SshEvent::Signal { name, core_dumped }
+    } else if let Some(code) = exit_status {
+        SshEvent::Exit { code }
+    } else {
+        SshEvent::Disconnected
+    }
+}
+
+/// How long `check_server_key` waits for the user's first-connect decision
+/// before treating silence as a rejection, so a forgotten dialog can't hold
+/// the handshake (and the TCP connection) open indefinitely.
+const HOSTKEY_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+
+static HOSTKEY_PROMPT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Pending first-connect host-key confirmations, keyed by an opaque prompt id.
+/// `check_server_key` parks a one-shot `Sender` here and awaits its `Receiver`;
+/// the `ssh_confirm_host_key` command resolves it. A process-global map keeps
+/// the command decoupled from the in-flight handshake task.
+fn pending_host_keys() -> &'static std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Resolve a pending host-key prompt. Returns the parked sender (the command
+/// fires it with the user's decision); `None` if it already timed out/resolved.
+pub(super) fn take_pending_host_key(prompt_id: &str) -> Option<oneshot::Sender<bool>> {
+    pending_host_keys().lock().ok()?.remove(prompt_id)
+}
+
+/// Where a `-R` rule's server-side listener sends what it accepts: bound
+/// SERVER port -> (generation, local target host, local target port). Read
+/// by the target hop's `HostKeyVerifier::server_channel_open_forwarded_tcpip`
+/// override below; written by `SshSession::open_remote_forward`/
+/// `close_remote_forward`. Built fresh per hop in `build_verifier` - only the
+/// TARGET's copy is ever populated, because `-R` rides the same handle
+/// `open_forward` already does and a jump hop never opens one of its own.
+type RemoteForwardTargets = Arc<Mutex<HashMap<u16, (u64, String, u16)>>>;
+
+/// Server-key check. With `expected_fingerprint`, the presented key must
+/// match exactly; any mismatch is recorded for the caller to surface as a
+/// "host key changed" error and aborts the handshake. Without one (first
+/// connect or dialog test on a new host), falls back to trust-on-first-use:
+/// accept the key, record its fingerprint for the caller to persist, and
+/// rely on later connects to compare against the saved value.
+///
+/// `pub(super)` so the parameterised `Handle<HostKeyVerifier>` field on
+/// `SshSession` can be exposed to the sibling `sftp` module.
+pub(super) struct HostKeyVerifier {
+    expected: Option<String>,
+    report: Arc<Mutex<HostKeyReport>>,
+    /// Event sink for the first-connect `HostKeyPrompt` (no-expected only).
+    on_event: IpcChannel<SshEvent>,
+    /// Correlates the emitted prompt with the `ssh_confirm_host_key` answer.
+    prompt_id: String,
+    /// Host label shown in the confirmation dialog.
+    host: String,
+    /// One-shot receiver for the user's decision; taken once on first connect.
+    decision: Option<oneshot::Receiver<bool>>,
+    /// This hop's `-R` routing registry - see `RemoteForwardTargets`. Always
+    /// present, always empty for a jump hop: nothing ever calls
+    /// `open_remote_forward` on one, so its registry has no writer.
+    remote_forwards: RemoteForwardTargets,
+    /// Session-end signal: never sent, only dropped. Only the TARGET hop's
+    /// verifier holds one. russh moves the handler into the session task and
+    /// drops it when that task ends (remote disconnect, transport error,
+    /// keepalive timeout, our own `disconnect`), so the receiver `ssh_open`
+    /// waits on wakes exactly once, whatever the channels are doing.
+    _session_end: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+pub(super) struct HostKeyReport {
+    /// Fingerprint of the key the server actually presented, regardless
+    /// of whether it matched the expected one.
+    seen: Option<String>,
+    /// (expected, seen) pair when the server's key did not match the
+    /// pinned fingerprint. Surfaced verbatim in the error so the user
+    /// can compare both values before deciding to trust.
+    mismatch: Option<(String, String)>,
+    /// Set to the seen fingerprint when the user (or a confirm timeout)
+    /// rejected a brand-new host key, so the caller surfaces a clear
+    /// "not trusted" message instead of a generic connect failure.
+    rejected: Option<String>,
+}
+
+impl Handler for HostKeyVerifier {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        let fp = key.fingerprint(HashAlg::Sha256).to_string();
+        {
+            let mut report = self.report.lock().await;
+            report.seen = Some(fp.clone());
+            if let Some(expected) = &self.expected {
+                if expected != &fp {
+                    log::warn!("ssh: host key mismatch expected={expected} got={fp}");
+                    report.mismatch = Some((expected.clone(), fp.clone()));
+                    // Returning false makes russh fail the handshake. The caller
+                    // inspects `report.mismatch` to turn that into a specific
+                    // error string rather than a generic disconnect.
+                    return Ok(false);
+                }
+                log::info!("ssh: host key pinned ok fingerprint={fp}");
+                return Ok(true);
+            }
+        }
+
+        // First connect (no pinned fingerprint): pause the handshake BEFORE any
+        // credential is sent and require the user to verify the fingerprint
+        // out-of-band. Silent trust-on-first-use would let a first-connect MITM
+        // capture the password / private key during the auth that follows.
+        let Some(rx) = self.decision.take() else {
+            log::warn!("ssh: no host-key confirmation channel; refusing new host key");
+            self.report.lock().await.rejected = Some(fp);
+            return Ok(false);
+        };
+        let _ = self.on_event.send(SshEvent::HostKeyPrompt {
+            prompt_id: self.prompt_id.clone(),
+            fingerprint: fp.clone(),
+            host: self.host.clone(),
+        });
+        let accepted = match tokio::time::timeout(HOSTKEY_CONFIRM_TIMEOUT, rx).await {
+            Ok(Ok(v)) => v,
+            // Sender dropped (command never fired) or the wait timed out.
+            _ => {
+                let _ = take_pending_host_key(&self.prompt_id);
+                false
+            }
+        };
+        if accepted {
+            log::info!("ssh: user confirmed new host key fingerprint={fp}");
+        } else {
+            log::warn!("ssh: user rejected/aborted new host key fingerprint={fp}");
+            self.report.lock().await.rejected = Some(fp);
+        }
+        Ok(accepted)
+    }
+
+    /// The `-R` half of this override: the server just accepted a connection
+    /// on a listener THIS session asked it to open (`Handle::tcpip_forward`),
+    /// and is handing back a channel for it. Routed by `connected_port`
+    /// ALONE (a lookup in `remote_forwards`) rather than by
+    /// `(connected_address, connected_port)`: a server can bind one port only
+    /// once, so once `open_remote_forward` has the port the SERVER actually
+    /// bound, that port is already the whole identity the routing needs -
+    /// see `KNOWN-LIMITS.md`.
+    ///
+    /// An unknown port - no `-R` rule bound it, or it was since closed - is
+    /// still ACCEPTED, not refused: russh's `client::encrypted` confirms the
+    /// channel open before this handler ever runs, so by the time
+    /// `remote_forwards` comes up empty the peer already has an open
+    /// channel. What it gets instead is a connect immediately followed by
+    /// EOF, via `session.close(channel.id())` below - the closest this
+    /// override can get to a refusal after the fact. Synchronous rather than
+    /// `channel`'s own async `close()`, which sends across the same mpsc
+    /// this session loop is the one draining - calling it from here would be
+    /// asking the loop to unblock itself.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let target = {
+            let map = self.remote_forwards.lock().await;
+            map.get(&(connected_port as u16))
+                .map(|(_, host, port)| (host.clone(), *port))
+        };
+        let Some((local_host, local_port)) = target else {
+            log::warn!(
+                "ssh -R: forwarded-tcpip on port {connected_port} names no local target; closing"
+            );
+            let _ = session.close(channel.id());
+            return Ok(());
+        };
+        tokio::spawn(async move {
+            let mut stream = channel.into_stream();
+            match tokio::net::TcpStream::connect((local_host.as_str(), local_port)).await {
+                Ok(mut local) => {
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+                }
+                Err(e) => {
+                    log::warn!("ssh -R: local connect to {local_host}:{local_port} failed: {e}");
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+/// One interactive shell channel on a session - a terminal tab's. A session
+/// carries any number of them; each ends on its own, and closing one leaves the
+/// session and every other shell up.
+pub struct SshShell {
+    /// Write half of the shell channel. Methods take `&self`, so writes from
+    /// concurrent commands proceed without locking against the read pump.
+    /// Earlier versions shared the whole Channel<Msg> behind a Mutex, which
+    /// deadlocked: the pump held the lock across `wait().await` while idle,
+    /// blocking every keystroke.
+    write_half: ChannelWriteHalf<Msg>,
+    /// Background task draining channel messages to the IPC channel. `None`
+    /// for a shell-less (SFTP-only) channel, which is never pumped.
+    pump: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Live terminal dims; updated by `resize`. Read for list metadata.
+    dims: std::sync::Mutex<(u16, u16)>,
+    created_at_ms: u64,
+    /// Extra mirror sinks (the remote-access bridge) the pump fans Data / Exit
+    /// to alongside the GUI's own channel. Populated by `add_mirror_sink`.
+    mirror_sinks: Arc<std::sync::Mutex<Vec<IpcChannel<SshEvent>>>>,
+    /// Recent raw output, replayed to a freshly-attached mirror sink so it has
+    /// context (SSH has no daemon-side scrollback). Capped.
+    mirror_ring: Arc<std::sync::Mutex<VecDeque<u8>>>,
+    alive: Arc<AtomicBool>,
+}
+
+pub struct SshSession {
+    /// Live shell channels, keyed by the id `open_shell` minted. A pump removes
+    /// its own entry when its channel ends; `close_shell` and `close` take the
+    /// rest.
+    shells: std::sync::Mutex<HashMap<u32, Arc<SshShell>>>,
+    /// Source of the ids in `shells`.
+    shell_seq: AtomicU32,
+    /// Optional resource sampler owned by the session. At most one monitor
+    /// channel is active for this SSH connection; its sequence guards a late
+    /// stop request from cancelling a newer sampler.
+    resource_stream: std::sync::Mutex<Option<(u32, watch::Sender<bool>)>>,
+    resource_stream_seq: AtomicU32,
+    /// Underlying client handle. Kept alive so the TCP connection stays up;
+    /// dropping it drops the SSH session. `pub(super)` so the sibling `sftp`
+    /// module can open new subsystem channels on it.
+    pub(super) handle: Mutex<Option<Handle<HostKeyVerifier>>>,
+    /// Jump-host handles for a ProxyJump chain, in connect order (entry first).
+    /// Retained for the session's whole life: each tunnel rides on the hop
+    /// before it, so dropping a jump handle collapses every hop above it
+    /// (including the target). Empty for a direct connection. Disconnected,
+    /// innermost-first, on `close`.
+    jump_handles: Mutex<Vec<Handle<HostKeyVerifier>>>,
+    /// Lazily-opened SFTP subsystem. Cached so repeated file-tree ops do
+    /// not pay the channel-open + handshake roundtrip each time.
+    sftp: Mutex<Option<Arc<SftpSession>>>,
+    /// Live `ssh -L` local forwards, keyed by the bound loopback port. Each
+    /// value is that forward's generation paired with its accept loop; aborting
+    /// the loop drops the listener and frees the port. Torn down with the
+    /// session in `close` / `Drop`.
+    ///
+    /// The port is the KEY but not the identity, which is why the generation
+    /// rides beside the handle. A port freed by one Stop is immediately
+    /// rebindable, so a later `open_forward` on a pinned port lands under the
+    /// same key as the forward that has gone - and a close still in flight from
+    /// the first one would otherwise abort the second. `abort_forward` compares
+    /// the generation for exactly that reason.
+    forwards: Mutex<HashMap<u16, (u64, JoinHandle<()>)>>,
+    /// Source of the generations in `forwards`. Per session rather than
+    /// process-wide because a close already names its session, so uniqueness
+    /// within one is all the identity a port needs; `mint_forward_generation`
+    /// is the only reader.
+    forward_seq: AtomicU64,
+    /// This session's `-R` routing registry, shared with the target hop's
+    /// `HostKeyVerifier` (built before this struct existed - see the
+    /// `connect()` note above `remote_forwards`). `open_remote_forward`/
+    /// `close_remote_forward` are this struct's own write side.
+    remote_forwards: RemoteForwardTargets,
+    /// Fires once when the connection ends - see `HostKeyVerifier::_session_end`.
+    /// Taken once by `ssh_open` to drive the janitor that evicts the session id
+    /// from `SshState.sessions`. `std::sync::Mutex` so the take is sync-cheap.
+    ended: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    /// SHA256 fingerprint the target presented; `ssh_open` returns it.
+    pub(super) fingerprint: String,
+    /// Remote endpoint, surfaced by `ssh_list_sessions`.
+    host: String,
+    user: String,
+}
+
+/// Mint the next generation for a forward on one session. Monotonic, and never
+/// reused within a session, so a generation a close names either matches the
+/// listener currently on that port or matches nothing.
+///
+/// A free function over the counter for the same reason `abort_forward` is one
+/// over the map: `open_forward` needs a live `SshSession` and cannot be reached
+/// from a test, while what it does with the counter can be.
+fn mint_forward_generation(seq: &AtomicU64) -> u64 {
+    seq.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Abort ONE forward's accept loop, freeing its local port, and report whether
+/// there was one to abort.
+///
+/// A free function over the map rather than a method, so it is testable without
+/// an `SshSession`: the only two constructors (both in `connect`) are the tail
+/// of a live handshake, and the only existing forward test is `#[ignore]`. This
+/// is the whole decision `ssh_forward_close` makes, so this is where it is
+/// pinned.
+///
+/// `generation` is what makes the decision an identity check rather than a port
+/// lookup: a forward is aborted ONLY when the generation stored beside it
+/// matches. A close naming a generation the map has moved past is refused, so a
+/// close that was still in flight when its listener went away cannot take down
+/// the successor a later open bound on the same port.
+///
+/// `false` is not an error: the forward may have gone with a reconnect, a
+/// teardown may be firing twice, or this may be the stale close above.
+/// Idempotent on purpose - a caller must be able to Stop without tracking
+/// whether Start finished.
+async fn abort_forward(
+    forwards: &Mutex<HashMap<u16, (u64, JoinHandle<()>)>>,
+    bound_port: u16,
+    generation: u64,
+) -> bool {
+    let mut live = forwards.lock().await;
+    // Compared BEFORE the remove, so a mismatch leaves the entry - and its
+    // listener - exactly as it was. Removing first and putting it back would be
+    // the same outcome under this lock, but it would mean a future early return
+    // between the two could drop a live forward out of the map.
+    if live.get(&bound_port).map(|(stored, _)| *stored) != Some(generation) {
+        return false;
+    }
+    match live.remove(&bound_port) {
+        Some((_, task)) => {
+            task.abort();
+            true
+        }
+        // Unreachable: the entry was just read under this same guard.
+        None => false,
+    }
+}
+
+impl SshShell {
+    pub async fn write(&self, data: &[u8]) -> Result<(), String> {
+        self.write_half.data(data).await.map_err(|e| e.to_string())
+    }
+
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        if let Ok(mut d) = self.dims.lock() {
+            *d = (cols, rows);
+        }
+        self.write_half
+            .window_change(cols.into(), rows.into(), 0, 0)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Register an extra event sink (the remote-access bridge) and replay the
+    /// recent output ring so it has context. Returns whether the shell is
+    /// still alive. Mirrors the PTY daemon's multi-subscriber attach.
+    pub fn add_mirror_sink(&self, ch: IpcChannel<SshEvent>) -> bool {
+        let bytes: Vec<u8> = self
+            .mirror_ring
+            .lock()
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default();
+        if !bytes.is_empty() {
+            let _ = ch.send(SshEvent::Data {
+                data: B64.encode(&bytes),
+            });
+        }
+        if let Ok(mut s) = self.mirror_sinks.lock() {
+            // Bound the live sink count (a buggy caller could call
+            // ssh_attach in a loop); evict the oldest so a reconnect storm can't
+            // grow it without bound. The pump's fan also prunes dead sinks.
+            const MAX_MIRROR_SINKS: usize = 8;
+            while s.len() >= MAX_MIRROR_SINKS {
+                s.remove(0);
+            }
+            s.push(ch);
+        }
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// Snapshot for `ssh_list_sessions`: (cols, rows, alive, created_at_ms).
+    pub fn info(&self) -> (u16, u16, bool, u64) {
+        let (cols, rows) = self.dims.lock().map(|d| *d).unwrap_or((80, 24));
+        (
+            cols,
+            rows,
+            self.alive.load(Ordering::Acquire),
+            self.created_at_ms,
+        )
+    }
+
+    /// Close this one channel. The pump is aborted FIRST, so a close the
+    /// frontend asked for emits no ending event.
+    pub async fn close(&self) {
+        let pump = self.pump.lock().ok().and_then(|mut g| g.take());
+        if let Some(j) = pump {
+            j.abort();
+        }
+        let _ = self.write_half.eof().await;
+        let _ = self.write_half.close().await;
+    }
+}
+
+impl SshSession {
+    /// The configured SSH target, used for a local-to-remote ICMP measurement.
+    pub(super) fn target_host(&self) -> &str {
+        &self.host
+    }
+
+    /// Take the one-shot session-end receiver out of the session. Called once
+    /// by `ssh_open` to wire up the janitor task; subsequent callers get
+    /// `None`.
+    pub fn take_ended_signal(&self) -> Option<oneshot::Receiver<()>> {
+        self.ended.lock().ok().and_then(|mut g| g.take())
+    }
+
+    pub fn shell(&self, shell_id: u32) -> Option<Arc<SshShell>> {
+        self.shells.lock().ok()?.get(&shell_id).cloned()
+    }
+
+    /// Close one shell, leaving the session and every other shell up. `false`
+    /// when `shell_id` names no live shell - it already ended, or was closed.
+    pub async fn close_shell(&self, shell_id: u32) -> bool {
+        // Removed under the lock, closed outside it: a std guard must not be
+        // held across an await.
+        let shell = self
+            .shells
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&shell_id));
+        let Some(shell) = shell else {
+            return false;
+        };
+        shell.close().await;
+        true
+    }
+
+    /// Snapshot for `ssh_list_sessions`, one row per live shell:
+    /// (shell_id, host, user, cols, rows, alive, created_at_ms).
+    pub fn shell_infos(&self) -> Vec<(u32, String, String, u16, u16, bool, u64)> {
+        let Ok(shells) = self.shells.lock() else {
+            return Vec::new();
+        };
+        shells
+            .iter()
+            .map(|(id, s)| {
+                let (cols, rows, alive, created_at_ms) = s.info();
+                (
+                    *id,
+                    self.host.clone(),
+                    self.user.clone(),
+                    cols,
+                    rows,
+                    alive,
+                    created_at_ms,
+                )
+            })
+            .collect()
+    }
+
+    /// Open one more shell channel on this live session - a terminal tab's -
+    /// and pump its output to `on_event`. Returns the shell's id within the
+    /// session.
+    pub async fn open_shell(
+        self: &Arc<Self>,
+        cols: u16,
+        rows: u16,
+        on_event: IpcChannel<SshEvent>,
+    ) -> Result<u32, String> {
+        // Hold the handle lock only across the channel open, exactly like
+        // `exec_capture`. Authentication already succeeded; a channel that will
+        // not open now is the transport or a server limit, and may well open on
+        // the next attempt.
+        let channel = {
+            let handle_guard = self.handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .ok_or_else(|| "ssh session is closed".to_string())?;
+            handle
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("ssh: open channel failed: {e}"))?
+        };
+
+        // Interactive PTY + shell are best-effort. Locked-down file-transfer
+        // accounts (SFTP chroot, `PermitTTY no`, `ForceCommand internal-sftp`,
+        // a `/usr/sbin/nologin` login shell) deny the PTY and/or the shell -
+        // which once failed the WHOLE connect, so a plain "FTP"-style host could
+        // never be added at all. But the authenticated `Handle` is all the SFTP
+        // file browser needs: it opens its OWN `sftp` subsystem channel (see
+        // `sftp::open_sftp_on_handle`), independent of this shell channel. So a
+        // denied shell must DEGRADE, not abort. A normal server takes the
+        // interactive path; a shell-less server gets an inert shell.
+        let mut interactive = true;
+        if let Err(e) = channel
+            .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+            .await
+        {
+            log::warn!(
+                "ssh: request pty denied ({e}); continuing as SFTP-only (no interactive shell)"
+            );
+            interactive = false;
+        }
+        if interactive {
+            if let Err(e) = channel.request_shell(true).await {
+                log::warn!("ssh: request shell denied ({e}); continuing as SFTP-only");
+                interactive = false;
+            }
+        }
+
+        if interactive {
+            // Bootstrap: turn on OSC 7 cwd reporting on the remote shell. Stock
+            // bash/zsh on most distros do not emit OSC 7 by default, leaving the
+            // SFTP file tree stuck at the SFTP-canonicalised home regardless of
+            // `cd`. Inject a tiny `precmd` / PROMPT_COMMAND hook so every prompt
+            // prints the path the local OSC 7 handler parses. Errors from non-
+            // bash/zsh shells (fish, dash, csh) are silenced; worst case the tree
+            // stays on home. Leading space keeps it out of bash history when
+            // HISTCONTROL=ignorespace. Trailing `clear` wipes the snippet's echo
+            // and the motd, which is acceptable for a clean prompt.
+            const OSC7_BOOTSTRAP: &[u8] = b" { if [ -n \"$ZSH_VERSION\" ]; then __tervia_o7(){ printf '\\e]7;file://%s%s\\e\\\\' \"${HOST:-$HOSTNAME}\" \"$PWD\"; }; typeset -ag precmd_functions; precmd_functions+=(__tervia_o7); elif [ -n \"$BASH_VERSION\" ]; then __tervia_o7(){ printf '\\e]7;file://%s%s\\e\\\\' \"$HOSTNAME\" \"$PWD\"; }; case \":${PROMPT_COMMAND:-}:\" in *\":__tervia_o7:\"*) ;; *) PROMPT_COMMAND=\"__tervia_o7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\";; esac; fi; __tervia_o7 2>/dev/null; } 2>/dev/null; { clear 2>/dev/null || printf '\\033c'; }\r";
+            let _ = channel.data(OSC7_BOOTSTRAP).await;
+        } else {
+            // No usable terminal, but SFTP works over the live `Handle`. The
+            // shell below stays inert - NO read pump - so a shell-less channel
+            // that closes or sits idle never fires the tab's reconnect loop; it
+            // lives until `ssh_shell_close`. A one-line notice in the inert
+            // terminal tells the user why it accepts no input.
+            const SFTP_ONLY_NOTICE: &[u8] = b"\r\n\x1b[33m[tervia] This server allows file transfer (SFTP) only - no interactive shell. The terminal is disabled; use the remote file browser.\x1b[0m\r\n";
+            let _ = on_event.send(SshEvent::Data {
+                data: B64.encode(SFTP_ONLY_NOTICE),
+            });
+        }
+
+        // Split so the pump task owns the read half exclusively and the
+        // SshShell owns the write half. No shared lock, no deadlock.
+        let (mut read_half, write_half) = channel.split();
+        let shell = Arc::new(SshShell {
+            write_half,
+            pump: std::sync::Mutex::new(None),
+            dims: std::sync::Mutex::new((cols, rows)),
+            created_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            mirror_sinks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mirror_ring: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            alive: Arc::new(AtomicBool::new(true)),
+        });
+        // Inserted BEFORE the pump exists, so a channel that ends at once cannot
+        // remove its entry ahead of the insert and leave a dead shell behind.
+        let shell_id = self.shell_seq.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut m) = self.shells.lock() {
+            m.insert(shell_id, shell.clone());
+        }
+        if !interactive {
+            // The read half drops here: a shell-less channel is never pumped.
+            return Ok(shell_id);
+        }
+
+        // Mirror infrastructure shared with the pump: extra sinks (remote-access
+        // bridge), a small replay ring, and an alive flag.
+        const MIRROR_RING_CAP: usize = 128 * 1024;
+        let pump_sinks = shell.mirror_sinks.clone();
+        let pump_ring = shell.mirror_ring.clone();
+        let pump_alive = shell.alive.clone();
+        // Weak, not Arc: the pump is owned BY the session (through its shell),
+        // so a strong ref would keep a closed session alive.
+        let weak = Arc::downgrade(self);
+
+        let pump = tokio::spawn(async move {
+            // Fan an event to every extra mirror sink, pruning any whose channel has
+            // closed (the browser / bridge went away). Without this, dead sinks
+            // accumulate across reconnects and the pump wastes a clone + send on
+            // every output byte.
+            let fan = |ev: &SshEvent| {
+                if let Ok(mut sinks) = pump_sinks.lock() {
+                    sinks.retain(|ch| ch.send(ev.clone()).is_ok());
+                }
+            };
+            // Exit status / signal can legitimately arrive AFTER Eof (dropbear
+            // always sends Eof first; OpenSSH does too whenever the child's
+            // stdout closes before it is reaped - same ordering `exec_capture`
+            // above documents). So neither ExitStatus nor ExitSignal ends the
+            // loop by itself: both are just recorded here, and the terminal
+            // SshEvent is decided once the channel actually ends (Close, or
+            // wait() returning None). Ending on Eof the way this used to would
+            // make a server with that ordering report every exit as the
+            // ambiguous `Disconnected` shape, since the real exit-status/-signal
+            // would never be read.
+            let mut exit_status: Option<i32> = None;
+            let mut exit_signal: Option<(String, bool)> = None;
+            while let Some(msg) = read_half.wait().await {
+                match msg {
+                    ChannelMsg::Data { ref data } => {
+                        if let Ok(mut r) = pump_ring.lock() {
+                            r.extend(data.iter().copied());
+                            while r.len() > MIRROR_RING_CAP {
+                                r.pop_front();
+                            }
+                        }
+                        let ev = SshEvent::Data {
+                            data: B64.encode(data),
+                        };
+                        let _ = on_event.send(ev.clone());
+                        fan(&ev);
+                    }
+                    ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                        let ev = SshEvent::Stderr {
+                            data: B64.encode(data),
+                        };
+                        let _ = on_event.send(ev.clone());
+                        fan(&ev);
+                    }
+                    ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => {
+                        exit_status = Some(status as i32);
+                    }
+                    ChannelMsg::ExitSignal {
+                        signal_name,
+                        core_dumped,
+                        ..
+                    } => {
+                        exit_signal = Some((format!("{signal_name:?}"), core_dumped));
+                    }
+                    ChannelMsg::Eof => {
+                        // Deliberately not a break - see the ordering note above.
+                        // Keep draining for Close (and a possibly-delayed
+                        // exit-status/exit-signal).
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            // Close, or wait() returning None for a peer that hung up without
+            // one. Either way the channel is over: report how, then drop this
+            // shell from its session.
+            pump_alive.store(false, Ordering::Release);
+            let ev = build_exit_event(exit_status, exit_signal);
+            let _ = on_event.send(ev.clone());
+            fan(&ev);
+            if let Some(s) = weak.upgrade() {
+                if let Ok(mut m) = s.shells.lock() {
+                    m.remove(&shell_id);
+                }
+            }
+        });
+        if let Ok(mut p) = shell.pump.lock() {
+            *p = Some(pump);
+        }
+        Ok(shell_id)
+    }
+
+    pub async fn close(self: Arc<Self>) {
+        // Collected first: `ssh_close` awaits this inside a Tauri command, so
+        // the std guard must not be held across the closes below.
+        if let Ok(mut stream) = self.resource_stream.lock() {
+            if let Some((_, cancel)) = stream.take() {
+                let _ = cancel.send(true);
+            }
+        }
+        let shells: Vec<Arc<SshShell>> = self
+            .shells
+            .lock()
+            .map(|mut m| m.drain().map(|(_, s)| s).collect())
+            .unwrap_or_default();
+        for s in shells {
+            s.close().await;
+        }
+        // Drop the forward listeners first so their ports are free again the
+        // moment the session closes, rather than whenever the last Arc goes.
+        for (_, (_, t)) in self.forwards.lock().await.drain() {
+            t.abort();
+        }
+        // Drop the SFTP session first so its background reader shuts down
+        // before the underlying connection goes away.
+        if let Some(sftp) = self.sftp.lock().await.take() {
+            let _ = sftp.close().await;
+        }
+        if let Some(h) = self.handle.lock().await.take() {
+            let _ = h
+                .disconnect(Disconnect::ByApplication, "tervia: client closed", "")
+                .await;
+        }
+        // Tear the jump chain down from innermost to outermost, after the
+        // target handle that rode on top of it is already gone.
+        for h in self.jump_handles.lock().await.drain(..).rev() {
+            let _ = h
+                .disconnect(Disconnect::ByApplication, "tervia: client closed", "")
+                .await;
+        }
+    }
+
+    /// Begin the session's single resource stream and cancel any previous one.
+    /// See the resource-monitor constraints in `KNOWN-LIMITS.md`.
+    pub fn begin_resource_stream(&self) -> Result<(u32, watch::Receiver<bool>), String> {
+        let stream_id = self.resource_stream_seq.fetch_add(1, Ordering::Relaxed);
+        let (cancel, receiver) = watch::channel(false);
+        let mut stream = self
+            .resource_stream
+            .lock()
+            .map_err(|_| "ssh resource stream state is unavailable".to_string())?;
+        if let Some((_, previous)) = stream.replace((stream_id, cancel)) {
+            let _ = previous.send(true);
+        }
+        Ok((stream_id, receiver))
+    }
+
+    /// Stop the named sampler only if it is still the active one.
+    pub fn stop_resource_stream(&self, stream_id: u32) {
+        if let Ok(mut stream) = self.resource_stream.lock() {
+            if stream
+                .as_ref()
+                .is_some_and(|(active_id, _)| *active_id == stream_id)
+            {
+                if let Some((_, cancel)) = stream.take() {
+                    let _ = cancel.send(true);
+                }
+            }
+        }
+    }
+
+    pub fn has_jump_hosts(&self) -> bool {
+        self.jump_handles
+            .try_lock()
+            .map(|handles| !handles.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Start an `ssh -L` local forward: bind `127.0.0.1:local_port` and pipe
+    /// every accepted connection over its own `direct-tcpip` channel to
+    /// `remote_host:remote_port`, resolved from the SERVER's point of view - so
+    /// a ProxyJump chain and the remote's own private network apply for free.
+    /// `local_port` 0 binds an ephemeral port; the port actually bound is
+    /// returned, paired with the generation that names THIS listener on it.
+    /// Both halves have to reach `close_forward` - see `abort_forward` for what
+    /// the port alone cannot say.
+    ///
+    /// Loopback only, deliberately: a forwarded port re-exports whatever the
+    /// remote endpoint trusts (a database, an admin UI) with no auth step of its
+    /// own, so binding `0.0.0.0` would hand it to the whole LAN. OpenSSH makes
+    /// the same choice by default (`GatewayPorts no`).
+    pub async fn open_forward(
+        self: &Arc<Self>,
+        local_port: u16,
+        remote_host: String,
+        remote_port: u16,
+    ) -> Result<(u16, u64), String> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+            .await
+            .map_err(|e| format!("ssh: bind 127.0.0.1:{local_port} failed: {e}"))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| format!("ssh: reading bound port failed: {e}"))?
+            .port();
+        let label = format!("127.0.0.1:{bound} -> {remote_host}:{remote_port}");
+        // Weak, not Arc: the accept loop is owned BY the session, so holding a
+        // strong ref would make the pair immortal and leak the listener.
+        let weak = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut sock, peer) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("ssh -L {bound}: accept failed, forward closed: {e}");
+                        return;
+                    }
+                };
+                // Hold the session only across the channel open. A long-lived
+                // tunnel that kept the Arc would keep this listener bound after
+                // the session is evicted, so the next reconnect's bind would
+                // fail with "address already in use".
+                let opened = {
+                    let Some(session) = weak.upgrade() else {
+                        return;
+                    };
+                    let guard = session.handle.lock().await;
+                    let Some(handle) = guard.as_ref() else { return };
+                    handle
+                        .channel_open_direct_tcpip(
+                            remote_host.clone(),
+                            u32::from(remote_port),
+                            peer.ip().to_string(),
+                            u32::from(peer.port()),
+                        )
+                        .await
+                };
+                match opened {
+                    Ok(channel) => {
+                        tokio::spawn(async move {
+                            let mut stream = channel.into_stream();
+                            let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                        });
+                    }
+                    // One refused connection must not kill the listener: the
+                    // remote service may simply not be up yet, and the user
+                    // would have no way to bring the forward back short of
+                    // reconnecting the whole session.
+                    Err(e) => log::warn!("ssh -L {bound}: open tunnel failed: {e}"),
+                }
+            }
+        });
+        // Minted here and not at the top: a bind that failed registered nothing,
+        // so it must not consume a generation either - the numbers are only ever
+        // compared for equality, but a gap would read as a forward that had
+        // existed.
+        let generation = mint_forward_generation(&self.forward_seq);
+        self.forwards.lock().await.insert(bound, (generation, task));
+        log::info!("ssh -L {label}");
+        Ok((bound, generation))
+    }
+
+    /// Stop the one `ssh -L` listener bound to `bound_port` AND carrying
+    /// `generation`, leaving the session and every other forward up. `false`
+    /// means there was no such forward - including a port that is bound by a
+    /// later forward than the one this close names. See `abort_forward`.
+    pub async fn close_forward(&self, bound_port: u16, generation: u64) -> bool {
+        abort_forward(&self.forwards, bound_port, generation).await
+    }
+
+    /// Start an `ssh -R` remote forward: ask the server to listen on
+    /// `bind_address:bind_port` (`bind_port` 0 lets the SERVER pick) and
+    /// route every connection it accepts back to `local_host:local_port` on
+    /// THIS machine - see the `Handler::server_channel_open_forwarded_tcpip`
+    /// override above, which is what actually dials it. `russh` 0.60.1's
+    /// `Handle::tcpip_forward` is the wire call. `GatewayPorts no` on an
+    /// ordinary server restricts the bind to loopback regardless of
+    /// `bind_address`.
+    ///
+    /// A PINNED `bind_port` (non-zero) is registered in `remote_forwards`
+    /// BEFORE `tcpip_forward` is even sent, and rolled back if the request
+    /// errors - otherwise a connection the server accepts in that round-trip
+    /// window would find no registry entry and get closed by
+    /// `server_channel_open_forwarded_tcpip`. Port 0 cannot get the same
+    /// treatment: the bound port isn't known until the reply comes back, so
+    /// a connection accepted in that window is unavoidably unroutable and is
+    /// dropped the same as any other unknown port - there is no port to
+    /// register under before asking.
+    pub async fn open_remote_forward(
+        &self,
+        bind_address: String,
+        bind_port: u16,
+        local_host: String,
+        local_port: u16,
+    ) -> Result<(u16, u64), String> {
+        let guard = self.handle.lock().await;
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| "ssh session is closed".to_string())?;
+        let generation = mint_forward_generation(&self.forward_seq);
+        if bind_port != 0 {
+            self.remote_forwards
+                .lock()
+                .await
+                .insert(bind_port, (generation, local_host.clone(), local_port));
+        }
+        let reported = match handle
+            .tcpip_forward(bind_address.clone(), u32::from(bind_port))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if bind_port != 0 {
+                    self.remote_forwards.lock().await.remove(&bind_port);
+                }
+                return Err(format!(
+                    "ssh: remote listen on {bind_address}:{bind_port} failed: {e}"
+                ));
+            }
+        };
+        // Per `tcpip_forward`'s own doc: the server reports the bound port
+        // only when 0 was requested, and 0 back otherwise - so a PINNED port
+        // is never taken from the reply.
+        let bound = if bind_port == 0 {
+            reported as u16
+        } else {
+            bind_port
+        };
+        if bind_port == 0 {
+            self.remote_forwards
+                .lock()
+                .await
+                .insert(bound, (generation, local_host, local_port));
+        }
+        log::info!("ssh -R {bind_address}:{bound}");
+        Ok((bound, generation))
+    }
+
+    /// Stop the one `-R` listener bound to `bound_port` AND carrying
+    /// `generation` - the same identity-over-port reasoning `abort_forward`
+    /// gives for `-L`: a port this frees is immediately rebindable, so a
+    /// stale close in flight must not be able to name the listener a later
+    /// open bound on the same port. `false` means there was none to close.
+    pub async fn close_remote_forward(
+        &self,
+        bind_address: String,
+        bound_port: u16,
+        generation: u64,
+    ) -> Result<bool, String> {
+        let removed = {
+            let mut map = self.remote_forwards.lock().await;
+            match map.get(&bound_port) {
+                Some((gen, _, _)) if *gen == generation => {
+                    map.remove(&bound_port);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !removed {
+            return Ok(false);
+        }
+        let guard = self.handle.lock().await;
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| "ssh session is closed".to_string())?;
+        handle
+            .cancel_tcpip_forward(bind_address, u32::from(bound_port))
+            .await
+            .map_err(|e| format!("ssh: cancel remote listen on port {bound_port} failed: {e}"))?;
+        Ok(true)
+    }
+
+    /// Start an `ssh -D` SOCKS5 listener: bind `127.0.0.1:local_port` (0
+    /// picks one) and speak the minimal subset a working proxy needs - no-
+    /// auth only, CONNECT only (`socks_handshake`/`serve_socks_connection`
+    /// below) - opening one `channel_open_direct_tcpip` per accepted CONNECT,
+    /// the same call `open_forward` makes for `-L`. Shares `forwards` /
+    /// `abort_forward` / `mint_forward_generation` with `-L`'s own listener
+    /// bookkeeping: a SOCKS5 listener is stopped exactly the way a `-L` one
+    /// is, through `close_forward`.
+    pub async fn open_socks(self: &Arc<Self>, local_port: u16) -> Result<(u16, u64), String> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+            .await
+            .map_err(|e| format!("ssh: bind 127.0.0.1:{local_port} failed: {e}"))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| format!("ssh: reading bound port failed: {e}"))?
+            .port();
+        let weak = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            loop {
+                let (sock, _peer) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("ssh -D {bound}: accept failed, forward closed: {e}");
+                        return;
+                    }
+                };
+                let weak = weak.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_socks_connection(sock, weak).await {
+                        log::debug!("ssh -D {bound}: connection ended: {e}");
+                    }
+                });
+            }
+        });
+        let generation = mint_forward_generation(&self.forward_seq);
+        self.forwards.lock().await.insert(bound, (generation, task));
+        log::info!("ssh -D 127.0.0.1:{bound}");
+        Ok((bound, generation))
+    }
+
+    /// Return the cached SFTP session, opening a fresh subsystem channel on
+    /// the SSH handle on first request. Cheap after the first call; the
+    /// initial open costs one channel round-trip plus SFTP handshake.
+    pub async fn ensure_sftp(&self) -> Result<Arc<SftpSession>, String> {
+        let mut guard = self.sftp.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+        let sftp = open_sftp_on_handle(self).await?;
+        *guard = Some(sftp.clone());
+        Ok(sftp)
+    }
+
+    /// Open a session channel and request remote command execution, with
+    /// bounded channel-open and exec-request deadlines.
+    async fn open_exec_channel(
+        &self,
+        cmd: &str,
+        timeout: Duration,
+        open_context: &str,
+        exec_context: &str,
+    ) -> Result<russh::Channel<Msg>, String> {
+        // Hold the handle lock only across the channel open, exactly like
+        // `open_sftp_on_handle`. Keeping it for the whole command would park
+        // `ssh_close` (the other holder) behind a poll for up to the deadline,
+        // so closing an SSH tab could hang for seconds.
+        let channel = {
+            let handle_guard = self.handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .ok_or_else(|| "ssh session is closed".to_string())?;
+            tokio::time::timeout(timeout, handle.channel_open_session())
+                .await
+                .map_err(|_| format!("ssh: {open_context} timed out after {}s", timeout.as_secs()))?
+                .map_err(|e| format!("ssh: {open_context}: {e}"))?
+        };
+        tokio::time::timeout(timeout, channel.exec(true, cmd))
+            .await
+            .map_err(|_| format!("ssh: {exec_context} timed out after {}s", timeout.as_secs()))?
+            .map_err(|e| format!("ssh: {exec_context}: {e}"))?;
+        Ok(channel)
+    }
+
+    /// Run one non-interactive command on the remote and capture its stdout.
+    /// Opens a one-shot channel on the retained handle, the same way
+    /// `open_sftp_on_handle` does, so it is independent of the shell channel
+    /// driving the terminal.
+    ///
+    /// A non-zero exit is an `Err` carrying the remote's stderr. Swallowing it
+    /// made every remote failure - `git` missing from sshd's minimal PATH,
+    /// dubious-ownership, a denied exec - indistinguishable from "empty output",
+    /// so the caller could only ever report "not a repository".
+    pub async fn exec_capture(&self, cmd: &str) -> Result<String, String> {
+        let mut channel = self
+            .open_exec_channel(
+                cmd,
+                Duration::from_secs(15),
+                "open exec channel",
+                "exec request",
+            )
+            .await?;
+
+        // Bounded so a pathological remote can neither exhaust memory nor hang
+        // the caller. All three are far above a `git status` on a large repo.
+        // Known limit: fixed 4 MiB stdout / 4 KiB stderr / 15s ceiling; make them
+        // parameters only if a second caller needs a different budget.
+        const CAP: usize = 4 * 1024 * 1024;
+        const ERR_CAP: usize = 4096;
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
+        tokio::pin!(deadline);
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let mut exit: u32 = 0;
+        let mut timed_out = false;
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+                msg = channel.wait() => match msg {
+                    Some(ChannelMsg::Data { ref data }) => {
+                        let room = CAP.saturating_sub(out.len());
+                        if room > 0 {
+                            out.extend_from_slice(&data[..data.len().min(room)]);
+                        }
+                    }
+                    // ext 1 is stderr. Keep the LAST 4 KiB, not the first: a
+                    // chatty ~/.bashrc writes to stderr before the command runs,
+                    // so a head-capped buffer would drop the actual message.
+                    Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
+                        err.extend_from_slice(data);
+                        if err.len() > ERR_CAP {
+                            err.drain(..err.len() - ERR_CAP);
+                        }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => exit = exit_status,
+                    Some(ChannelMsg::Failure) => {
+                        return Err("ssh server rejected the exec request".to_string());
+                    }
+                    // A signal death arrives as exit-signal, NOT exit-status
+                    // (RFC 4254 6.10 - a server sends one or the other), so
+                    // without this `exit` would stay 0 and a truncated read
+                    // would be reported as success. 128+n is the shell's
+                    // convention for "killed by a signal".
+                    Some(ChannelMsg::ExitSignal {
+                        ref signal_name, ..
+                    }) => {
+                        exit = 128;
+                        if err.is_empty() {
+                            err.extend_from_slice(
+                                format!("killed by signal {signal_name:?}").as_bytes(),
+                            );
+                        }
+                    }
+                    // Eof is deliberately NOT a break. The `exit-status` request
+                    // legitimately arrives AFTER Eof (dropbear always; OpenSSH
+                    // whenever the child's stdout closes before it is reaped),
+                    // and breaking there would leave `exit` at 0 - i.e. every
+                    // failure would still be reported as success with empty
+                    // output, which is the exact bug this capture exists to fix.
+                    // The server always follows with Close once the command is
+                    // done, and the deadline above is the backstop.
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                },
+            }
+        }
+        if timed_out {
+            return Err("ssh exec timed out after 15s".to_string());
+        }
+        if exit != 0 {
+            let detail = String::from_utf8_lossy(&err);
+            let detail = detail.trim();
+            return Err(if detail.is_empty() {
+                format!("ssh exec exited {exit}")
+            } else {
+                format!("ssh exec ({exit}): {detail}")
+            });
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Keep one exec channel open and forward each stdout chunk until the
+    /// caller cancels it or the remote command ends. This is for remote
+    /// streams such as resource monitoring; one-shot commands should keep
+    /// using `exec_capture` so their output stays bounded.
+    pub async fn exec_stream<F>(
+        &self,
+        cmd: &str,
+        mut cancel: watch::Receiver<bool>,
+        mut on_data: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&[u8]) -> Result<bool, String> + Send,
+    {
+        let mut channel = self
+            .open_exec_channel(
+                cmd,
+                Duration::from_secs(10),
+                "open resource stream channel",
+                "start resource stream",
+            )
+            .await?;
+
+        const ERR_CAP: usize = 4096;
+        let mut err = Vec::new();
+        let mut exit = None;
+        let mut received_sample = false;
+        let sample_deadline = tokio::time::sleep(Duration::from_secs(8));
+        tokio::pin!(sample_deadline);
+        loop {
+            tokio::select! {
+                _ = &mut sample_deadline => {
+                    let _ = channel.close().await;
+                    return Err(if received_sample {
+                        "ssh resource stream timed out waiting for the next sample after 8s".to_string()
+                    } else {
+                        "ssh resource stream timed out waiting for its first sample after 8s".to_string()
+                    });
+                }
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        let _ = channel.close().await;
+                        return Ok(());
+                    }
+                }
+                msg = channel.wait() => match msg {
+                    Some(ChannelMsg::Data { ref data }) => {
+                        match on_data(data) {
+                            Ok(true) => {
+                                received_sample = true;
+                                sample_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(8));
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                let _ = channel.close().await;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
+                        err.extend_from_slice(data);
+                        if err.len() > ERR_CAP {
+                            err.drain(..err.len() - ERR_CAP);
+                        }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
+                    Some(ChannelMsg::ExitSignal { ref signal_name, .. }) => {
+                        exit = Some(128);
+                        if err.is_empty() {
+                            err.extend_from_slice(
+                                format!("killed by signal {signal_name:?}").as_bytes(),
+                            );
+                        }
+                    }
+                    Some(ChannelMsg::Failure) => {
+                        let _ = channel.close().await;
+                        return Err("ssh server rejected the resource stream exec request".to_string());
+                    }
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                },
+            }
+        }
+
+        let detail = String::from_utf8_lossy(&err);
+        let detail = detail.trim();
+        match exit {
+            Some(code) if code != 0 && !detail.is_empty() => {
+                Err(format!("ssh resource stream ({code}): {detail}"))
+            }
+            Some(code) if code != 0 => Err(format!("ssh resource stream exited {code}")),
+            _ => Err("ssh resource stream ended".to_string()),
+        }
+    }
+}
+
+/// The pure SOCKS5 handshake: greeting + method selection (no-auth only) and
+/// the CONNECT request (RFC 1928 ss3-4), generic over any
+/// `AsyncRead + AsyncWrite` so it is unit-testable over `tokio::io::duplex`
+/// with no socket and no SSH at all (see `socks_handshake_tests` below).
+/// `Ok(Ok((host, port)))` on a CONNECT this minimal server can serve;
+/// `Ok(Err(reply_code))` for a method/command/address type it refuses - the
+/// SOCKS5 reply byte the caller must send back before closing.
+async fn socks_handshake<S>(io: &mut S) -> std::io::Result<Result<(String, u16), u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut head = [0u8; 2];
+    io.read_exact(&mut head).await?;
+    let mut methods = vec![0u8; head[1] as usize];
+    io.read_exact(&mut methods).await?;
+    if head[0] != 0x05 || !methods.contains(&0x00) {
+        // No acceptable method (RFC 1928 s3): 0xFF, then the caller closes.
+        io.write_all(&[0x05, 0xFF]).await?;
+        return Ok(Err(0xFF));
+    }
+    io.write_all(&[0x05, 0x00]).await?;
+
+    let mut req = [0u8; 4];
+    io.read_exact(&mut req).await?;
+    let (ver, cmd, atyp) = (req[0], req[1], req[3]);
+    if ver != 0x05 {
+        return Ok(Err(0x01)); // general SOCKS server failure
+    }
+    if cmd != 0x01 {
+        // CONNECT only - BIND and UDP ASSOCIATE are refused.
+        return Ok(Err(0x07)); // command not supported
+    }
+    let host = match atyp {
+        0x01 => {
+            let mut a = [0u8; 4];
+            io.read_exact(&mut a).await?;
+            std::net::Ipv4Addr::from(a).to_string()
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            io.read_exact(&mut len).await?;
+            let mut d = vec![0u8; len[0] as usize];
+            io.read_exact(&mut d).await?;
+            String::from_utf8_lossy(&d).into_owned()
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            io.read_exact(&mut a).await?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => return Ok(Err(0x08)), // address type not supported
+    };
+    let mut portbuf = [0u8; 2];
+    io.read_exact(&mut portbuf).await?;
+    Ok(Ok((host, u16::from_be_bytes(portbuf))))
+}
+
+/// The fixed `BND.ADDR`/`BND.PORT` this minimal server always answers with -
+/// `0.0.0.0:0`, the ordinary placeholder a SOCKS5 client that only wants a
+/// working CONNECT never reads back.
+async fn socks_reply<S>(io: &mut S, code: u8) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    io.write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+}
+
+/// One accepted SOCKS5 connection: negotiate, then either pipe it through a
+/// fresh `direct-tcpip` channel to whatever it asked for - the exact call
+/// `open_forward` makes for `-L`, just driven by a SOCKS handshake instead of
+/// a fixed `remote_host`/`remote_port` - or answer the refusal
+/// `socks_handshake` decided (skipped for `0xFF`, whose reply already went
+/// out inside `socks_handshake`) and let the connection close. The handshake
+/// itself is bounded to 10s: a peer that sends nothing, or an incomplete
+/// greeting, must not park this task and its socket forever.
+async fn serve_socks_connection(
+    mut sock: tokio::net::TcpStream,
+    session: std::sync::Weak<SshSession>,
+) -> std::io::Result<()> {
+    let handshake = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        socks_handshake(&mut sock),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        // Deadline elapsed: no reply code to send back, just drop the socket
+        // the same as any other handshake failure.
+        Err(_) => return Ok(()),
+    };
+    let (host, port) = match handshake {
+        Ok(v) => v,
+        Err(code) => {
+            if code != 0xFF {
+                socks_reply(&mut sock, code).await?;
+            }
+            return Ok(());
+        }
+    };
+    // Hold the session only across the channel open, exactly like
+    // `open_forward`'s own `opened` block: a long-lived tunnel that kept the
+    // Arc would keep this listener bound after the session is evicted, so the
+    // next reconnect's bind would fail with "address already in use".
+    let opened = {
+        let Some(session) = session.upgrade() else {
+            socks_reply(&mut sock, 0x01).await?;
+            return Ok(());
+        };
+        let guard = session.handle.lock().await;
+        let Some(handle) = guard.as_ref() else {
+            socks_reply(&mut sock, 0x01).await?;
+            return Ok(());
+        };
+        handle
+            .channel_open_direct_tcpip(host.clone(), u32::from(port), "127.0.0.1".to_string(), 0)
+            .await
+    };
+    match opened {
+        Ok(channel) => {
+            socks_reply(&mut sock, 0x00).await?;
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+        }
+        Err(e) => {
+            log::warn!("ssh -D: open tunnel to {host}:{port} failed: {e}");
+            socks_reply(&mut sock, 0x05).await?; // connection refused
+        }
+    }
+    Ok(())
+}
+
+impl Drop for SshSession {
+    fn drop(&mut self) {
+        // Last-resort cleanup when the frontend hung up without calling
+        // ssh_close. Shells are deliberately NOT aborted: each pump holds only a
+        // Weak to this session and reports its own ending when the connection
+        // dies.
+        // The -L listeners go, so a session evicted by the janitor (remote
+        // hangup, never an explicit close) releases its local ports.
+        if let Ok(mut f) = self.forwards.try_lock() {
+            for (_, (_, t)) in f.drain() {
+                t.abort();
+            }
+        }
+    }
+}
+
+/// Shared russh client config: russh's vetted modern defaults with bare
+/// `ssh-rsa` (SHA-1) dropped from the host-key set (see HOST_KEY_ALGOS). Built
+/// fresh per hop because `client::connect[_stream]` consumes the `Arc<Config>`.
+fn build_config() -> Arc<Config> {
+    Arc::new(Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(KEEPALIVE),
+        preferred: russh::Preferred {
+            key: std::borrow::Cow::Borrowed(HOST_KEY_ALGOS),
+            ..russh::Preferred::DEFAULT
+        },
+        ..Default::default()
+    })
+}
+
+/// Build a host-key verifier for one hop. When no fingerprint is pinned, parks
+/// a first-connect confirmation one-shot keyed by the returned prompt id
+/// (resolved by `ssh_confirm_host_key`). Returns the handler plus the shared
+/// report and prompt metadata the caller needs to apply the confirm-timeout
+/// budget and to turn a handshake failure into a specific error.
+fn build_verifier(
+    expected_fingerprint: Option<String>,
+    on_event: IpcChannel<SshEvent>,
+    host: String,
+    remote_forwards: RemoteForwardTargets,
+    session_end: Option<oneshot::Sender<()>>,
+) -> (HostKeyVerifier, Arc<Mutex<HostKeyReport>>, String, bool) {
+    let report: Arc<Mutex<HostKeyReport>> = Arc::new(Mutex::new(HostKeyReport::default()));
+    let needs_confirm = expected_fingerprint.is_none();
+    let prompt_id = format!("hk-{}", HOSTKEY_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed));
+    let decision = if needs_confirm {
+        let (tx, rx) = oneshot::channel::<bool>();
+        if let Ok(mut m) = pending_host_keys().lock() {
+            m.insert(prompt_id.clone(), tx);
+        }
+        Some(rx)
+    } else {
+        None
+    };
+    let handler = HostKeyVerifier {
+        expected: expected_fingerprint,
+        report: report.clone(),
+        on_event,
+        prompt_id: prompt_id.clone(),
+        host,
+        decision,
+        remote_forwards,
+        _session_end: session_end,
+    };
+    (handler, report, prompt_id, needs_confirm)
+}
+
+/// Turn a russh handshake failure into a specific, user-actionable message
+/// using the verifier's structured report (user rejected a new key, or a
+/// pinned-key mismatch), falling back to the generic disconnect text.
+///
+/// `host` and `port` are carried only for that fallback: it is the one arm whose
+/// text says nothing about WHICH attempt failed, and a pane that already prefixes
+/// every park with "ssh connect failed" gains nothing from a second sentence
+/// repeating the words.
+async fn handshake_error(
+    report: &Arc<Mutex<HostKeyReport>>,
+    host: &str,
+    port: u16,
+    e: russh::Error,
+) -> SshConnectError {
+    let report_guard = report.lock().await;
+    if let Some(seen) = report_guard.rejected.clone() {
+        // Two ways to get here, and BOTH are config. The user declined the key,
+        // or the 120s confirm window in `check_server_key` lapsed with nobody
+        // at the screen - that arm sets `rejected` too.
+        //
+        // Filing the lapse here is a deliberate behaviour change, not a side
+        // effect of the user-rejection row. It used to be reported as a string,
+        // land in transport, and ladder, on the argument that a reconnect
+        // re-raises the question for whoever comes back to it. That argument
+        // does not survive the arithmetic: the prompt is a modal that blocks
+        // the whole UI, each retry re-arms another 120s window, and a user away
+        // long enough to miss the first one misses all four and reaches the
+        // same parked end state having held four connections open for eight
+        // minutes. Parking reaches it in two, and Enter re-raises the question
+        // the moment they do come back.
+        //
+        // A link that dropped WHILE the dialog was up is a different case and
+        // is not this one: the connect future dies without `check_server_key`
+        // ever recording an answer, `rejected` stays None, and the fall-through
+        // below reports it transport so the ladder still covers it.
+        return SshConnectError::config(format!(
+            "ssh: host key not trusted: the new server key {seen} was not confirmed; \
+             connection aborted before sending credentials."
+        ));
+    }
+    if let Some((expected, seen)) = report_guard.mismatch.clone() {
+        // A pin recorded on this machine refuses the key. Same server, same
+        // pin, same outcome next time.
+        return SshConnectError::config(format!(
+            "ssh: host key mismatch: expected={expected} server={seen}. \
+             The server presented a different key than the one recorded on the last \
+             successful connect. If the server key was rotated legitimately, edit the \
+             saved connection and clear the recorded fingerprint before reconnecting; \
+             otherwise this could be a man-in-the-middle attack."
+        ));
+    }
+    SshConnectError::transport(format!(
+        "ssh: could not open a connection to {host}:{port}: {e}"
+    ))
+}
+
+/// Drive a russh connect future under the right timeout budget (first connects
+/// may block on the confirmation dialog, so they get the extra confirm window),
+/// clean up any unconsumed prompt, and map a failure through `handshake_error`.
+/// Works for both `client::connect` (TCP) and `client::connect_stream` (tunnel).
+async fn finish_connect<F>(
+    connect_fut: F,
+    needs_confirm: bool,
+    report: &Arc<Mutex<HostKeyReport>>,
+    prompt_id: &str,
+    host: &str,
+    port: u16,
+) -> Result<Handle<HostKeyVerifier>, SshConnectError>
+where
+    F: std::future::Future<Output = Result<Handle<HostKeyVerifier>, russh::Error>>,
+{
+    let overall_timeout = if needs_confirm {
+        CONNECT_TIMEOUT + HOSTKEY_CONFIRM_TIMEOUT
+    } else {
+        CONNECT_TIMEOUT
+    };
+    // This budget covers the TCP dial plus, on a first connect, the window the
+    // user has to answer the fingerprint dialog. It is not usually what decides
+    // a lapsed window: `check_server_key` runs its own `HOSTKEY_CONFIRM_TIMEOUT`
+    // on the answer channel, clocked from when the prompt is emitted, while this
+    // one started before the dial. The inner one therefore fires first PROVIDED
+    // the host-key check is reached within `CONNECT_TIMEOUT`, which is the
+    // ordinary case; it then records the fingerprint in
+    // `HostKeyReport::rejected` and fails the handshake, which `handshake_error`
+    // reports `config`.
+    //
+    // Nothing bounds when that check is reached, though. `build_config` sets
+    // `inactivity_timeout: None`, and neither the TCP connect nor the key
+    // exchange inside `connect_fut` carries a clock of its own - this `timeout`
+    // is the only one over them. On a slow or lossy first connect where dial
+    // plus kex runs past `CONNECT_TIMEOUT`, the prompt is emitted late, its
+    // window outlives this one, and THIS arm fires with the dialog still up.
+    // It still reports transport, because the only fact available here is a
+    // connect future that never resolved; the consequence is that such a connect
+    // ladders, each retry re-arming another full confirm window, which is the
+    // outcome the host-key reasoning in `handshake_error` argues against.
+    let result = tokio::time::timeout(overall_timeout, connect_fut)
+        .await
+        .map_err(|_| {
+            SshConnectError::transport(format!("ssh: connect to {host}:{port} timed out"))
+        })?;
+    // Drop any unconsumed prompt (handshake failed before/around the check).
+    if needs_confirm {
+        if let Ok(mut m) = pending_host_keys().lock() {
+            m.remove(prompt_id);
+        }
+    }
+    match result {
+        Ok(h) => Ok(h),
+        Err(e) => Err(handshake_error(report, host, port, e).await),
+    }
+}
+
+/// Open a `direct-tcpip` tunnel from `prev` to `host:port` under the connect
+/// timeout, so a jump host that is up but cannot reach the next hop fails in a
+/// bounded, message-bearing way instead of hanging on the jump's own (often
+/// ~75s) TCP connect timeout - restoring the direct path's deliberate cap for
+/// tunneled hops. Also drops a parked first-connect prompt on failure, since
+/// the tunnel can fail before `finish_connect` (the usual cleanup point) runs,
+/// which would otherwise leak the one-shot in `pending_host_keys()`.
+async fn open_tunnel(
+    prev: &Handle<HostKeyVerifier>,
+    host: &str,
+    port: u16,
+    needs_confirm: bool,
+    prompt_id: &str,
+) -> Result<russh::Channel<Msg>, SshConnectError> {
+    let opened = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        prev.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0),
+    )
+    .await;
+    let drop_prompt = || {
+        if needs_confirm {
+            if let Ok(mut m) = pending_host_keys().lock() {
+                m.remove(prompt_id);
+            }
+        }
+    };
+    match opened {
+        Err(_) => {
+            drop_prompt();
+            Err(SshConnectError::transport(format!(
+                "ssh: open tunnel to {host}:{port} timed out"
+            )))
+        }
+        Ok(Err(e)) => {
+            drop_prompt();
+            Err(SshConnectError::transport(format!(
+                "ssh: open tunnel to {host}:{port} failed: {e}"
+            )))
+        }
+        Ok(Ok(channel)) => Ok(channel),
+    }
+}
+
+/// A live ssh-agent connection with its transport erased, so the Windows named
+/// pipe and the Unix socket are the same type to everything downstream.
+type Agent = AgentClient<Box<dyn AgentStream + Send + Unpin + 'static>>;
+
+/// What to do about it, per platform. Appended to every agent failure because
+/// none of them are actionable on their own ("early eof" is what a user with no
+/// agent at all actually gets).
+#[cfg(windows)]
+const NO_AGENT_HINT: &str = "Start the OpenSSH agent with `Start-Service ssh-agent` \
+     (set it to Automatic to keep it), or run Pageant, then add a key with `ssh-add`.";
+#[cfg(not(windows))]
+const NO_AGENT_HINT: &str = "Start one with `eval $(ssh-agent)`, then add a key with `ssh-add`.";
+
+/// An agent that takes longer than this to answer is treated as absent. Also
+/// bounds russh's named-pipe connect, which retries a BUSY pipe forever, so a
+/// wedged agent cannot hang a connect (or the dialog's agent panel) for good.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Open the agent transport, and say whether opening it PROVED an agent is
+/// there.
+///
+/// Windows: the OpenSSH agent's named pipe, unless `SSH_AUTH_SOCK` points
+/// somewhere else (Git Bash, 1Password and gpg-agent all set it), then Pageant,
+/// which is what PuTTY and Bitvise expose. Everywhere else: `SSH_AUTH_SOCK`.
+///
+/// The second element of the pair is that proof, and it is why nothing calls
+/// this directly. `None` means a connect completed against something listening.
+/// `Some(what_was_looked_for)` means the transport constructed WITHOUT
+/// establishing that - the Pageant fallback does exactly this, it builds happily
+/// with nothing on the other end - and carries the sentence naming what was
+/// looked for, because by the time the absence surfaces the pipe path is out of
+/// scope. `agent_keys` settles the question one call later and needs the
+/// distinction to file the answer; see `agent_listing_error`.
+///
+/// A transport that will not open AT ALL is `config` on every arm: "there is no
+/// agent on this machine" is a fact about the machine, and the hint tells the
+/// user which service to start. A retry a second later reproduces it byte for
+/// byte. Filing it transport would ladder four times at up to `AGENT_TIMEOUT`
+/// each before showing the hint - and would contradict `authenticate_agent`,
+/// which already calls a RUNNING agent holding no key `config`. An absent agent
+/// is the more permanent of the two.
+#[cfg(windows)]
+async fn open_agent() -> Result<(Agent, Option<String>), SshConnectError> {
+    let pipe = std::env::var("SSH_AUTH_SOCK")
+        .unwrap_or_else(|_| r"\\.\pipe\openssh-ssh-agent".to_string());
+    if let Ok(c) = AgentClient::connect_named_pipe(&pipe).await {
+        return Ok((c.dynamic(), None));
+    }
+    // Reached whenever the named pipe is absent, which on this platform is every
+    // no-agent case - and `connect_pageant` then succeeds anyway. Marking the
+    // result unproven here is the whole fix: without the marker the absence
+    // surfaces as a listing failure, which cannot tell itself apart from a live
+    // agent breaking mid-exchange, and a machine with no agent at all walked the
+    // full ladder while a RUNNING agent holding no key parked immediately.
+    let tried = format!("no ssh-agent at {pipe} and no Pageant");
+    match AgentClient::connect_pageant().await {
+        Ok(c) => Ok((c.dynamic(), Some(tried))),
+        Err(e) => Err(SshConnectError::config(format!(
+            "{tried} ({e}). {NO_AGENT_HINT}"
+        ))),
+    }
+}
+
+#[cfg(not(windows))]
+async fn open_agent() -> Result<(Agent, Option<String>), SshConnectError> {
+    // Always proven: `connect_env` opens the Unix socket, which fails outright
+    // when nothing is listening, so reaching the Ok arm IS the evidence the
+    // Windows Pageant arm cannot produce.
+    AgentClient::connect_env()
+        .await
+        .map(|c| (c.dynamic(), None))
+        .map_err(|e| {
+            SshConnectError::config(format!(
+                "no ssh-agent on SSH_AUTH_SOCK ({e}). {NO_AGENT_HINT}"
+            ))
+        })
+}
+
+/// The kind a failed identity listing carries, decided by WHICH transport arm
+/// `open_agent` returned through rather than by the listing error, which is the
+/// same "early eof" either way.
+///
+/// `unproven` is `open_agent`'s second element. Kept as a free function so the
+/// decision is unit-testable on every platform: the arm that feeds it `Some` is
+/// Windows-only, and this crate's tests never run on Windows in CI.
+fn agent_listing_error(unproven: Option<&str>, cause: &str) -> SshConnectError {
+    match unproven {
+        // Something answered the socket - it is there - and then the exchange
+        // broke. The next attempt may find it healthy.
+        None => {
+            SshConnectError::transport(format!("no ssh-agent answered ({cause}). {NO_AGENT_HINT}"))
+        }
+        // Nothing was ever shown to be on the other end, so absent and broken are
+        // indistinguishable from here - and absent is both the common case and
+        // the permanent one. Same call `open_agent` makes for a transport that
+        // would not open at all.
+        Some(tried) => SshConnectError::config(format!("{tried} ({cause}). {NO_AGENT_HINT}")),
+    }
+}
+
+/// The agent, plus the public keys it holds. Connecting and listing are one
+/// operation on purpose: a transport that opens proves nothing (see
+/// `open_agent`), so the listing is the real handshake and the caller gets one
+/// unambiguous error either way. The connection is returned because agent auth
+/// then signs over that same connection.
+///
+/// Certificates are dropped from the list: they need
+/// `authenticate_certificate_with`, a flow Tervia does not implement, and offering
+/// them as plain keys would only burn the server's auth attempts.
+/// Carries `SshConnectError` rather than `String` so its failures can disagree
+/// about the kind, which they genuinely do: not having an agent is a state of
+/// this machine (`config`), whereas one that accepted a connection and then
+/// would not answer is a live thing misbehaving (`transport`). Collapsing them
+/// into one string is what made an absent agent ladder. The listing failure sits
+/// on both sides of that line at once, which is why its kind comes from
+/// `agent_listing_error` and not from the error in hand.
+pub(crate) async fn agent_keys() -> Result<(Agent, Vec<PublicKey>), SshConnectError> {
+    let probe = async {
+        let (mut agent, unproven) = open_agent().await?;
+        let identities = agent
+            .request_identities()
+            .await
+            .map_err(|e| agent_listing_error(unproven.as_deref(), &e.to_string()))?;
+        let keys = identities
+            .into_iter()
+            .filter_map(|i| match i {
+                AgentIdentity::PublicKey { key, .. } => Some(key),
+                AgentIdentity::Certificate { .. } => None,
+            })
+            .collect();
+        Ok::<_, SshConnectError>((agent, keys))
+    };
+    match tokio::time::timeout(AGENT_TIMEOUT, probe).await {
+        Ok(res) => res,
+        // Also transport: a wedged or overloaded agent is the case this bound
+        // exists for, and it can come back.
+        Err(_) => Err(SshConnectError::transport(format!(
+            "ssh-agent did not answer within {}s. {NO_AGENT_HINT}",
+            AGENT_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// RSA must say which SHA-2 variant it is signing with (`rsa-sha2-256`); every
+/// other algorithm carries its hash in the algorithm name and must pass `None`.
+fn agent_hash_alg(key: &PublicKey) -> Option<HashAlg> {
+    match key.algorithm() {
+        Algorithm::Rsa { .. } => Some(HashAlg::Sha256),
+        _ => None,
+    }
+}
+
+/// Public-key auth where the private key NEVER LEAVES THE AGENT: the agent signs
+/// each challenge and Tervia only ever sees the signature. That is the whole point
+/// of this mode - nothing to paste, nothing in the keychain, nothing that can
+/// leak from here.
+async fn authenticate_agent(
+    handle: &mut Handle<HostKeyVerifier>,
+    host: &str,
+    user: &str,
+    // Restrict the offer to the ssh-agent identity with this SHA256
+    // fingerprint - set for a vault entry of the `hardware` kind, so THIS
+    // identity is what authenticates rather than whichever key the agent
+    // happens to offer first. `None` is today's behaviour: every key.
+    only_fingerprint: Option<&str>,
+) -> Result<bool, SshConnectError> {
+    // The kind comes from `agent_keys`, which knows which of its failures this
+    // was and which transport arm it came through; only the host label is added.
+    // Re-deciding it here would put an absent agent back on the ladder.
+    let (mut agent, keys) = agent_keys()
+        .await
+        .map_err(|e| e.map_message(|m| format!("ssh: [{host}] {m}")))?;
+    let keys: Vec<PublicKey> = match only_fingerprint {
+        Some(fp) => keys
+            .into_iter()
+            .filter(|k| k.fingerprint(HashAlg::Sha256).to_string() == fp)
+            .collect(),
+        None => keys,
+    };
+    if keys.is_empty() {
+        // A running agent holding nothing USABLE - either nothing at all, or
+        // (with `only_fingerprint` set) not the one identity a `hardware`
+        // vault entry names - is a state of this machine. Retrying does not
+        // add a key to it.
+        return Err(SshConnectError::config(match only_fingerprint {
+            Some(fp) => format!(
+                "ssh: [{host}] ssh-agent does not hold the key {fp}. Add it with `ssh-add`, \
+                 or point the token/agent that does hold it at this machine."
+            ),
+            None => format!(
+                "ssh: [{host}] ssh-agent is running but holds no usable key. Add one with \
+                 `ssh-add`."
+            ),
+        }));
+    }
+    // Offered in the agent's own order, like OpenSSH does, stopping at the first
+    // one the server takes. The loop caps nothing itself, so an agent holding
+    // more keys than the server's MaxAuthTries (6 by default) gets disconnected
+    // part way through: the next `authenticate_publickey_with` returns an error,
+    // the `map_err` inside the loop files it transport under a raw russh string,
+    // and the refusal arm at the bottom - the one that says how many keys were
+    // tried - is never reached. An exhausted MaxAuthTries is therefore
+    // reconnect-eligible, and the pane ladders over a condition no retry changes.
+    for key in &keys {
+        // Type-annotated `Box::pin`, not a plain `.await`. russh's `Signer`
+        // returns an opaque future, and the compiler cannot generalize its
+        // `Send`-ness over the borrows this call holds - the failure surfaces as
+        // "implementation of Send is not general enough" at the `ssh_open`
+        // spawn, in another file, naming an internal russh type. Coercing to a
+        // `dyn Future + Send` here proves it once, locally.
+        let attempt: Pin<Box<dyn Future<Output = Result<AuthResult, AgentAuthError>> + Send + '_>> =
+            Box::pin(handle.authenticate_publickey_with(
+                user,
+                key.clone(),
+                agent_hash_alg(key),
+                &mut agent,
+            ));
+        // The signing exchange itself broke - a russh or agent-transport error
+        // raised WHILE authenticating, not the server's answer. Transport.
+        let accepted = attempt.await.map_err(|e| {
+            SshConnectError::transport(format!("ssh: [{host}] ssh-agent auth error: {e}"))
+        })?;
+        if accepted.success() {
+            return Ok(true);
+        }
+    }
+    // Every key was offered and the server refused all of them. That is its
+    // answer, so it is `auth`.
+    Err(SshConnectError::auth(format!(
+        "ssh: [{host}] the server accepted none of the {} key(s) held by ssh-agent",
+        keys.len()
+    )))
+}
+
+/// Authenticate a hop with the ssh-agent, its private key, or its password (with
+/// a keyboard-interactive fallback for PAM-only servers). Shared by every jump
+/// hop and the final target so the auth posture stays identical down the whole
+/// chain. `host` only labels error messages, so a failing jump names itself
+/// instead of reading as if it were the target.
+#[allow(clippy::too_many_arguments)]
+async fn authenticate_hop(
+    handle: &mut Handle<HostKeyVerifier>,
+    host: &str,
+    user: &str,
+    use_agent: bool,
+    password: Option<&str>,
+    private_key: Option<&str>,
+    passphrase: Option<&str>,
+    // OpenSSH certificate text paired with `private_key` - set only for a
+    // vault entry of the `cert` kind. Checked before the plain-key branch:
+    // a cert kind still carries its signing key in `private_key`, so the
+    // two must not be told apart by `private_key` alone.
+    certificate: Option<&str>,
+    // Restrict `use_agent` to one ssh-agent identity - see
+    // `authenticate_agent`'s own doc comment.
+    agent_key_fingerprint: Option<&str>,
+) -> Result<bool, SshConnectError> {
+    if use_agent {
+        authenticate_agent(handle, host, user, agent_key_fingerprint).await
+    } else if let (Some(pk_text), Some(cert_text)) = (private_key, certificate) {
+        let key = russh::keys::decode_secret_key(pk_text, passphrase).map_err(|e| {
+            SshConnectError::config(format!("ssh: [{host}] parse private key failed: {e}"))
+        })?;
+        let cert = Certificate::from_openssh(cert_text).map_err(|e| {
+            SshConnectError::config(format!("ssh: [{host}] parse certificate failed: {e}"))
+        })?;
+        // The authoritative half of the pairing check - see
+        // `SshTextClassification::Certificate`'s `fingerprint` field doc
+        // (`mod.rs`) for the frontend's own check at save time, over
+        // fingerprints rather than key data. This one runs unconditionally,
+        // because a record can reach this point without ever passing
+        // through that check (hand-edited JSON, a sync landing, an older
+        // client).
+        if cert.public_key() != key.public_key().key_data() {
+            return Err(SshConnectError::config(format!(
+                "ssh: [{host}] this certificate does not certify the paired private key"
+            )));
+        }
+        Ok(handle
+            .authenticate_openssh_cert(user, Arc::new(key), cert)
+            .await
+            .map_err(|e| {
+                SshConnectError::transport(format!("ssh: [{host}] certificate auth error: {e}"))
+            })?
+            .success())
+    } else if let Some(pk_text) = private_key {
+        // Config, and this is the row the whole ladder fix turns on: a WRONG
+        // PASSPHRASE fails here, before anything is sent, because the key never
+        // decoded. The server was never asked, so it is not `auth` - but it is
+        // just as fixed, and it is the failure users hit most.
+        let key = russh::keys::decode_secret_key(pk_text, passphrase).map_err(|e| {
+            SshConnectError::config(format!("ssh: [{host}] parse private key failed: {e}"))
+        })?;
+        let pk = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
+        // A russh error raised while authenticating, NOT the server's verdict:
+        // the verdict is the `.success()` below, and it is read by `connect`.
+        // Getting this pair backwards is the likeliest way to file a refused
+        // credential as retryable all over again.
+        Ok(handle
+            .authenticate_publickey(user, pk)
+            .await
+            .map_err(|e| {
+                SshConnectError::transport(format!("ssh: [{host}] pubkey auth error: {e}"))
+            })?
+            .success())
+    } else {
+        let password = password.unwrap_or_default();
+        // Same split as above: a transport error here, the server's answer in
+        // `first.success()`.
+        let first = handle
+            .authenticate_password(user, password)
+            .await
+            .map_err(|e| {
+                SshConnectError::transport(format!("ssh: [{host}] password auth error: {e}"))
+            })?;
+        if first.success() {
+            Ok(true)
+        } else {
+            // Plenty of PAM-backed servers refuse the `password` method and
+            // only offer `keyboard-interactive` (FreeIPA, Duo-only, certain
+            // sshd hardening profiles). Try KBI as a fallback, feeding the
+            // saved password as the first prompt's answer. 2FA multi-prompt
+            // setups will fail with a clear "too many prompts" error instead
+            // of hanging.
+            //
+            // A transport failure INSIDE the fallback is swallowed to `false`,
+            // and that is not laziness. We are only here because the server
+            // already answered the password method with a refusal, so a refusal
+            // is the fact that ended this attempt; letting KBI's error escape
+            // would replace it with `transport` and put a wrong saved password
+            // back on the reconnect ladder - the exact defect this error type
+            // exists to close. It is reachable: `MaxAuthTries 1`, fail2ban, and
+            // appliances that disconnect after one failure all leave KBI
+            // reading from a closed connection. The text is logged rather than
+            // lost, and `connect` reports the refusal as `auth`.
+            match try_keyboard_interactive(handle, user, password).await {
+                Ok(ok) => Ok(ok),
+                Err(e) => {
+                    log::warn!(
+                        "ssh: [{host}] keyboard-interactive fallback failed after the server \
+                         refused the password ({e}); reporting the refusal"
+                    );
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+/// Whether a hop has anything to authenticate WITH. One predicate for the target
+/// and for every jump hop: the two used to be separate inline expressions, and
+/// they must agree by construction. This is now the ONLY such test - the
+/// frontend's pre-flight mirror is gone, because `resolveSshAuth` returns
+/// keychain references and so cannot know what is behind them. A host saved
+/// with no credential is refused here and reported as a configuration error
+/// rather than fed to the reconnect ladder as if the server had hung up.
+///
+/// `is_none`, not emptiness: what reaches this is what `SecretSource::resolve`
+/// found, and an entry holding an empty string resolves to `None` there -
+/// which is exactly the state an absent field used to arrive in.
+fn has_credential(use_agent: bool, password: Option<&str>, private_key: Option<&str>) -> bool {
+    use_agent || password.is_some() || private_key.is_some()
+}
+
+/// The target-side wording of that guard. Named because the same sentence must
+/// reach a user whether they arrived through a terminal leaf, the forward
+/// tunnel, or the host editor's Test probe.
+const NO_CREDENTIALS_ERROR: &str = "ssh: no credentials: set use_agent, password, or private_key";
+
+/// One hop's stored credential as `has_credential` and `authenticate_hop` take
+/// it. `Zeroizing<String>` derefs to `String`, which derefs to `str`.
+fn plain(v: &Option<Zeroizing<String>>) -> Option<&str> {
+    v.as_deref().map(String::as_str)
+}
+
+pub async fn connect(
+    input: SshOpenInput,
+    secrets: SshSecrets,
+    on_event: IpcChannel<SshEvent>,
+) -> Result<Arc<SshSession>, SshConnectError> {
+    if !has_credential(
+        input.use_agent,
+        plain(&secrets.target.password),
+        plain(&secrets.target.private_key),
+    ) {
+        return Err(SshConnectError::config(NO_CREDENTIALS_ERROR));
+    }
+
+    // --- Jump chain (ProxyJump / Termius-style "host chaining") -------------
+    // `input.jumps` is in connect order: jumps[0] is the publicly-reachable
+    // entry we TCP-connect to; each later hop is reached by opening a
+    // `direct-tcpip` channel on the previous hop and running a fresh SSH
+    // handshake over that tunnel stream. The target is reached the same way
+    // over the last jump (or directly when there are no jumps). Every jump
+    // handle is retained on the session: dropping one collapses every tunnel
+    // riding on it (including the target), so they must outlive the session.
+    let mut jump_handles: Vec<Handle<HostKeyVerifier>> = Vec::new();
+    for (hop, hop_secrets) in input.jumps.iter().zip(&secrets.jumps) {
+        if !has_credential(
+            hop.use_agent,
+            plain(&hop_secrets.password),
+            plain(&hop_secrets.private_key),
+        ) {
+            return Err(SshConnectError::config(format!(
+                "ssh: jump host {} has no ssh-agent, password or private key configured",
+                hop.host
+            )));
+        }
+        let (handler, report, prompt_id, needs_confirm) = build_verifier(
+            hop.expected_fingerprint.clone(),
+            on_event.clone(),
+            hop.host.clone(),
+            // A jump hop never carries a `-R` rule of its own - see
+            // `RemoteForwardTargets`'s own doc - so this registry is built
+            // fresh here and never written to.
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+        );
+        let mut handle = if let Some(prev) = jump_handles.last() {
+            let channel = open_tunnel(prev, &hop.host, hop.port, needs_confirm, &prompt_id).await?;
+            finish_connect(
+                client::connect_stream(build_config(), channel.into_stream(), handler),
+                needs_confirm,
+                &report,
+                &prompt_id,
+                &hop.host,
+                hop.port,
+            )
+            .await?
+        } else {
+            finish_connect(
+                client::connect(build_config(), (hop.host.as_str(), hop.port), handler),
+                needs_confirm,
+                &report,
+                &prompt_id,
+                &hop.host,
+                hop.port,
+            )
+            .await?
+        };
+        let ok = authenticate_hop(
+            &mut handle,
+            &hop.host,
+            &hop.user,
+            hop.use_agent,
+            plain(&hop_secrets.password),
+            plain(&hop_secrets.private_key),
+            plain(&hop_secrets.private_key_passphrase),
+            hop.certificate.as_deref(),
+            hop.agent_key_fingerprint.as_deref(),
+        )
+        .await?;
+        if !ok {
+            // The hop's server was asked and said no.
+            return Err(SshConnectError::auth(format!(
+                "ssh: authentication rejected for jump host {}",
+                hop.host
+            )));
+        }
+        // Pin the jump's host key against its own saved connection.
+        let fp = report.lock().await.seen.clone().unwrap_or_default();
+        let _ = on_event.send(SshEvent::JumpConnected {
+            connection_id: hop.connection_id.clone(),
+            fingerprint: fp,
+        });
+        jump_handles.push(handle);
+    }
+
+    // --- Target -------------------------------------------------------------
+    // Either a direct TCP connect (no jumps) or a tunnel over the last jump.
+    // Built here, ahead of the verifier, and cloned into both it and the
+    // `SshSession` below: the session does not exist yet at this point, so
+    // this registry - not a session reference the verifier could route
+    // through later - is what lets the two agree on one map.
+    let remote_forwards: RemoteForwardTargets = Arc::new(Mutex::new(HashMap::new()));
+    let (end_tx, end_rx) = oneshot::channel::<()>();
+    let (handler, report, prompt_id, needs_confirm) = build_verifier(
+        input.expected_fingerprint.clone(),
+        on_event,
+        input.host.clone(),
+        remote_forwards.clone(),
+        Some(end_tx),
+    );
+    let mut handle = if let Some(prev) = jump_handles.last() {
+        let channel = open_tunnel(prev, &input.host, input.port, needs_confirm, &prompt_id).await?;
+        finish_connect(
+            client::connect_stream(build_config(), channel.into_stream(), handler),
+            needs_confirm,
+            &report,
+            &prompt_id,
+            &input.host,
+            input.port,
+        )
+        .await?
+    } else {
+        finish_connect(
+            client::connect(build_config(), (input.host.as_str(), input.port), handler),
+            needs_confirm,
+            &report,
+            &prompt_id,
+            &input.host,
+            input.port,
+        )
+        .await?
+    };
+
+    let authed_ok = authenticate_hop(
+        &mut handle,
+        &input.host,
+        &input.user,
+        input.use_agent,
+        plain(&secrets.target.password),
+        plain(&secrets.target.private_key),
+        plain(&secrets.target.private_key_passphrase),
+        input.certificate.as_deref(),
+        input.agent_key_fingerprint.as_deref(),
+    )
+    .await?;
+
+    if !authed_ok {
+        // The target's own answer. This is the row the user meets when a saved
+        // password is wrong: one attempt, then park.
+        return Err(SshConnectError::auth("ssh: authentication rejected"));
+    }
+
+    // No channel yet: every shell (a terminal tab's) is opened on demand by
+    // `open_shell`, and the session outlives all of them.
+    let fingerprint = report.lock().await.seen.clone().unwrap_or_default();
+    Ok(Arc::new(SshSession {
+        shells: std::sync::Mutex::new(HashMap::new()),
+        shell_seq: AtomicU32::new(1),
+        resource_stream: std::sync::Mutex::new(None),
+        resource_stream_seq: AtomicU32::new(1),
+        handle: Mutex::new(Some(handle)),
+        jump_handles: Mutex::new(jump_handles),
+        sftp: Mutex::new(None),
+        forwards: Mutex::new(HashMap::new()),
+        forward_seq: AtomicU64::new(1),
+        remote_forwards,
+        ended: std::sync::Mutex::new(Some(end_rx)),
+        fingerprint,
+        host: input.host,
+        user: input.user,
+    }))
+}
+
+/// Run an `ssh-userauth` keyboard-interactive exchange using the saved
+/// password as the response to the first prompt of the first `InfoRequest`.
+/// Returns `Ok(true)` on `Success`, `Ok(false)` on the server's final
+/// `Failure`, and `Err(..)` for transport-level errors.
+///
+/// Additional prompts and subsequent rounds get empty strings. Plain PAM
+/// password setups are happy with that; 2FA-style setups requiring an OTP
+/// fail and surface as "authentication rejected". A dedicated 2FA prompt
+/// UI would slot in by replacing `responses` with values from a frontend
+/// round-trip.
+///
+/// `MAX_KBI_ROUNDS` caps the loop so a hostile server cannot keep us in an
+/// endless prompt cycle.
+async fn try_keyboard_interactive(
+    handle: &mut Handle<HostKeyVerifier>,
+    user: &str,
+    password: &str,
+) -> Result<bool, SshConnectError> {
+    const MAX_KBI_ROUNDS: usize = 8;
+    // Transport: the exchange failed to run at all. The server's own verdict is
+    // the `Success`/`Failure` returned below, not either of these.
+    let mut state = handle
+        .authenticate_keyboard_interactive_start(user.to_string(), None)
+        .await
+        .map_err(|e| {
+            SshConnectError::transport(format!("ssh: keyboard-interactive start failed: {e}"))
+        })?;
+    let mut first_round = true;
+    for _ in 0..MAX_KBI_ROUNDS {
+        match state {
+            KeyboardInteractiveAuthResponse::Success => return Ok(true),
+            KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                let responses: Vec<String> = prompts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        if first_round && i == 0 {
+                            password.to_string()
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .collect();
+                first_round = false;
+                state = handle
+                    .authenticate_keyboard_interactive_respond(responses)
+                    .await
+                    .map_err(|e| {
+                        SshConnectError::transport(format!(
+                            "ssh: keyboard-interactive respond failed: {e}"
+                        ))
+                    })?;
+            }
+        }
+    }
+    // The server kept asking and the saved password never satisfied it - a 2FA
+    // setup, typically. The kind here only documents intent: the sole caller in
+    // `authenticate_hop` maps every `Err` from this function to `Ok(false)` and
+    // logs the text, deliberately, so a password the server already refused is
+    // reported as that refusal rather than overwritten by a fallback failure.
+    // Neither this kind nor this string reaches the user.
+    Err(SshConnectError::auth(
+        "ssh: keyboard-interactive: too many prompt rounds",
+    ))
+}
+
+/// The pump's three exit shapes (reported status, reported signal,
+/// unreported/ambiguous) must stay distinguishable at the event level - a
+/// test that only exercised the happy `ExitStatus` case would not catch a
+/// regression that collapsed the other two back into each other or back
+/// into `Exit`. No network, no tokio runtime: `build_exit_event` is a plain
+/// function of the two `Option`s the pump accumulates.
+#[cfg(test)]
+mod exit_classification_tests {
+    use super::*;
+
+    #[test]
+    fn reported_exit_status_alone_is_exit() {
+        let ev = build_exit_event(Some(0), None);
+        assert!(matches!(ev, SshEvent::Exit { code: 0 }), "{ev:?}");
+
+        // Nonzero must survive too - collapsing every reported status to 0
+        // would make a failing remote command indistinguishable from a
+        // clean `exit`.
+        let ev = build_exit_event(Some(17), None);
+        assert!(matches!(ev, SshEvent::Exit { code: 17 }), "{ev:?}");
+    }
+
+    #[test]
+    fn reported_signal_alone_is_signal_not_exit() {
+        let ev = build_exit_event(None, Some(("KILL".to_string(), false)));
+        assert!(
+            matches!(ev, SshEvent::Signal { ref name, core_dumped: false } if name == "KILL"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn neither_reported_is_the_ambiguous_disconnected_shape() {
+        // This is the exact case the bug was: Eof/Close/wait()->None with no
+        // exit-status and no exit-signal ever having arrived. It used to be
+        // indistinguishable from a reported `exit 0`.
+        let ev = build_exit_event(None, None);
+        assert!(matches!(ev, SshEvent::Disconnected), "{ev:?}");
+    }
+
+    /// RFC 4254 6.10 says a channel gets exactly one of exit-status /
+    /// exit-signal, so this combination should not occur on the wire - but
+    /// the function must still resolve it deterministically rather than
+    /// panicking or picking arbitrarily. Signal wins: it is the more
+    /// specific, more surprising fact for the user to see.
+    #[test]
+    fn both_reported_prefers_signal_deterministically() {
+        let ev = build_exit_event(Some(0), Some(("TERM".to_string(), true)));
+        assert!(
+            matches!(ev, SshEvent::Signal { ref name, core_dumped: true } if name == "TERM"),
+            "{ev:?}"
+        );
+    }
+}
+
+/// The connect error's serialized form is a wire contract, not an internal
+/// detail: `bridge.ts` reads `kind` and `message` off the rejected value and
+/// decides from `kind` alone whether the pane parks or ladders. A `rename_all`
+/// regression, a renamed field or a re-tagged enum would leave every Rust
+/// caller compiling and silently return the frontend to one bug it already had:
+/// an unrecognised shape falls through `sshConnectErrorFrom` unchanged, and
+/// every failure ladders again. Asserted against literal JSON so it fails here
+/// rather than at runtime in the webview.
+#[cfg(test)]
+mod connect_error_wire_tests {
+    use super::*;
+
+    #[test]
+    fn each_kind_serializes_to_the_shape_the_frontend_reads() {
+        for (err, expected) in [
+            (
+                SshConnectError::config("m"),
+                r#"{"kind":"config","message":"m"}"#,
+            ),
+            (
+                SshConnectError::auth("m"),
+                r#"{"kind":"auth","message":"m"}"#,
+            ),
+            (
+                SshConnectError::transport("m"),
+                r#"{"kind":"transport","message":"m"}"#,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&err).expect("serialize"),
+                expected,
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_survives_verbatim() {
+        // `isHostKeyMismatchError` matches this prefix off `.message` after the
+        // frontend has rewrapped it. Anything that decorated or truncated the
+        // text here would take the "trust new key" prompt away without failing
+        // a single Rust caller.
+        let text = "ssh: host key mismatch: expected=SHA256:a server=SHA256:b";
+        assert_eq!(SshConnectError::config(text).message, text);
+        assert_eq!(SshConnectError::transport(text).to_string(), text);
+    }
+
+    #[test]
+    fn the_three_kinds_stay_distinct() {
+        // The collapse guard: a change that mapped two kinds onto one would
+        // leave both assertions above passing for the survivor.
+        assert_ne!(SshConnectErrorKind::Auth, SshConnectErrorKind::Transport);
+        assert_ne!(SshConnectErrorKind::Config, SshConnectErrorKind::Transport);
+        assert_ne!(SshConnectErrorKind::Config, SshConnectErrorKind::Auth);
+    }
+}
+
+/// The ssh-agent listing failure, whose kind cannot be read off the error.
+///
+/// A machine with no agent and an agent that broke mid-exchange raise the same
+/// "early eof" here, so the only thing that separates them is which transport
+/// arm opened - and on Windows the Pageant fallback constructs against nothing,
+/// so the absence has no other chance to be noticed. Filing both `transport` is
+/// what walked a machine with no agent at all through the full ladder while a
+/// RUNNING agent holding no key parked immediately, on the platform where the
+/// fallback is the one that gets taken.
+///
+/// Asserted on the decision rather than on the arm that feeds it: `open_agent`
+/// is `#[cfg]`-split and needs a live transport, and CI runs no Rust tests on
+/// Windows. That the Windows arm actually passes the marker is held by a
+/// source-text check in scripts/ssh-retry-verify.ts.
+#[cfg(test)]
+mod agent_listing_tests {
+    use super::*;
+
+    #[test]
+    fn a_proven_transport_that_then_broke_is_transport() {
+        let e = agent_listing_error(None, "early eof");
+        assert_eq!(e.kind, SshConnectErrorKind::Transport);
+        assert!(e.message.contains("early eof"), "{e:?}");
+        assert!(e.message.contains(NO_AGENT_HINT), "{e:?}");
+    }
+
+    #[test]
+    fn an_unproven_transport_is_config_and_says_what_it_looked_for() {
+        let tried = "no ssh-agent at PIPE and no Pageant";
+        let e = agent_listing_error(Some(tried), "early eof");
+        assert_eq!(e.kind, SshConnectErrorKind::Config);
+        // The sentence `open_agent` built while the pipe path was still in
+        // scope, kept verbatim - it is the only place the user is told WHERE
+        // this machine was looked at.
+        assert!(e.message.starts_with(tried), "{e:?}");
+        assert!(e.message.contains("early eof"), "{e:?}");
+        assert!(e.message.contains(NO_AGENT_HINT), "{e:?}");
+    }
+
+    #[test]
+    fn the_same_cause_gets_two_kinds() {
+        // The collapse guard, and the whole point of the function: identical
+        // listing error, opposite verdicts. A change that decided from the cause
+        // instead of the arm would leave both tests above passing for whichever
+        // kind it settled on.
+        assert_ne!(
+            agent_listing_error(None, "early eof").kind,
+            agent_listing_error(Some("t"), "early eof").kind,
+        );
+    }
+}
+
+/// The pre-dial credential guard. Its exact shape is load-bearing twice over -
+/// the target and every jump hop are judged by it here, and the frontend
+/// reproduces it before dialling so that "this host has nothing to authenticate
+/// with" is classified as a configuration error instead of entering the
+/// reconnect ladder. The frontend's copy is now a BELT rather than the only
+/// thing that knows: this guard reports its failure as `config`, so the pane
+/// would park on it even if the pre-flight check were deleted. What the copy
+/// still buys is that the answer never leaves this machine - no dial, no round
+/// trip - and that the same sentence is shown either way, which is why the two
+/// wordings are pinned to each other. A guard that quietly accepted one of the
+/// empty shapes would send the frontend and the backend down different paths
+/// for the same input.
+#[cfg(test)]
+mod credential_guard_tests {
+    use super::*;
+
+    #[test]
+    fn each_credential_alone_is_enough() {
+        assert!(has_credential(true, None, None), "ssh-agent alone");
+        assert!(has_credential(false, Some("pw"), None), "password alone");
+        assert!(
+            has_credential(false, None, Some("KEY")),
+            "private key alone"
+        );
+    }
+
+    #[test]
+    fn nothing_configured_is_refused() {
+        // Exactly the state this guard exists for: a saved host with no
+        // credential of any kind. Saving one is legal: a blank password field
+        // stores the host and lists it with a missing-secret warning
+        // (`passwordHelp` in src/modules/hosts/editor/SshCredentialSection.tsx),
+        // so refusing the dial is this guard's job, not the save path's.
+        assert!(!has_credential(false, None, None));
+    }
+
+    #[test]
+    fn an_empty_secret_still_counts_as_a_credential() {
+        // Deliberate: an empty password is something to SEND, and the server
+        // rejecting it is a different (and reconnect-relevant) outcome from
+        // there being nothing to send. The frontend's mirror tests presence the
+        // same way, so both sides agree on this input.
+        assert!(has_credential(false, Some(""), None));
+        assert!(has_credential(false, None, Some("")));
+    }
+
+    #[test]
+    fn the_target_message_is_the_one_the_frontend_mirrors() {
+        // src/modules/terminal/lib/ssh-session.ts's NO_CREDENTIALS_MESSAGE is
+        // this string. Reworded on one side only, the two callers of the same
+        // guard start telling the user different things about the same host.
+        assert_eq!(
+            NO_CREDENTIALS_ERROR,
+            "ssh: no credentials: set use_agent, password, or private_key"
+        );
+    }
+}
+
+/// `abort_forward` is the whole decision `ssh_forward_close` makes: which entry
+/// leaves the map, whether its accept loop is actually aborted, whether a
+/// generation the port has moved past is refused, and what a second Stop on the
+/// same port reports. Tested here over a bare map because an `SshSession`
+/// cannot be built without a live handshake - a test that needed one would have
+/// to be `#[ignore]`d like `forwards_a_local_port` below, and would give CI
+/// nothing. `mint_forward_generation` is here for the same reason and covers
+/// the other half of the pair, the minting `open_forward` does.
+#[cfg(test)]
+mod forward_abort_tests {
+    use super::*;
+
+    /// The generation a fixture's registered forward carries. Any value would
+    /// do - the decision is equality and nothing else - but a named one keeps
+    /// `abort_forward_frees_the_port` and
+    /// `abort_forward_refuses_a_superseded_generation` reading as one pair that
+    /// differs in exactly that argument and in nothing else.
+    const REGISTERED: u64 = 7;
+
+    /// Spawn an accept loop that OWNS the listener, the way `open_forward`'s
+    /// task does: the local port stays bound for exactly as long as the task
+    /// lives, so the port is a readable proxy for "is the forward still up".
+    async fn bound_accept_loop() -> (u16, JoinHandle<()>) {
+        // 0 = ephemeral, so a busy dev machine can't fail the test on a port
+        // collision that has nothing to do with forwarding.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind an ephemeral loopback port");
+        let port = listener.local_addr().expect("read the bound port").port();
+        let task = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    return;
+                }
+            }
+        });
+        (port, task)
+    }
+
+    /// Poll `bind` rather than testing it once: `abort()` only MARKS the task,
+    /// and the listener is not dropped until the runtime next polls it, so a
+    /// single immediate bind would flake. Same 20 x 50ms shape as the live
+    /// `forwards_a_local_port`.
+    async fn port_rebinds_within_a_second(port: u16) -> bool {
+        for _ in 0..20 {
+            if tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// The port is in the assertion and not just the return value because
+    /// removing the handle from the map without aborting the task ALSO returns
+    /// `true`: Stop would report success while the port stayed unusable for the
+    /// rest of the session and no reconnect could re-open the forward.
+    ///
+    /// Also the CONTROL for `abort_forward_refuses_a_superseded_generation`
+    /// below: same fixture, same call, and a generation that matches.
+    #[tokio::test]
+    async fn abort_forward_frees_the_port() {
+        let (port, task) = bound_accept_loop().await;
+        let forwards = Mutex::new(HashMap::from([(port, (REGISTERED, task))]));
+
+        assert!(
+            abort_forward(&forwards, port, REGISTERED).await,
+            "a registered forward closed at its own generation must report that there was one to abort"
+        );
+        assert!(
+            port_rebinds_within_a_second(port).await,
+            "port {port} is still bound a second after its forward was closed"
+        );
+        assert!(
+            forwards.lock().await.is_empty(),
+            "the closed forward must leave the map, or the next open would collide with a dead entry"
+        );
+    }
+
+    /// A stale close cannot name a listener it did not open.
+    ///
+    /// The case: a Stop is issued, its forward goes, the port is immediately
+    /// rebindable, a Start binds it again - and only then does the first close
+    /// reach the map. Keyed by port alone that close finds the NEW forward and
+    /// aborts it, which from the page reads as a Start that silently did
+    /// nothing. Here the map holds a LATER generation than the close names,
+    /// which is exactly that state.
+    ///
+    /// The port is asserted STILL BOUND rather than merely still in the map,
+    /// because a caller can only observe the defect as a port that stopped
+    /// listening; and the stored generation is asserted unchanged, because a
+    /// refusal that rewrote it would leave the real owner unable to close its
+    /// own forward.
+    ///
+    /// Its control is `abort_forward_frees_the_port` above, which differs in
+    /// the generation argument and nothing else: a mutation that broke the
+    /// abort itself reddens both, and one that dropped the generation
+    /// comparison reddens only this test.
+    #[tokio::test]
+    async fn abort_forward_refuses_a_superseded_generation() {
+        let (port, task) = bound_accept_loop().await;
+        let forwards = Mutex::new(HashMap::from([(port, (REGISTERED + 1, task))]));
+
+        assert!(
+            !abort_forward(&forwards, port, REGISTERED).await,
+            "a close naming a generation the port has moved past must report false"
+        );
+        assert!(
+            !port_rebinds_within_a_second(port).await,
+            "port {port} was freed by a close that named an older generation than the live forward"
+        );
+        let guard = forwards.lock().await;
+        let (stored, survivor) = guard
+            .get(&port)
+            .expect("a refused close must leave the live forward in the map");
+        assert_eq!(
+            *stored,
+            REGISTERED + 1,
+            "a refused close must not rewrite the live forward's generation"
+        );
+        assert!(
+            !survivor.is_finished(),
+            "a refused close must not abort the live forward's accept loop"
+        );
+    }
+
+    /// Stop is idempotent on purpose: the frontend can fire it for a forward a
+    /// reconnect already took away, or twice on a double-click, and neither is
+    /// an error - `false` is the state the caller asked for, already reached.
+    #[tokio::test]
+    async fn abort_forward_reports_an_unknown_port() {
+        let empty: Mutex<HashMap<u16, (u64, JoinHandle<()>)>> = Mutex::new(HashMap::new());
+        assert!(
+            !abort_forward(&empty, 4242, REGISTERED).await,
+            "an unknown port must report that there was nothing to abort"
+        );
+
+        let (port, task) = bound_accept_loop().await;
+        let forwards = Mutex::new(HashMap::from([(port, (REGISTERED, task))]));
+        assert!(
+            abort_forward(&forwards, port, REGISTERED).await,
+            "the first close of a live forward reports true"
+        );
+        assert!(
+            !abort_forward(&forwards, port, REGISTERED).await,
+            "the second close of the same port must report false, not repeat true"
+        );
+    }
+
+    /// The defect this pins is `close_forward` being written the way `close`
+    /// is - `close` drains every forward deliberately, and one Stop button
+    /// taking the whole session's other tunnels down with it would look
+    /// identical from the caller's side.
+    #[tokio::test]
+    async fn abort_forward_leaves_the_other_forwards_alone() {
+        let (closed_port, closed_task) = bound_accept_loop().await;
+        let (kept_port, kept_task) = bound_accept_loop().await;
+        // The two forwards carry DIFFERENT generations, the way two opens on one
+        // session do, so this test cannot pass by the closed port's generation
+        // happening to match the kept port's entry.
+        let forwards = Mutex::new(HashMap::from([
+            (closed_port, (REGISTERED, closed_task)),
+            (kept_port, (REGISTERED + 1, kept_task)),
+        ]));
+
+        assert!(abort_forward(&forwards, closed_port, REGISTERED).await);
+
+        let guard = forwards.lock().await;
+        let (_, survivor) = guard
+            .get(&kept_port)
+            .expect("the forward that was not closed must still be in the map");
+        assert!(
+            !survivor.is_finished(),
+            "closing one forward must not abort another forward's accept loop"
+        );
+    }
+
+    /// Two successive opens must not share a generation, or `abort_forward`'s
+    /// comparison compares two values that are always equal and refuses
+    /// nothing - which is the unfixed behaviour wearing the fix's shape.
+    ///
+    /// Over the counter rather than over `open_forward`, for the reason
+    /// `mint_forward_generation` exists as a function at all. No port appears
+    /// here, and that is the property: the generation is minted per OPEN and
+    /// never per port, so two opens differ even when they bind the same number.
+    #[test]
+    fn successive_opens_mint_different_generations() {
+        let seq = AtomicU64::new(1);
+        let first = mint_forward_generation(&seq);
+        let second = mint_forward_generation(&seq);
+        let third = mint_forward_generation(&seq);
+
+        assert_ne!(
+            first, second,
+            "two opens on one session must not be handed the same generation"
+        );
+        assert_ne!(second, third, "nor may the second and third");
+        // Monotonic, not merely distinct. Equality is the whole of what
+        // `abort_forward` asks, so distinctness is what the comparison needs -
+        // but a counter that could go backwards would eventually revisit a
+        // spent value, and "never reused" is what makes a refused close
+        // certainly stale rather than probably stale.
+        assert!(
+            first < second && second < third,
+            "generations must increase, or a spent one comes round again"
+        );
+    }
+}
+/// `socks_handshake`'s own behaviour, over `tokio::io::duplex` - no socket,
+/// no SSH, no `#[ignore]`. What `Handler::server_channel_open_forwarded_tcpip`
+/// and `serve_socks_connection` do with a successful/refused result is
+/// exercised by `remote_dynamic_forward_tests` instead, since that half needs
+/// a live SSH session.
+#[cfg(test)]
+mod socks_handshake_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn accepts_no_auth_and_parses_a_connect_to_a_domain() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let domain = b"example.com";
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+            req.extend_from_slice(domain);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            client.write_all(&req).await.unwrap();
+
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Ok(("example.com".to_string(), 443)));
+
+            let mut method_reply = [0u8; 2];
+            client.read_exact(&mut method_reply).await.unwrap();
+            assert_eq!(method_reply, [0x05, 0x00]);
+        });
+    }
+
+    #[test]
+    fn refuses_an_auth_method_other_than_no_auth() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            // Offers only username/password (0x02), never no-auth (0x00).
+            client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Err(0xFF));
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [0x05, 0xFF]);
+        });
+    }
+
+    #[test]
+    fn refuses_bind_and_udp_associate_commands() {
+        for cmd in [0x02u8, 0x03u8] {
+            rt().block_on(async move {
+                let (mut client, mut server) = tokio::io::duplex(256);
+                client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                client
+                    .write_all(&[0x05, cmd, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+                let result = socks_handshake(&mut server).await.unwrap();
+                assert_eq!(
+                    result,
+                    Err(0x07),
+                    "cmd {cmd:#04x} must be refused as unsupported"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn parses_ipv4_and_ipv6_atyp() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            client
+                .write_all(&[0x05, 0x01, 0x00, 0x01, 10, 0, 0, 9, 0x15, 0xB3])
+                .await
+                .unwrap();
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Ok(("10.0.0.9".to_string(), 5555)));
+        });
+
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut req = vec![0x05, 0x01, 0x00, 0x04];
+            req.extend_from_slice(&[0u8; 15]);
+            req.push(1); // ::1
+            req.extend_from_slice(&22u16.to_be_bytes());
+            client.write_all(&req).await.unwrap();
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Ok(("::1".to_string(), 22)));
+        });
+    }
+
+    #[test]
+    fn refuses_an_unsupported_address_type() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            // atyp 0x02 is unassigned by RFC 1928 - never IPv4/domain/IPv6.
+            client.write_all(&[0x05, 0x01, 0x00, 0x02]).await.unwrap();
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Err(0x08));
+        });
+    }
+
+    #[test]
+    fn refuses_a_request_whose_version_byte_is_not_five() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            // The greeting was SOCKS5; the request claims SOCKS4.
+            client
+                .write_all(&[0x04, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Err(0x01));
+        });
+    }
+
+    #[test]
+    fn refuses_a_zero_method_greeting() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            // NMETHODS 0: no method offered at all, not even no-auth.
+            client.write_all(&[0x05, 0x00]).await.unwrap();
+            let result = socks_handshake(&mut server).await.unwrap();
+            assert_eq!(result, Err(0xFF));
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [0x05, 0xFF]);
+        });
+    }
+
+    #[test]
+    fn eof_mid_request_is_an_err_not_a_panic() {
+        rt().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            // Only 2 of the fixed 4 request header bytes, then hang up.
+            client.write_all(&[0x05, 0x01]).await.unwrap();
+            drop(client);
+            let result = socks_handshake(&mut server).await;
+            assert!(
+                result.is_err(),
+                "a request cut short by EOF must return Err, not panic"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::modules::secrets::SecretSource;
+    use crate::modules::ssh::{HopSecrets, SshJumpHop};
+    use tauri::ipc::Channel as IpcChannel;
+
+    /// Shared fixture for the live tests below. Every input comes from env vars
+    /// - nothing about anyone's infra is hard-coded:
+    ///
+    ///   TERVIA_IT_KEY_PATH     PEM private key file (used for every hop)
+    ///   TERVIA_IT_TARGET_HOST  final host, TERVIA_IT_TARGET_USER, TERVIA_IT_TARGET_FP
+    ///   TERVIA_IT_JUMP_HOST    jump host (optional), TERVIA_IT_JUMP_USER, TERVIA_IT_JUMP_FP
+    ///
+    /// The `*_FP` SHA256 fingerprints pin each hop so the handshake never blocks
+    /// on the interactive host-key dialog (there is no GUI in a test). Missing
+    /// required vars => `None`, and the caller skips.
+    /// A unit test has no `AppHandle`, so `resolve_secrets` is unavailable: the
+    /// resolved half is built here from the same key text the input references.
+    fn it_input(tag: &str) -> Option<(SshOpenInput, SshSecrets)> {
+        let (Ok(key_path), Ok(target_host)) = (
+            std::env::var("TERVIA_IT_KEY_PATH"),
+            std::env::var("TERVIA_IT_TARGET_HOST"),
+        ) else {
+            eprintln!("[{tag}] skipped: set TERVIA_IT_KEY_PATH + TERVIA_IT_TARGET_HOST");
+            return None;
+        };
+        let key = std::fs::read_to_string(&key_path).expect("read key file");
+        let env_opt = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let key_secret = || HopSecrets {
+            private_key: Some(Zeroizing::new(key.clone())),
+            ..Default::default()
+        };
+
+        let mut jumps = Vec::new();
+        let mut jump_secrets = Vec::new();
+        if let Some(jump_host) = env_opt("TERVIA_IT_JUMP_HOST") {
+            jumps.push(SshJumpHop {
+                connection_id: "it-jump".into(),
+                host: jump_host,
+                port: 22,
+                user: env_opt("TERVIA_IT_JUMP_USER").unwrap_or_else(|| "ubuntu".into()),
+                use_agent: false,
+                password: None,
+                private_key: Some(SecretSource::Inline { value: key.clone() }),
+                private_key_passphrase: None,
+                expected_fingerprint: env_opt("TERVIA_IT_JUMP_FP"),
+                certificate: None,
+                agent_key_fingerprint: None,
+            });
+            jump_secrets.push(key_secret());
+        }
+
+        let input = SshOpenInput {
+            host: target_host,
+            port: 22,
+            user: env_opt("TERVIA_IT_TARGET_USER").unwrap_or_else(|| "ubuntu".into()),
+            use_agent: false,
+            password: None,
+            private_key: Some(SecretSource::Inline { value: key.clone() }),
+            private_key_passphrase: None,
+            expected_fingerprint: env_opt("TERVIA_IT_TARGET_FP"),
+            certificate: None,
+            agent_key_fingerprint: None,
+            jumps,
+        };
+        let secrets = SshSecrets {
+            target: key_secret(),
+            jumps: jump_secrets,
+        };
+        Some((input, secrets))
+    }
+
+    fn it_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A saved host whose keychain account holds nothing must be refused
+    /// BEFORE any socket is opened, with the sentence the user has always read.
+    ///
+    /// This is the guard's whole reason for moving: it used to read
+    /// `input.password`, which the frontend had already filled with a resolved
+    /// value or left absent. It now reads what `SecretSource::resolve` found,
+    /// so a reference to an empty or missing account has to refuse here - there
+    /// is no longer a frontend pre-flight behind it. Not `#[ignore]`d: the
+    /// refusal returns before the first `TcpStream::connect`, so this touches
+    /// no network.
+    #[test]
+    fn a_target_whose_reference_resolved_to_nothing_is_refused_before_dialling() {
+        let input = SshOpenInput {
+            host: "198.51.100.1".into(),
+            port: 22,
+            user: "ubuntu".into(),
+            use_agent: false,
+            password: Some(SecretSource::Keychain {
+                service: "tervia-hosts".into(),
+                account: "h-1::password".into(),
+            }),
+            private_key: None,
+            private_key_passphrase: None,
+            expected_fingerprint: None,
+            certificate: None,
+            agent_key_fingerprint: None,
+            jumps: Vec::new(),
+        };
+        let empty = SshSecrets {
+            target: HopSecrets::default(),
+            jumps: Vec::new(),
+        };
+        let Err(err) = it_runtime().block_on(connect(input, empty, IpcChannel::new(|_msg| Ok(()))))
+        else {
+            panic!("a reference to an empty account must not dial");
+        };
+        assert_eq!(err.to_string(), NO_CREDENTIALS_ERROR);
+    }
+
+    /// Live end-to-end check that the REAL `session::connect` reaches a target
+    /// through a ProxyJump chain. Network + a real key + real creds, so it is
+    /// `#[ignore]`d (run with `cargo test --release chain -- --ignored`).
+    #[test]
+    #[ignore]
+    fn connects_through_jump_chain() {
+        let Some((input, secrets)) = it_input("chain_tests") else {
+            return;
+        };
+        let target_host = input.host.clone();
+
+        it_runtime().block_on(async move {
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel)
+                .await
+                .expect("chain connect failed");
+            assert_eq!(session.host, target_host, "session bound to target host");
+            assert!(
+                session
+                    .handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|h| !h.is_closed()),
+                "session should be live after connecting through chain"
+            );
+            session.close().await;
+            eprintln!("[chain_tests] OK: connected to {target_host} through chain");
+        });
+    }
+
+    /// Poll `bind` for up to a second: `abort()` only marks the accept loop, so
+    /// the listener is not dropped until the runtime next polls it and a single
+    /// immediate bind would flake.
+    async fn port_rebinds_within_a_second(port: u16) -> bool {
+        for _ in 0..20 {
+            if tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Live end-to-end check for `ssh -L`: forward a local port to the remote's
+    /// OWN sshd (the one service we know is listening over there), then read the
+    /// version banner back through the tunnel. `SSH-` on the wire proves the
+    /// listener bound, the `direct-tcpip` channel opened, and bytes copy in both
+    /// directions. Then closes that ONE forward while the session stays up -
+    /// the Stop button's path - before checking the session teardown still frees
+    /// a port of its own.
+    ///
+    /// NOT CI COVERAGE. This is `#[ignore]`d and needs a live VPS plus the env
+    /// fixture above, so none of it runs on a pull request. `close_forward`'s CI
+    /// coverage is `forward_abort_tests` over `abort_forward`; what this test
+    /// adds is that the same decision holds against a real listener with a real
+    /// `direct-tcpip` channel on it. Same env fixture as the chain test above;
+    /// run with `cargo test --release forward -- --ignored`.
+    #[test]
+    #[ignore]
+    fn forwards_a_local_port() {
+        use tokio::io::AsyncReadExt;
+
+        let Some((input, secrets)) = it_input("forward_tests") else {
+            return;
+        };
+        let remote_port = input.port;
+
+        it_runtime().block_on(async move {
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel)
+                .await
+                .expect("connect failed");
+            // 0 = ephemeral, so a busy dev machine can't fail the test on a
+            // port collision that has nothing to do with forwarding.
+            let (local, generation) = session
+                .open_forward(0, "127.0.0.1".into(), remote_port)
+                .await
+                .expect("open_forward failed");
+            assert_ne!(local, 0, "an ephemeral bind must report its real port");
+
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", local))
+                .await
+                .expect("connect to forwarded port failed");
+            let mut banner = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut banner))
+                .await
+                .expect("no bytes came back through the tunnel")
+                .expect("read through tunnel failed");
+            assert_eq!(&banner, b"SSH-", "expected the remote sshd banner");
+
+            // Stop this one forward with the session still up. Everything after
+            // this point would also hold if `close_forward` had closed the
+            // session, so the re-open below is what separates the two.
+            assert!(
+                session.close_forward(local, generation).await,
+                "closing a live forward must report there was one to close"
+            );
+            assert!(
+                port_rebinds_within_a_second(local).await,
+                "close_forward left port {local} bound"
+            );
+            assert!(
+                !session.close_forward(local, generation).await,
+                "a second close of port {local} must report false, not repeat true"
+            );
+
+            // The session survived, so it can still open forwards - and the
+            // teardown check below now has a listener of its own to free
+            // instead of passing on a port close_forward already released.
+            let (second, second_generation) = session
+                .open_forward(0, "127.0.0.1".into(), remote_port)
+                .await
+                .expect("re-open after close_forward failed - it closed the session");
+            assert_ne!(
+                generation, second_generation,
+                "a second open must mint its own generation, or the first one's \
+                 close could name this listener"
+            );
+
+            session.close().await;
+            // close() must free the port, or every reconnect would fail to bind.
+            assert!(
+                port_rebinds_within_a_second(second).await,
+                "forward listener still holds port {second} after close"
+            );
+            eprintln!("[forward_tests] OK: localhost:{local} tunneled to the remote sshd, closed on its own, and localhost:{second} freed by teardown");
+        });
+    }
+
+    /// Talks to the REAL ssh-agent on this machine, which is the only way to
+    /// check the transport at all: the named pipe (Windows) and the socket
+    /// (everywhere else) are picked per platform and neither can be faked from a
+    /// unit test. Prints what it found, or the message a user would get, so a
+    /// missing agent reads as an unhelpful string here before it does in the
+    /// dialog. `#[ignore]`d because a machine with no agent is not a failure.
+    /// Run with `cargo test agent_lists_its_keys -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn agent_lists_its_keys() {
+        it_runtime().block_on(async {
+            match agent_keys().await {
+                Ok((_agent, keys)) => {
+                    eprintln!("[agent_tests] agent holds {} key(s)", keys.len());
+                    for k in &keys {
+                        eprintln!(
+                            "  {} {} {}",
+                            k.algorithm(),
+                            k.fingerprint(HashAlg::Sha256),
+                            k.comment()
+                        );
+                    }
+                }
+                // The no-agent path is the one users hit first, so read the
+                // message and make sure it says what to start.
+                Err(e) => eprintln!("[agent_tests] {e}"),
+            }
+        });
+    }
+
+    /// A private directory under the system temp dir, removed on drop -
+    /// same shape as `TempDir` in `src-tauri/src/modules/fs/atomic.rs`, a
+    /// separate copy because that one is private to its own test module.
+    #[cfg(unix)]
+    struct ScratchDir(std::path::PathBuf);
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("tervia-keygen-e2e-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// sshd itself refuses a host key file it can read as anything wider than
+    /// owner-only, and `StrictModes no` in the config below only relaxes its
+    /// check on the home directory / `authorized_keys`, not this one.
+    #[cfg(unix)]
+    fn owner_only(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)
+            .expect("stat scratch file")
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms).expect("chmod scratch file");
+    }
+
+    /// sshd cannot switch to a different account without running as root, so
+    /// the only user an unprivileged instance can authenticate is whichever
+    /// one started it - this machine's own login, not a name chosen by the
+    /// test.
+    #[cfg(unix)]
+    fn current_username() -> String {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| {
+                let out = std::process::Command::new("id")
+                    .arg("-un")
+                    .output()
+                    .expect("`id -un` failed");
+                String::from_utf8(out.stdout)
+                    .expect("`id -un` printed non-utf8")
+                    .trim()
+                    .into()
+            })
+    }
+
+    /// Kills and reaps a spawned child on drop - sshd in the existing test
+    /// below, and sshd/`ssh-agent` in the two new ones, so a panicking
+    /// assertion never leaves a background process running past the test.
+    #[cfg(unix)]
+    struct ChildGuard(std::process::Child);
+    #[cfg(unix)]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Live end-to-end proof that a GENERATED key is not merely a PEM
+    /// `ssh_key_inspect_inner` can parse back (`mod.rs`'s own unit tests cover
+    /// that): it is a private key a real sshd accepts. `ssh_key_generate`
+    /// mints an ed25519 key pair, its public line is installed in a
+    /// throwaway, unprivileged `/usr/sbin/sshd`'s `authorized_keys`, and
+    /// `connect` above - the same function `ssh_open` calls, which is what
+    /// runs `authenticate_hop` - authenticates with the PEM this command
+    /// returned. A second `ssh_key_generate` call mints the throwaway
+    /// server's OWN host key, so the connect's `expected_fingerprint` can
+    /// pin it and the handshake never needs the interactive host-key dialog
+    /// this test has no frontend to answer.
+    ///
+    /// `#[ignore]`d: CI does not carry `/usr/sbin/sshd`, and an unprivileged
+    /// sshd can only authenticate the account that started it, so this also
+    /// will not run as a different user than whoever invokes it. Skips
+    /// itself (rather than panicking) when the binary is missing, for a
+    /// manual `cargo test -- --ignored` run on a machine that lacks it too.
+    /// Run with:
+    ///   cargo test --manifest-path src-tauri/Cargo.toml generated_key_authenticates_against_a_real_sshd -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn generated_key_authenticates_against_a_real_sshd() {
+        let sshd_path = std::path::Path::new("/usr/sbin/sshd");
+        if !sshd_path.exists() {
+            eprintln!("[keygen_e2e] skipped: {} not found", sshd_path.display());
+            return;
+        }
+
+        let scratch = ScratchDir::new("sshd");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port to find a free one")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let user = current_username();
+
+        it_runtime().block_on(async move {
+            let host_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("host key generation failed");
+            let client_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("client key generation failed");
+
+            let host_key_path = scratch.path("host_key");
+            std::fs::write(&host_key_path, host_key.pem.as_bytes()).expect("write host key");
+            owner_only(&host_key_path);
+
+            let authorized_keys_path = scratch.path("authorized_keys");
+            std::fs::write(
+                &authorized_keys_path,
+                format!(
+                    "{}\n",
+                    client_key.info.public_key.clone().expect("public key recorded")
+                ),
+            )
+            .expect("write authorized_keys");
+            owner_only(&authorized_keys_path);
+
+            let config_path = scratch.path("sshd_config");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "Port {port}\n\
+                     ListenAddress 127.0.0.1\n\
+                     HostKey {}\n\
+                     AuthorizedKeysFile {}\n\
+                     PidFile {}\n\
+                     UsePAM no\n\
+                     StrictModes no\n\
+                     PasswordAuthentication no\n\
+                     PubkeyAuthentication yes\n\
+                     KbdInteractiveAuthentication no\n\
+                     PermitRootLogin yes\n\
+                     LogLevel ERROR\n",
+                    host_key_path.display(),
+                    authorized_keys_path.display(),
+                    scratch.path("sshd.pid").display(),
+                ),
+            )
+            .expect("write sshd_config");
+
+            let child = std::process::Command::new(sshd_path)
+                .arg("-D")
+                .arg("-e")
+                .arg("-f")
+                .arg(&config_path)
+                .spawn()
+                .expect("spawn sshd - is /usr/sbin/sshd runnable by this user?");
+            let _guard = ChildGuard(child);
+
+            // Poll for the listener - sshd's own startup (host key parse,
+            // socket bind) is not instant, the same reason
+            // `port_rebinds_within_a_second` above polls rather than sleeps
+            // a fixed amount.
+            let mut listening = false;
+            for _ in 0..50 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    listening = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(listening, "sshd never started listening on 127.0.0.1:{port}");
+
+            let input = SshOpenInput {
+                host: "127.0.0.1".into(),
+                port,
+                user,
+                use_agent: false,
+                password: None,
+                private_key: Some(SecretSource::Inline {
+                    value: client_key.pem.to_string(),
+                }),
+                private_key_passphrase: None,
+                // Pinned to the throwaway server's own key, so the handshake
+                // never blocks on the first-connect dialog this test has no
+                // frontend to answer.
+                expected_fingerprint: host_key.info.fingerprint.clone(),
+                certificate: None,
+                agent_key_fingerprint: None,
+                jumps: Vec::new(),
+            };
+            let secrets = SshSecrets {
+                target: HopSecrets {
+                    private_key: Some(client_key.pem.clone()),
+                    ..Default::default()
+                },
+                jumps: Vec::new(),
+            };
+
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel)
+                .await
+                .expect("connect with the generated key failed");
+            assert_eq!(session.host, "127.0.0.1");
+            assert!(
+                session
+                    .handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|h| !h.is_closed()),
+                "session should be live after authenticating with a generated key"
+            );
+            session.close().await;
+            eprintln!(
+                "[keygen_e2e] OK: a generated ed25519 key authenticated against a local sshd on 127.0.0.1:{port}"
+            );
+        });
+    }
+
+    /// Live end-to-end proof that a certificate vault entry authenticates
+    /// through `authenticate_openssh_cert` against a server that trusts ONLY
+    /// a CA - `TrustedUserCAKeys`, with an EMPTY `authorized_keys` - and that
+    /// the signing key ALONE, with no certificate, is refused by that same
+    /// server. `ssh_key_generate` mints the CA and the user key; the
+    /// certificate is built and signed with `certificate::Builder`,
+    /// mirroring `create_test_cert`, russh's own dev-only test helper for
+    /// signing a certificate, substituting this crate's own
+    /// `UnwrapErr(SysRng)` for the nonce RNG in place of the `rand` crate
+    /// that helper uses (not a `src-tauri` dependency).
+    ///
+    /// `#[ignore]`d for the reason the keygen test above is: no
+    /// `/usr/sbin/sshd` in CI. Run with:
+    ///   cargo test --manifest-path src-tauri/Cargo.toml cert_authenticates_against_a_real_sshd_trusting_only_the_ca -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn cert_authenticates_against_a_real_sshd_trusting_only_the_ca() {
+        use getrandom::SysRng;
+        use russh::keys::ssh_key::certificate::{Builder, CertType};
+        use russh::keys::ssh_key::rand_core::UnwrapErr;
+
+        let sshd_path = std::path::Path::new("/usr/sbin/sshd");
+        if !sshd_path.exists() {
+            eprintln!("[cert_e2e] skipped: {} not found", sshd_path.display());
+            return;
+        }
+
+        let scratch = ScratchDir::new("cert");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port to find a free one")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let user = current_username();
+
+        it_runtime().block_on(async move {
+            let host_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("host key generation failed");
+            let ca_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("ca key generation failed");
+            let user_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("user key generation failed");
+
+            let ca = russh::keys::decode_secret_key(&ca_key.pem, None).expect("decode ca key");
+            let subject =
+                russh::keys::decode_secret_key(&user_key.pem, None).expect("decode user key");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let mut rng = UnwrapErr(SysRng);
+            let mut builder =
+                Builder::new_with_random_nonce(&mut rng, subject.public_key(), now - 3600, now + 3600)
+                    .expect("builder construction");
+            builder.key_id("tervia-cert-e2e").expect("key id");
+            builder.cert_type(CertType::User).expect("cert type");
+            builder.valid_principal(&user).expect("principal");
+            let cert = builder.sign(&ca).expect("sign certificate");
+            let cert_text = cert.to_openssh().expect("serialize certificate");
+
+            let host_key_path = scratch.path("host_key");
+            std::fs::write(&host_key_path, host_key.pem.as_bytes()).expect("write host key");
+            owner_only(&host_key_path);
+
+            let ca_pub_path = scratch.path("ca.pub");
+            std::fs::write(
+                &ca_pub_path,
+                format!(
+                    "{}\n",
+                    ca_key.info.public_key.clone().expect("ca public key recorded")
+                ),
+            )
+            .expect("write CA public key");
+
+            // Empty on purpose: the whole point of this test is that the
+            // signing key is trusted ONLY through `TrustedUserCAKeys`, never
+            // through an `authorized_keys` entry of its own.
+            let authorized_keys_path = scratch.path("authorized_keys");
+            std::fs::write(&authorized_keys_path, "").expect("write empty authorized_keys");
+            owner_only(&authorized_keys_path);
+
+            let config_path = scratch.path("sshd_config");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "Port {port}\n\
+                     ListenAddress 127.0.0.1\n\
+                     HostKey {}\n\
+                     AuthorizedKeysFile {}\n\
+                     TrustedUserCAKeys {}\n\
+                     PidFile {}\n\
+                     UsePAM no\n\
+                     StrictModes no\n\
+                     PasswordAuthentication no\n\
+                     PubkeyAuthentication yes\n\
+                     KbdInteractiveAuthentication no\n\
+                     PermitRootLogin yes\n\
+                     LogLevel ERROR\n",
+                    host_key_path.display(),
+                    authorized_keys_path.display(),
+                    ca_pub_path.display(),
+                    scratch.path("sshd.pid").display(),
+                ),
+            )
+            .expect("write sshd_config");
+
+            let child = std::process::Command::new(sshd_path)
+                .arg("-D")
+                .arg("-e")
+                .arg("-f")
+                .arg(&config_path)
+                .spawn()
+                .expect("spawn sshd - is /usr/sbin/sshd runnable by this user?");
+            let _guard = ChildGuard(child);
+
+            let mut listening = false;
+            for _ in 0..50 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    listening = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(listening, "sshd never started listening on 127.0.0.1:{port}");
+
+            let session = connect(
+                SshOpenInput {
+                    host: "127.0.0.1".into(),
+                    port,
+                    user: user.clone(),
+                    use_agent: false,
+                    password: None,
+                    private_key: Some(SecretSource::Inline {
+                        value: user_key.pem.to_string(),
+                    }),
+                    private_key_passphrase: None,
+                    expected_fingerprint: host_key.info.fingerprint.clone(),
+                    certificate: Some(cert_text),
+                    agent_key_fingerprint: None,
+                    jumps: Vec::new(),
+                },
+                SshSecrets {
+                    target: HopSecrets {
+                        private_key: Some(user_key.pem.clone()),
+                        ..Default::default()
+                    },
+                    jumps: Vec::new(),
+                },
+                IpcChannel::new(|_msg| Ok(())),
+            )
+            .await
+            .expect("certificate auth against the CA-trusting server failed");
+            assert_eq!(session.host, "127.0.0.1");
+            assert!(
+                session
+                    .handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|h| !h.is_closed()),
+                "session should be live after certificate auth"
+            );
+            session.close().await;
+
+            // The signing key ALONE, no certificate: the server trusts the
+            // CA, not this key directly, and `authorized_keys` is empty.
+            let bare_result = connect(
+                SshOpenInput {
+                    host: "127.0.0.1".into(),
+                    port,
+                    user,
+                    use_agent: false,
+                    password: None,
+                    private_key: Some(SecretSource::Inline {
+                        value: user_key.pem.to_string(),
+                    }),
+                    private_key_passphrase: None,
+                    expected_fingerprint: host_key.info.fingerprint.clone(),
+                    certificate: None,
+                    agent_key_fingerprint: None,
+                    jumps: Vec::new(),
+                },
+                SshSecrets {
+                    target: HopSecrets {
+                        private_key: Some(user_key.pem.clone()),
+                        ..Default::default()
+                    },
+                    jumps: Vec::new(),
+                },
+                IpcChannel::new(|_msg| Ok(())),
+            )
+            .await;
+            assert!(
+                bare_result.is_err(),
+                "the bare signing key with no certificate must not authenticate against a CA-only server"
+            );
+
+            eprintln!(
+                "[cert_e2e] OK: certificate auth succeeded and bare-key auth was refused on 127.0.0.1:{port}"
+            );
+        });
+    }
+
+    /// Live end-to-end proof that a `hardware`-kind vault entry authenticates
+    /// through `authenticate_agent` restricted to ONE ssh-agent identity, and
+    /// that naming a DIFFERENT identity - held nowhere the agent can reach -
+    /// is refused locally rather than falling back to whichever key the
+    /// agent happens to offer. The server trusts BOTH keys, so the negative
+    /// case proves the AGENT restriction, not the server's own refusal.
+    ///
+    /// No physical FIDO2 token exists in this environment, so this loads an
+    /// ordinary generated key into a throwaway `ssh-agent` rather than a real
+    /// `sk-ssh-ed25519@openssh.com` identity - the path this proves (agent
+    /// auth restricted to one fingerprint) is identical either way, since
+    /// Tervia never sees the private material behind a fingerprint regardless
+    /// of what holds it. `KNOWN-LIMITS.md` records what that leaves
+    /// unexercised: a physical touch prompt, a CTAP-specific error.
+    ///
+    /// `#[ignore]`d like the other e2e tests here, and this one ALSO mutates
+    /// process-global `SSH_AUTH_SOCK` (restored on drop) - run alone. Run with:
+    ///   cargo test --manifest-path src-tauri/Cargo.toml hardware_kind_authenticates_only_through_the_matching_agent_identity -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn hardware_kind_authenticates_only_through_the_matching_agent_identity() {
+        let sshd_path = std::path::Path::new("/usr/sbin/sshd");
+        if !sshd_path.exists() {
+            eprintln!("[hardware_e2e] skipped: {} not found", sshd_path.display());
+            return;
+        }
+
+        let scratch = ScratchDir::new("hwagent");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port to find a free one")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let user = current_username();
+        let agent_socket = scratch.path("agent.sock");
+
+        it_runtime().block_on(async move {
+            let host_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("host key generation failed");
+            let held_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("held key generation failed");
+            let absent_key = crate::modules::ssh::ssh_key_generate("ed25519".into(), None, None)
+                .await
+                .expect("absent key generation failed");
+
+            let host_key_path = scratch.path("host_key");
+            std::fs::write(&host_key_path, host_key.pem.as_bytes()).expect("write host key");
+            owner_only(&host_key_path);
+
+            // The server trusts BOTH keys - the restriction being proven is
+            // the AGENT's, not the server's.
+            let authorized_keys_path = scratch.path("authorized_keys");
+            std::fs::write(
+                &authorized_keys_path,
+                format!(
+                    "{}\n{}\n",
+                    held_key.info.public_key.clone().expect("held key public half"),
+                    absent_key.info.public_key.clone().expect("absent key public half"),
+                ),
+            )
+            .expect("write authorized_keys");
+            owner_only(&authorized_keys_path);
+
+            let config_path = scratch.path("sshd_config");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "Port {port}\n\
+                     ListenAddress 127.0.0.1\n\
+                     HostKey {}\n\
+                     AuthorizedKeysFile {}\n\
+                     PidFile {}\n\
+                     UsePAM no\n\
+                     StrictModes no\n\
+                     PasswordAuthentication no\n\
+                     PubkeyAuthentication yes\n\
+                     KbdInteractiveAuthentication no\n\
+                     PermitRootLogin yes\n\
+                     LogLevel ERROR\n",
+                    host_key_path.display(),
+                    authorized_keys_path.display(),
+                    scratch.path("sshd.pid").display(),
+                ),
+            )
+            .expect("write sshd_config");
+
+            let sshd_child = std::process::Command::new(sshd_path)
+                .arg("-D")
+                .arg("-e")
+                .arg("-f")
+                .arg(&config_path)
+                .spawn()
+                .expect("spawn sshd - is /usr/sbin/sshd runnable by this user?");
+            let _sshd_guard = ChildGuard(sshd_child);
+
+            let mut listening = false;
+            for _ in 0..50 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    listening = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(listening, "sshd never started listening on 127.0.0.1:{port}");
+
+            let agent_child = std::process::Command::new("ssh-agent")
+                .arg("-a")
+                .arg(&agent_socket)
+                .arg("-D")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ssh-agent - is `ssh-agent` on PATH?");
+            let _agent_guard = ChildGuard(agent_child);
+            for _ in 0..50 {
+                if agent_socket.canonicalize().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                agent_socket.canonicalize().is_ok(),
+                "ssh-agent never created its socket at {}",
+                agent_socket.display()
+            );
+
+            let held_key_path = scratch.path("held_key");
+            std::fs::write(&held_key_path, held_key.pem.as_bytes()).expect("write held key");
+            owner_only(&held_key_path);
+            let add_status = std::process::Command::new("ssh-add")
+                .arg(&held_key_path)
+                .env("SSH_AUTH_SOCK", &agent_socket)
+                .status()
+                .expect("run ssh-add - is `ssh-add` on PATH?");
+            assert!(add_status.success(), "ssh-add failed to load the held key");
+
+            // Restores whatever this process's `SSH_AUTH_SOCK` was before this
+            // test, on drop - including a panic unwind, not only the happy
+            // path. Global process state, so this test documents its own
+            // "run alone" requirement above rather than leaving it implicit.
+            struct AuthSockGuard(Option<std::ffi::OsString>);
+            impl Drop for AuthSockGuard {
+                fn drop(&mut self) {
+                    match &self.0 {
+                        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
+                        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
+                    }
+                }
+            }
+            let _sock_guard = AuthSockGuard(std::env::var_os("SSH_AUTH_SOCK"));
+            // SAFETY (rather, soundness caveat `set_var` itself now enforces
+            // as `unsafe`): this test is `#[ignore]`d and documented to run
+            // with `--test-threads=1`, so no other thread reads the process
+            // environment concurrently with this write.
+            unsafe { std::env::set_var("SSH_AUTH_SOCK", &agent_socket) };
+
+            let held_fingerprint = held_key.info.fingerprint.clone().expect("held fingerprint");
+            let absent_fingerprint =
+                absent_key.info.fingerprint.clone().expect("absent fingerprint");
+
+            let session = connect(
+                SshOpenInput {
+                    host: "127.0.0.1".into(),
+                    port,
+                    user: user.clone(),
+                    use_agent: true,
+                    password: None,
+                    private_key: None,
+                    private_key_passphrase: None,
+                    expected_fingerprint: host_key.info.fingerprint.clone(),
+                    certificate: None,
+                    agent_key_fingerprint: Some(held_fingerprint),
+                    jumps: Vec::new(),
+                },
+                SshSecrets {
+                    target: HopSecrets::default(),
+                    jumps: Vec::new(),
+                },
+                IpcChannel::new(|_msg| Ok(())),
+            )
+            .await
+            .expect("agent auth restricted to the held identity failed");
+            assert_eq!(session.host, "127.0.0.1");
+            assert!(
+                session
+                    .handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|h| !h.is_closed()),
+                "session should be live after agent auth"
+            );
+            session.close().await;
+
+            let Err(err) = connect(
+                SshOpenInput {
+                    host: "127.0.0.1".into(),
+                    port,
+                    user,
+                    use_agent: true,
+                    password: None,
+                    private_key: None,
+                    private_key_passphrase: None,
+                    expected_fingerprint: host_key.info.fingerprint.clone(),
+                    certificate: None,
+                    agent_key_fingerprint: Some(absent_fingerprint.clone()),
+                    jumps: Vec::new(),
+                },
+                SshSecrets {
+                    target: HopSecrets::default(),
+                    jumps: Vec::new(),
+                },
+                IpcChannel::new(|_msg| Ok(())),
+            )
+            .await
+            else {
+                panic!("naming an identity the agent does not hold must be refused");
+            };
+            assert_eq!(
+                err.kind,
+                SshConnectErrorKind::Config,
+                "a fingerprint the agent does not hold is a config fact, not the server's answer: {err}"
+            );
+            assert!(
+                err.message.contains(&absent_fingerprint),
+                "the refusal should name the fingerprint it could not find: {}",
+                err.message
+            );
+
+            eprintln!(
+                "[hardware_e2e] OK: agent auth succeeded for the held identity and was refused \
+                 before dialling for the absent one"
+            );
+        });
+    }
+}
+
+/// Live end-to-end checks for `-R`, `-D`, shells sharing one session, and SFTP delete,
+/// against a throwaway `/usr/sbin/sshd` this process spawns itself - unlike
+/// `chain_tests`' own live checks above, which need a real VPS and env vars.
+/// Every test here is
+/// `#[ignore = "needs /usr/sbin/sshd"]`, not a bare `#[ignore]`, so `cargo
+/// test` output says why without a reader having to open this file. Run:
+/// `cargo test remote_dynamic_forward_tests -- --ignored --nocapture`.
+#[cfg(test)]
+mod remote_dynamic_forward_tests {
+    use super::*;
+    use crate::modules::secrets::SecretSource;
+    use crate::modules::ssh::HopSecrets;
+    use std::process::{Child, Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An unprivileged `sshd`, its own temp `HostKey`/`AuthorizedKeysFile`/
+    /// config, on a free localhost port. `sshd` run this way can only
+    /// authenticate AS the account that started it - a non-root process
+    /// cannot `setuid` to anyone else - so the connect below logs in as
+    /// whoever is running this test.
+    struct TestSshd {
+        child: Child,
+        dir: std::path::PathBuf,
+        port: u16,
+        user: String,
+        client_key_path: std::path::PathBuf,
+        /// SHA256 fingerprint of `host_key`'s public half, computed the same
+        /// way `HostKeyVerifier::check_server_key` computes the live one, so
+        /// `connect_input` can pin `expected_fingerprint` and the handshake
+        /// never parks on a `HostKeyPrompt` nothing in this test answers.
+        host_fingerprint: String,
+    }
+
+    impl TestSshd {
+        fn start() -> Option<Self> {
+            if !std::path::Path::new("/usr/sbin/sshd").exists() {
+                eprintln!("skipped: no /usr/sbin/sshd on this machine");
+                return None;
+            }
+            let user = String::from_utf8(Command::new("id").arg("-un").output().ok()?.stdout)
+                .ok()?
+                .trim()
+                .to_string();
+
+            // Bind-then-drop: `sshd` binds the real listener a moment later.
+            // Rare and harmless to lose the race against another process on a
+            // busy machine - the test just fails to connect and is rerun.
+            let port = {
+                let l = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+                l.local_addr().ok()?.port()
+            };
+
+            let dir = std::env::temp_dir().join(format!("tervia-test-sshd-{port}"));
+            std::fs::create_dir_all(&dir).ok()?;
+
+            let host_key = dir.join("host_ed25519");
+            let client_key = dir.join("client_ed25519");
+            for key in [&host_key, &client_key] {
+                let ok = Command::new("ssh-keygen")
+                    .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                    .arg(key)
+                    .status()
+                    .ok()?
+                    .success();
+                if !ok {
+                    return None;
+                }
+            }
+            let host_fingerprint = PublicKey::from_openssh(
+                &std::fs::read_to_string(host_key.with_extension("pub")).ok()?,
+            )
+            .ok()?
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+            let authorized_keys = dir.join("authorized_keys");
+            std::fs::copy(client_key.with_extension("pub"), &authorized_keys).ok()?;
+
+            let config = dir.join("sshd_config");
+            std::fs::write(
+                &config,
+                format!(
+                    "Port {port}\n\
+                     ListenAddress 127.0.0.1\n\
+                     HostKey {}\n\
+                     AuthorizedKeysFile {}\n\
+                     PubkeyAuthentication yes\n\
+                     PasswordAuthentication no\n\
+                     KbdInteractiveAuthentication no\n\
+                     UsePAM no\n\
+                     StrictModes no\n\
+                     AllowTcpForwarding yes\n\
+                     GatewayPorts no\n\
+                     Subsystem sftp internal-sftp\n",
+                    host_key.display(),
+                    authorized_keys.display(),
+                ),
+            )
+            .ok()?;
+
+            let child = Command::new("/usr/sbin/sshd")
+                .args(["-D", "-e", "-f"])
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .ok()?;
+
+            let sshd = Self {
+                child,
+                dir,
+                port,
+                user,
+                client_key_path: client_key,
+                host_fingerprint,
+            };
+            if sshd.wait_ready() {
+                Some(sshd)
+            } else {
+                None
+            }
+        }
+
+        /// Poll the port until `sshd` is accepting connections, or give up.
+        fn wait_ready(&self) -> bool {
+            for _ in 0..50 {
+                if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        }
+    }
+
+    impl Drop for TestSshd {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn it_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn connect_input(sshd: &TestSshd) -> (SshOpenInput, SshSecrets) {
+        let key = std::fs::read_to_string(&sshd.client_key_path).expect("read client key");
+        let target = HopSecrets {
+            private_key: Some(Zeroizing::new(key.clone())),
+            ..Default::default()
+        };
+        let input = SshOpenInput {
+            host: "127.0.0.1".into(),
+            port: sshd.port,
+            user: sshd.user.clone(),
+            use_agent: false,
+            password: None,
+            private_key: Some(SecretSource::Inline { value: key }),
+            private_key_passphrase: None,
+            expected_fingerprint: Some(sshd.host_fingerprint.clone()),
+            certificate: None,
+            agent_key_fingerprint: None,
+            jumps: Vec::new(),
+        };
+        (
+            input,
+            SshSecrets {
+                target,
+                jumps: Vec::new(),
+            },
+        )
+    }
+
+    /// A local TCP listener that echoes back the first thing it reads, once -
+    /// the destination both tests dial THROUGH the SSH session, proving bytes
+    /// actually crossed it in both directions.
+    async fn spawn_echo_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+            }
+        });
+        port
+    }
+
+    /// `-R`: a connection to the SERVER's own new listener reaches a local
+    /// echo server, proving `tcpip_forward` bound it and
+    /// `server_channel_open_forwarded_tcpip` routed the accepted channel to
+    /// `open_remote_forward`'s target.
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    fn remote_forward_reaches_a_local_echo_server() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+
+        it_runtime().block_on(async move {
+            let echo_port = spawn_echo_server().await;
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel).await.expect("connect failed");
+
+            let (bound, generation) = session
+                .open_remote_forward("localhost".into(), 0, "127.0.0.1".into(), echo_port)
+                .await
+                .expect("open_remote_forward failed");
+            assert_ne!(bound, 0, "an ephemeral server bind must report its real port");
+
+            // Dial the SERVER's listener, the way a client on the far side of
+            // a real bastion would.
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", bound))
+                .await
+                .expect("connect to the server's -R listener failed");
+            sock.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut buf))
+                .await
+                .expect("no echo came back through the remote forward")
+                .expect("read failed");
+            assert_eq!(&buf, b"ping");
+
+            assert!(
+                session
+                    .close_remote_forward("localhost".into(), bound, generation)
+                    .await
+                    .expect("close_remote_forward failed"),
+                "closing a live -R forward must report there was one to close"
+            );
+            session.close().await;
+            eprintln!(
+                "[remote_dynamic_forward_tests] OK: -R 127.0.0.1:{bound} reached the local echo server"
+            );
+        });
+    }
+
+    /// `-D`: a SOCKS5 CONNECT through the local listener reaches a local echo
+    /// server, proving the handshake, the reply and the
+    /// `channel_open_direct_tcpip` pipe all work end to end.
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    fn socks_connect_reaches_a_local_echo_server() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+
+        it_runtime().block_on(async move {
+            let echo_port = spawn_echo_server().await;
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel).await.expect("connect failed");
+
+            let (socks_port, _generation) = session.open_socks(0).await.expect("open_socks failed");
+
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("connect to SOCKS listener failed");
+            sock.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut method_reply = [0u8; 2];
+            sock.read_exact(&mut method_reply).await.unwrap();
+            assert_eq!(method_reply, [0x05, 0x00], "expected the no-auth method selected");
+
+            let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+            req.extend_from_slice(&echo_port.to_be_bytes());
+            sock.write_all(&req).await.unwrap();
+            let mut connect_reply = [0u8; 10];
+            sock.read_exact(&mut connect_reply).await.unwrap();
+            assert_eq!(&connect_reply[..2], &[0x05, 0x00], "expected CONNECT to succeed");
+
+            sock.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut buf))
+                .await
+                .expect("no echo came back through the SOCKS tunnel")
+                .expect("read failed");
+            assert_eq!(&buf, b"ping");
+
+            session.close().await;
+            eprintln!(
+                "[remote_dynamic_forward_tests] OK: -D 127.0.0.1:{socks_port} reached the local echo server via SOCKS5 CONNECT"
+            );
+        });
+    }
+
+    /// An event sink that forwards every `Data` chunk, decoded, to `tx`, and
+    /// any other event as `<type>` - a marker no shell output here contains.
+    fn recording(tx: std::sync::mpsc::Sender<String>) -> IpcChannel<SshEvent> {
+        IpcChannel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(s) = body {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+                if v["type"] == "data" {
+                    if let Some(bytes) = v["data"].as_str().and_then(|d| B64.decode(d).ok()) {
+                        let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
+                    }
+                } else if let Some(kind) = v["type"].as_str() {
+                    let _ = tx.send(format!("<{kind}>"));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Whether `needle` shows up in `rx`'s accumulated output within 10 s.
+    fn saw(rx: &std::sync::mpsc::Receiver<String>, needle: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let Ok(chunk) = rx.recv_timeout(left) else {
+                return false;
+            };
+            seen.push_str(&chunk);
+            if seen.contains(needle) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Two shells on ONE session: each carries its own bytes, closing one
+    /// leaves the session and the other up, and closing the session fires the
+    /// end signal `ssh_open`'s janitor waits on.
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    fn two_shells_share_one_session_and_close_independently() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+
+        it_runtime().block_on(async move {
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel)
+                .await
+                .expect("connect failed");
+            let ended = session.take_ended_signal().expect("end signal taken once");
+
+            let (a_tx, a_rx) = std::sync::mpsc::channel();
+            let (b_tx, b_rx) = std::sync::mpsc::channel();
+            let a = session
+                .open_shell(80, 24, recording(a_tx))
+                .await
+                .expect("open shell a");
+            let b = session
+                .open_shell(80, 24, recording(b_tx))
+                .await
+                .expect("open shell b");
+            assert_ne!(a, b, "each shell gets its own id");
+
+            // `$((6*7))` so the typed command's own echo cannot match.
+            session
+                .shell(a)
+                .unwrap()
+                .write(b"echo tervia-$((6*7))-a\r")
+                .await
+                .expect("write to shell a");
+            assert!(saw(&a_rx, "tervia-42-a"), "shell a ran its command");
+
+            assert!(session.close_shell(a).await, "a live shell reports a close");
+            assert!(
+                session.shell(a).is_none(),
+                "a closed shell leaves its session"
+            );
+            assert!(
+                !session.handle.lock().await.as_ref().unwrap().is_closed(),
+                "closing one shell leaves the session up"
+            );
+
+            session
+                .shell(b)
+                .unwrap()
+                .write(b"echo tervia-$((6*7))-b\r")
+                .await
+                .expect("write to shell b");
+            assert!(
+                saw(&b_rx, "tervia-42-b"),
+                "shell b still works after a closed"
+            );
+
+            session.clone().close().await;
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), ended)
+                    .await
+                    .is_ok(),
+                "closing the session fires its end signal"
+            );
+            eprintln!("[remote_dynamic_forward_tests] OK: two shells shared one session");
+        });
+    }
+
+    /// The connection ending on the REMOTE side - its sshd process killed
+    /// from inside the shell - fires the same end signal, with no close from
+    /// this side, and the shell reports its own ending as `disconnected`.
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    fn a_remote_hangup_fires_the_end_signal() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+
+        it_runtime().block_on(async move {
+            let channel = IpcChannel::new(|_msg| Ok(()));
+            let session = connect(input, secrets, channel)
+                .await
+                .expect("connect failed");
+            let ended = session.take_ended_signal().expect("end signal taken once");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let shell = session
+                .open_shell(80, 24, recording(tx))
+                .await
+                .expect("open shell");
+
+            session
+                .shell(shell)
+                .unwrap()
+                .write(b"kill -9 $PPID\r")
+                .await
+                .expect("write to the shell");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), ended)
+                    .await
+                    .is_ok(),
+                "a remote hangup fires the end signal"
+            );
+            assert!(saw(&rx, "<disconnected>"), "the shell reports a disconnect");
+            // The pump drops its entry just AFTER sending that ending.
+            let gone = (0..50).any(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                session.shell(shell).is_none()
+            });
+            assert!(gone, "the ended shell left its session");
+            eprintln!("[remote_dynamic_forward_tests] OK: a remote hangup fired the end signal");
+        });
+    }
+
+    /// SFTP delete of a symlink-to-directory and of a non-empty folder. The sshd
+    /// is local, so the "remote" tree is built and checked with `std::fs`. The
+    /// link must go as a link, the folder must go with everything in it, and the
+    /// directory both links point at must survive.
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn sftp_delete_removes_contents_without_following_symlinks() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+        let outside = sshd.dir.join("outside");
+        let top_link = sshd.dir.join("top-link");
+        let root = sshd.dir.join("del");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, &top_link).unwrap();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("top"), b"x").unwrap();
+        std::fs::write(root.join("sub/deeper/f"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub/link")).unwrap();
+
+        let (link_arg, root_arg) = (
+            top_link.to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
+        );
+        it_runtime().block_on(async move {
+            let session = connect(input, secrets, IpcChannel::new(|_msg| Ok(())))
+                .await
+                .expect("connect failed");
+            let sftp = session.ensure_sftp().await.expect("open sftp");
+            crate::modules::ssh::sftp::ssh_sftp_delete_inner(&sftp, link_arg)
+                .await
+                .expect("delete symlink failed");
+            crate::modules::ssh::sftp::ssh_sftp_delete_inner(&sftp, root_arg)
+                .await
+                .expect("delete non-empty folder failed");
+            session.close().await;
+        });
+
+        assert!(
+            std::fs::symlink_metadata(&top_link).is_err(),
+            "top-level symlink must be removed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&root).is_err(),
+            "non-empty folder must be removed"
+        );
+        assert!(
+            outside.join("keep").exists(),
+            "symlink target must be left alone"
+        );
+        eprintln!(
+            "[remote_dynamic_forward_tests] OK: sftp delete removed a link and a non-empty tree, target intact"
+        );
+    }
+
+    /// SFTP download of a binary file (byte-identical, progress emitted) and of
+    /// a folder (refused), then a move onto a taken name (refused, both files
+    /// intact) and a plain move (lands).
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn sftp_download_and_move() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+        let payload: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
+        let blob = sshd.dir.join("blob.bin");
+        let sub = sshd.dir.join("sub");
+        let loose = sshd.dir.join("loose.txt");
+        std::fs::write(&blob, &payload).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("blob.bin"), b"taken").unwrap();
+        std::fs::write(&loose, b"move me").unwrap();
+        // Sibling folders whose names differ only by case: a different file on
+        // this case-sensitive server, so the move must still be refused.
+        std::fs::create_dir_all(sshd.dir.join("Data")).unwrap();
+        std::fs::create_dir_all(sshd.dir.join("data")).unwrap();
+        std::fs::write(sshd.dir.join("Data/r.txt"), b"upper").unwrap();
+        std::fs::write(sshd.dir.join("data/r.txt"), b"lower").unwrap();
+
+        let arg = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let (blob_arg, sub_arg, loose_arg) = (arg(&blob), arg(&sub), arg(&loose));
+        let (taken_arg, moved_arg) = (arg(&sub.join("blob.bin")), arg(&sub.join("loose.txt")));
+        let (upper_arg, lower_arg) = (
+            arg(&sshd.dir.join("Data/r.txt")),
+            arg(&sshd.dir.join("data/r.txt")),
+        );
+        let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = events.clone();
+        let expected = payload.clone();
+        it_runtime().block_on(async move {
+            let session = connect(input, secrets, IpcChannel::new(|_msg| Ok(())))
+                .await
+                .expect("connect failed");
+            let sftp = session.ensure_sftp().await.expect("open sftp");
+            let progress =
+                IpcChannel::<crate::modules::ssh::sftp::TransferProgress>::new(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+            let got = crate::modules::ssh::sftp::ssh_sftp_download_inner(
+                &sftp,
+                blob_arg.clone(),
+                &progress,
+            )
+            .await
+            .expect("download failed");
+            assert!(
+                got == expected,
+                "downloaded bytes must match the remote file"
+            );
+            let err = crate::modules::ssh::sftp::ssh_sftp_download_inner(&sftp, sub_arg, &progress)
+                .await
+                .expect_err("a folder download must be refused");
+            assert!(err.contains("folder"), "{err}");
+            // A character device stats at 0 bytes and never ends.
+            let err = crate::modules::ssh::sftp::ssh_sftp_download_inner(
+                &sftp,
+                "/dev/zero".into(),
+                &progress,
+            )
+            .await
+            .expect_err("a device download must be refused");
+            assert!(err.contains("special file"), "{err}");
+            let err = crate::modules::ssh::sftp::ssh_sftp_rename_inner(&sftp, blob_arg, taken_arg)
+                .await
+                .expect_err("a move onto a taken name must be refused");
+            assert!(err.contains("already exists"), "{err}");
+            let err = crate::modules::ssh::sftp::ssh_sftp_rename_inner(&sftp, upper_arg, lower_arg)
+                .await
+                .expect_err("a move onto a case-differing sibling's taken name must be refused");
+            assert!(err.contains("already exists"), "{err}");
+            crate::modules::ssh::sftp::ssh_sftp_rename_inner(&sftp, loose_arg, moved_arg)
+                .await
+                .expect("plain move failed");
+            session.close().await;
+        });
+
+        assert!(
+            events.load(Ordering::SeqCst) >= 2,
+            "download must report progress"
+        );
+        assert_eq!(std::fs::read(&blob).unwrap(), payload, "source intact");
+        assert_eq!(
+            std::fs::read(sub.join("blob.bin")).unwrap(),
+            b"taken",
+            "target intact"
+        );
+        assert!(!loose.exists(), "moved file must leave its old path");
+        assert_eq!(std::fs::read(sub.join("loose.txt")).unwrap(), b"move me");
+        assert_eq!(
+            std::fs::read(sshd.dir.join("data/r.txt")).unwrap(),
+            b"lower"
+        );
+        eprintln!(
+            "[remote_dynamic_forward_tests] OK: sftp download byte-identical, folder refused, taken move refused, move landed"
+        );
+    }
+
+    /// SFTP upload of a binary file (byte-identical, progress emitted), then a
+    /// second upload onto that name without overwrite (refused, file intact)
+    /// and with overwrite (replaced).
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn sftp_upload_refuses_a_taken_name_unless_overwriting() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+        let payload: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
+        let target = sshd.dir.join("up.bin");
+        let target_arg = target.to_string_lossy().into_owned();
+        let check_path = target.clone();
+        let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = events.clone();
+        let bytes = payload.clone();
+        it_runtime().block_on(async move {
+            let session = connect(input, secrets, IpcChannel::new(|_msg| Ok(())))
+                .await
+                .expect("connect failed");
+            let sftp = session.ensure_sftp().await.expect("open sftp");
+            let progress =
+                IpcChannel::<crate::modules::ssh::sftp::TransferProgress>::new(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+            crate::modules::ssh::sftp::ssh_sftp_upload_inner(
+                &sftp,
+                &bytes,
+                target_arg.clone(),
+                false,
+                &progress,
+            )
+            .await
+            .expect("upload failed");
+            let err = crate::modules::ssh::sftp::ssh_sftp_upload_inner(
+                &sftp,
+                b"clobber",
+                target_arg.clone(),
+                false,
+                &progress,
+            )
+            .await
+            .expect_err("an upload onto a taken name must be refused");
+            assert!(err.contains("already exists"), "{err}");
+            assert!(
+                std::fs::read(&check_path).unwrap() == bytes,
+                "refused upload must leave the remote file intact"
+            );
+            crate::modules::ssh::sftp::ssh_sftp_upload_inner(
+                &sftp,
+                b"replaced",
+                target_arg,
+                true,
+                &progress,
+            )
+            .await
+            .expect("overwriting upload failed");
+            session.close().await;
+        });
+
+        assert!(
+            events.load(Ordering::SeqCst) >= 2,
+            "upload must report progress"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"replaced");
+        eprintln!(
+            "[remote_dynamic_forward_tests] OK: sftp upload byte-identical, taken name refused, overwrite replaced"
+        );
+    }
+}

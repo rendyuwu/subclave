@@ -1,0 +1,352 @@
+# Workspace root. The companion console-subsystem launcher `tervia.exe`
+# lives in a separate workspace member (`tervia-cli/`) so Tauri 2's deb /
+# dmg bundlers only see the GUI binary when they enumerate `[[bin]]`
+# entries from THIS manifest. Trying to gate the stub via `[[bin]]
+# required-features` here did NOT work - the bundlers ignored the gate
+# and still expected `target/release/tervia` to exist, then failed because
+# cargo had legitimately skipped the build. Splitting the package
+# removes the entry from the bundler's view entirely.
+#
+# `default-members = ["."]` keeps `cargo build` in this directory
+# scoped to the GUI package; the release workflow builds the stub
+# explicitly via `cargo build --release -p tervia-cli` on Windows only.
+[workspace]
+members = ["tervia-cli"]
+default-members = ["."]
+
+[package]
+name = "tervia"
+version = "0.1.3"
+description = "Tervia - a lightweight desktop client for remote machines: SSH, port forwarding, SFTP and RDP."
+authors = ["rendyuwu"]
+license = "Apache-2.0"
+repository = "https://github.com/rendyuwu/tervia"
+homepage = "https://github.com/rendyuwu/tervia"
+readme = "../README.md"
+edition = "2021"
+# Tauri-action invokes `cargo build` without `--bin` and asks Cargo which
+# binary to bundle. With the implicit bin (from package.name = "tervia" +
+# src/main.rs) plus the explicit `[[bin]] TerviaApp` pointing to the same
+# source, Cargo can refuse with "failed to find main binary". Pinning
+# default-run resolves it deterministically.
+default-run = "TerviaApp"
+# Disable auto-discovery so the implicit `tervia` bin (from package.name +
+# src/main.rs) does not collide with the explicit `[[bin]] TerviaApp` that
+# also points to src/main.rs. The companion launcher lives in a separate
+# workspace member, never in `src/bin/` of this package.
+autobins = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tervia_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Main GUI binary. `windows_subsystem = "windows"` (set in main.rs) detaches
+# stdio on Windows so the binary cannot synchronously print to the parent
+# shell - see the `tervia` console stub below. Renamed from the default
+# package-name `tervia.exe` so PATHEXT on Windows finds the console stub first
+# (the two cannot share a name on a case-insensitive filesystem).
+[[bin]]
+name = "TerviaApp"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Global allocator. The default Windows system heap retains freed commit on
+# bursty, fragmented workloads, so a heavy-output PTY burst (base64 chunks
+# streamed host->webview) inflates the process commit to multiple GB and it
+# never recedes. mimalloc decommits freed segments back to the OS on its purge
+# timer, turning that high-watermark back into transient peaks. See the
+# `#[global_allocator]` in lib.rs.
+mimalloc = "0.1"
+# Already in the tree as mimalloc's own dependency; taken directly for
+# `mi_collect`, which is what actually hands freed commit back to the OS. See
+# `purge_allocator` in lib.rs.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+# Host-process clipboard. Reads come through here because
+# `navigator.clipboard.readText()` cannot work on Linux, and so do the RDP
+# clipboard's writes, because a written X11 selection has to stay owned by a
+# live handle - see `modules/clipboard.rs` for both. Ordinary app writes still
+# use the webview API.
+#
+# `image-data` is on because `Get::image` / `Set::image` are the only way to
+# reach host image data through arboard and both are gated on it, and the
+# CLIPRDR bridge carries images. It is not the stack an earlier version of this
+# comment claimed: arboard sets `image`'s features per target with
+# `default-features = false` - `["png"]` on Linux, `["png", "bmp"]` on Windows,
+# `["tiff"]` on macOS - so there is no MIME sniffing anywhere and no TIFF off
+# macOS. Measured here with `cargo tree --edges normal` rather than guessed:
+# five crates compile on Linux (`image`, `png`, `byteorder-lite`, `moxcms`,
+# `pxfm`), of which `png` was already in the lockfile. `Cargo.lock` grows by
+# twelve, because it records the macOS and Windows feature sets too (`tiff`,
+# `weezl`, `zune-jpeg` and friends); none of those is built on Linux.
+# `Get::file_list` / `Set::file_list` are NOT gated on it, so enabling it
+# forecloses nothing for file transfer later.
+#
+# `wayland-data-control` is not a default and is kept for wlroots and COSMIC,
+# where it is the only clipboard path. It does not mean a Wayland session has no
+# clipboard without it: arboard's Wayland backend is `wl-clipboard-rs`, which
+# needs `zwlr_data_control_manager_v1`, and mutter implements neither that nor
+# `ext-data-control-v1` (wl-clipboard-rs#39). arboard tries Wayland when
+# `WAYLAND_DISPLAY` is set, warns on failure and falls back to X11 - which is
+# why reads have always worked on GNOME Wayland.
+#
+# Picked over tauri-plugin-clipboard-manager, which is the same arboard call
+# behind an ACL for five commands we do not use.
+arboard = { version = "3", default-features = false, features = [
+	"image-data",
+	"wayland-data-control",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Secrets held in memory live in `Zeroizing` containers so a dropped store map,
+# a decrypted buffer or a resolved password is scrubbed rather than merely
+# freed - see `modules/secrets.rs`. Already in the tree transitively; the
+# `serde` feature is what gives `Zeroizing<T>` the `Serialize`/`Deserialize`
+# impls the store map and the `secrets_get` return both need.
+zeroize = { version = "1", features = ["serde"] }
+portable-pty = "0.9"
+dirs = "5"
+base64 = "0.22"
+log = "0.4"
+ignore = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+globset = "0.4"
+# Direct `regex` for `fs_grep_replace`: file-level `replace_all` instead of
+# the line-by-line `grep_regex` matcher used for read-only search.
+regex = "1"
+shared_child = "1"
+tauri-plugin-log = "2"
+tauri-plugin-os = "2"
+tauri-plugin-process = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+url = "2"
+# Default features pull in aws-lc-rs which needs NASM at build time on
+# Windows. Use ring instead - pure-Rust + assembly, no toolchain hassle.
+#
+# Pinned exactly, and the pin is load-bearing - see the IronRDP block below for
+# the full story. Short version: russh 0.60.1 states its RustCrypto
+# requirements as prerelease-floored carets (`ecdsa ^0.17.0-rc.16`), which is
+# the only shape that can co-resolve with the exact `=` pins picky carries.
+# 0.60.3 turned every one of those carets into an `=` pin and 0.61+ moved to
+# plain `^0.17`; both conflict with picky, so neither can share a tree with the
+# RDP dependency set.
+russh = { version = "=0.60.1", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2.1"
+# `buffer_unordered` for the pipelined recursive SFTP delete
+# (`src-tauri/src/modules/ssh/sftp.rs`). Already compiled with default features
+# via reqwest/hyper-util; this adds no crate.
+futures-util = "0.3"
+# OS CSPRNG for `ssh_key_generate` (`src-tauri/src/modules/ssh/mod.rs`): rand_core
+# 0.10 ships no `OsRng`, so `UnwrapErr(SysRng)` is the `CryptoRng` `PrivateKey::random`
+# takes. Already compiled with `sys_rng` via russh's `rand` 0.10; this adds no crate.
+getrandom = { version = "0.4", features = ["sys_rng"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+# PBKDF2 + AES-256-GCM + CSPRNG for the passphrase-encrypted SSH connection
+# backup (`modules/backup.rs`). Already in the tree as russh's crypto backend
+# (`features = ["ring"]`), so this only promotes a transitive dependency to a
+# direct one - no new code is compiled and no new supply-chain surface is
+# added. Taken over the RustCrypto stack (aes-gcm + pbkdf2 + hmac, also
+# transitively present) because one audited crate covers the KDF, the AEAD and
+# the random source, so there is a single place to get the nonce handling
+# right. The webview cannot do this itself: `crypto.subtle` is secure-context
+# only and the app origin is plain http.
+ring = "0.17"
+# Stable session ids for the sidecar PTY daemon. v4 (random) is plenty - we
+# only need uniqueness across the daemon's lifetime, not global ordering.
+uuid = { version = "1", features = ["v4", "serde"] }
+# Cross-platform local IPC for the sidecar PTY daemon. Wraps Unix domain
+# sockets and Windows named pipes behind one API so the daemon protocol does
+# not need parallel transport implementations.
+interprocess = { version = "2.2", features = ["tokio"] }
+# RDP. The API-boundary crates rather than the `ironrdp-client` convenience
+# crate: `RdpClient::run()` owns the whole connect sequence, which leaves
+# nowhere to hook certificate TOFU, and it emits whole frames instead of dirty
+# rectangles.
+#
+# Every version here is an exact pin, and NOT because newer is untested. The
+# latest set (connector 0.10 / session 0.11 / graphics 0.9 / input 0.7 /
+# tokio 0.10) cannot coexist with russh at all:
+#
+#   ironrdp-connector 0.10.0 requires `picky =7.0.0-rc.25`
+#   picky 7.0.0-rc.25    requires `ecdsa =0.17.0-rc.22`, `pkcs8` via a chain
+#                                 that resolves pkcs5 to 0.8.0 final
+#   russh 0.60.x         calls `pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc`,
+#                                 renamed to `generate_*` in pkcs5 0.8.0 -> does
+#                                 not compile
+#   russh 0.61/0.62      use the new pkcs5 name but require `ecdsa ^0.17`, which
+#                                 excludes prereleases -> hard resolver conflict
+#                                 with picky's `=0.17.0-rc.22`
+#
+# connector 0.9.0 pins `picky =7.0.0-rc.23` instead, whose RustCrypto pins
+# (`ecdsa =0.17.0-rc.17`, `pkcs8 =0.11.0-rc.11`) sit inside russh 0.60.1's
+# caret floors and leave pkcs5 at 0.8.0-rc.13, so russh still compiles. That is
+# the whole reason for staying one minor behind. session 0.10.0 / graphics
+# 0.8.1 / input 0.6.0 / tokio 0.9.0 are simply the versions that pair with
+# connector 0.9 on ironrdp-pdu 0.8 + ironrdp-core 0.2.
+#
+# The escape route is upstream, not local: picky 7.0.0-rc.26 already relaxes
+# those pins to `ed25519-dalek ^3` / `p256 ^0.14`. When an ironrdp-connector
+# release pins rc.26 or later, this whole block and the russh pin can move
+# forward together.
+#
+# That unblocks the PINS. It does not unblock EGFX/H.264, which needs a second
+# thing from the same crate: a way to advertise the graphics-pipeline
+# early-capability flag, without which a server never opens the graphics
+# channel at all. No published release has one - not 0.9.0, and not the 0.10.0
+# this block already declines for other reasons. The field exists only on
+# IronRDP's main branch, behind a breaking change, so it lands in a connector
+# minor that does not exist yet (IronRDP #1237). A release satisfying only the
+# picky half would move these pins and leave EGFX exactly as unreachable as it
+# is now. `KNOWN-LIMITS.md` carries that as an accepted state.
+ironrdp-connector = "=0.9.0"
+ironrdp-session = "=0.10.0"
+ironrdp-tokio = "=0.9.0"
+# `rustls-ring` and not `rustls`: the latter aliases `rustls-aws-lc-rs`, which
+# needs NASM at build time on Windows. Same reason russh is pinned to ring.
+ironrdp-tls = { version = "0.2", default-features = false, features = [
+	"rustls-ring",
+] }
+ironrdp-graphics = "=0.8.1"
+ironrdp-input = "=0.6.0"
+# Already in the tree as transitive dependencies of the four crates above, at
+# exactly these versions - promoted to direct entries because nothing
+# re-exports them and the RDP module names their types. `ironrdp-pdu` for
+# `Action` (the discriminant `Framed::read_pdu` hands back), `InclusiveRectangle`
+# and the `Rectangle` trait that gives it `width()`/`height()`; `ironrdp-core`
+# for `WriteBuf`, which appears in every `Sequence::step` signature;
+# `ironrdp-dvc` for `DrdynvcClient`, the dynamic-channel multiplexer registered
+# as a static channel on the connector; `ironrdp-displaycontrol` for
+# `DisplayControlClient`, which carries the MS-RDPEDISP monitor-layout PDU that
+# makes `rdp_resize` work, and `MonitorLayoutEntry::adjust_display_size`, the
+# upstream clamp for that PDU's size constraints. The `=` pins are the versions
+# connector 0.9 / session 0.10 resolve to; a different version would make the
+# rectangle and channel-processor types distinct and stop compiling.
+ironrdp-pdu = "=0.8.0"
+ironrdp-core = { version = "=0.2.1", features = ["alloc"] }
+ironrdp-dvc = "=0.7.0"
+ironrdp-displaycontrol = "=0.7.0"
+# CLIPRDR, the RDP clipboard static channel (`modules/rdp/cliprdr.rs`).
+#
+# `ironrdp-cliprdr` is pinned at 0.6.0 and NOT 0.7.0: 0.7.0 requires
+# `ironrdp-pdu ^0.9` and `ironrdp-svc ^0.8`, while this tree is on
+# `ironrdp-pdu` 0.8.0 / `ironrdp-svc` 0.7.0 and those pins are load-bearing for
+# the picky/russh resolver reason the block above gives. 0.6.0 requires
+# `ironrdp-core ^0.2`, `ironrdp-pdu ^0.8`, `ironrdp-svc ^0.7`, `bitflags ^2.11`
+# and `tracing ^0.1`, every one of which is already resolved here, so it moves
+# no pin and adds one crate. It is the first edition-2024 crate in the tree
+# (`rust-version = "1.89"`); CI's stable toolchain covers it.
+#
+# `ironrdp-cliprdr-format` needs only `ironrdp-core ^0.2` and `png ^0.18`, both
+# already in the lockfile, and supplies `bitmap::dib_to_png`, `dibv5_to_png`,
+# `png_to_cf_dib` and `png_to_cf_dibv5` - so no DIB parser is hand-written here.
+# It asks `ironrdp-core` for `std`, which is `["alloc", "ironrdp-error/std"]`, a
+# superset of the `alloc` the entry above declares; leave that entry alone.
+ironrdp-cliprdr = "=0.6.0"
+ironrdp-cliprdr-format = "=0.2.0"
+# A direct dependency because arboard's image API is raw RGBA (`ImageData`:
+# four channels, row-major RGBA8) while all four `ironrdp-cliprdr-format`
+# conversions speak PNG, and something has to bridge them. Already pulled in by
+# arboard's `image-data` feature on all three targets, so this is a promotion
+# rather than a new crate; taken over `png` directly because it makes each
+# conversion one call instead of a hand-rolled encoder and decoder.
+# `ironrdp-cliprdr-native` is not usable for this: every dependency it has is
+# `cfg(windows)`.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# TCP keepalive with a usable idle time on the RDP socket. Already in the tree
+# via tokio/hyper at exactly this version, so this is a promotion, not a new
+# crate. Needed because tokio only exposes `TcpSocket::set_keepalive(bool)`,
+# which turns SO_KEEPALIVE on at the OS default idle - two hours on Linux - and
+# an RDP session that has silently lost its network needs to notice in seconds,
+# not after lunch. `TCP_KEEPIDLE`/`TCP_KEEPINTVL` need socket2. See
+# `KEEPALIVE_IDLE` in `modules/rdp/session.rs`; the SSH module solves the same
+# problem with russh's own `keepalive_interval`.
+socket2 = "0.6"
+# Leaf-certificate parsing for the RDP certificate TOFU check: the SHA-256
+# fingerprint's subject/issuer labels, and the `x509_cert::Certificate` that
+# `ironrdp_tls::extract_tls_server_public_key` takes (CredSSP binds to the
+# server's SubjectPublicKey, not to the whole certificate). Already in the tree
+# with the same feature set as `ironrdp-tls`'s own dependency, so this adds no
+# new compilation.
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+# Direct entries so the custom `ServerCertVerifier` doing certificate TOFU can
+# be injected into the `TlsConnector`. `ironrdp-tls` hardcodes
+# `NoCertificateVerification` with no callback seam, so owning the connector is
+# the only way to validate the server certificate during the handshake rather
+# than after it. Default features off on both: rustls defaults to the
+# aws-lc-rs provider.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+	"ring",
+	"logging",
+	"tls12",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+	"ring",
+	"logging",
+	"std",
+	"tls12",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = [
+	"apple-native",
+] }
+# Enumeration for `secrets_list`. The `keyring` crate has no listing API, and
+# this is the crate its own apple-native backend is built on - version 3 is
+# already in `Cargo.lock` through that dependency, so this adds an edge and no
+# new crate. `default-features = false` because the TLS features the default
+# set carries are nothing to do with reading keychain attributes.
+security-framework = { version = "3", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = [
+	"windows-native",
+] }
+windows-sys = { version = "0.59", features = [
+	"Win32_Foundation",
+	"Win32_Security",
+	"Win32_Security_Cryptography",
+	"Win32_Storage_FileSystem",
+	"Win32_System_Console",
+	"Win32_System_Diagnostics_ToolHelp",
+	"Win32_System_JobObjects",
+	"Win32_System_Threading",
+	"Win32_Graphics_Dwm",
+	"Win32_Graphics_Gdi",
+	"Win32_UI_WindowsAndMessaging",
+] }
+# WebView2 settings interop: `disable_browser_accelerator_keys` reaches for
+# `ICoreWebView2Settings3` so the app shell owns Ctrl+W / Ctrl+N / Ctrl+R rather
+# than the embedded browser. Versions match the copies wry already pulls in, so
+# no duplicate crates are added.
+webview2-com = "0.38"
+windows = { version = "0.61", features = [
+	"Win32_Foundation",
+	"Win32_System_Memory",
+] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-autostart = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"

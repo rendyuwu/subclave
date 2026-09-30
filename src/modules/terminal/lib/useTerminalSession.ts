@@ -1,0 +1,481 @@
+import { usePreferencesStore } from "@/modules/settings/preferences";
+import { resolveTerminalPreset } from "@/modules/settings/terminalPalette";
+import { buildTerminalTheme } from "@/styles/terminalTheme";
+import { buildContentFontFamily } from "@/lib/fonts";
+import { paneCaret } from "@/lib/paneCaret";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import type { SearchAddon } from "@xterm/addon-search";
+import { type TerviaOpenInput, type TerviaSpawnTabInput } from "./osc-handlers";
+import type { SshStatus } from "@/modules/ssh/status";
+import { cursorLineLooksLikeShellPrompt } from "./aiCliDetector";
+import type { AiCliKind, AiCliStatus } from "./aiCliStatus";
+import { isSessionBusy, sessions, type Callbacks, type Session } from "./sessionState";
+import { STUCK_RECOVERY_MS, effectiveTerminalFontSize, describeError } from "./session-helpers";
+import { refitSession, respawnSession, retryPty, writePtyError } from "./pty-lifecycle";
+import { disconnectSsh, reconnectSsh, retrySsh } from "./ssh-session";
+import { loadWebglRenderer, disposeWebglRenderer, syncRendererForWallpaper } from "./webgl";
+import { ensureSession, attachSession, detachSession } from "./session-lifecycle";
+
+export type { TerviaOpenInput, TerviaSpawnTabInput };
+export { disconnectSsh, reconnectSsh, respawnSession };
+export {
+  writeToLeaf,
+  findLeafIdFromPoint,
+  disposeSession,
+  acknowledgeAiCli,
+} from "./session-lifecycle";
+
+/**
+ * A font-size or font-family change invalidates the WebGL glyph atlas (glyphs
+ * are cached keyed by font metrics). Dispose + recreate the renderer, then
+ * refit since the new glyph metrics change the cell size.
+ */
+function reloadWebglAndRefit(s: Session): void {
+  if (s.webglAddon && s.term.element) {
+    disposeWebglRenderer(s);
+    if (s.webglEnabled) loadWebglRenderer(s);
+  }
+  refitSession(s);
+}
+
+type Options = {
+  leafId: number;
+  container: React.RefObject<HTMLDivElement | null>;
+  visible: boolean;
+  focused?: boolean;
+  initialCwd?: string;
+  /** When set, opens an SSH session instead of a local PTY. */
+  hostId?: string;
+  /**
+   * Daemon UUID from a previously saved workspace. When set the session
+   * tries `pty_attach` first and falls back to a fresh `pty_open` on
+   * failure (daemon was killed or the PC rebooted). Consumed on first
+   * spawn so a subsequent retry does not reuse the same UUID.
+   */
+  savedPtyId?: string;
+  /**
+   * AI CLI kind that was running when this workspace was last saved. On a
+   * restore/reattach it pre-activates the detector so a still-running agent's
+   * status badge resumes immediately. Consumed once at session creation.
+   */
+  savedActiveTool?: AiCliKind;
+  /**
+   * Per-leaf terminal theme override id (a `TERMINAL_PRESETS` id). When set,
+   * this pane paints its own palette instead of the global terminal theme.
+   * Undefined follows the global theme.
+   */
+  terminalThemeId?: string;
+  onSearchReady?: (addon: SearchAddon) => void;
+  onExit?: (code: number) => void;
+  onCwd?: (cwd: string) => void;
+  onDetectedLocalUrl?: (url: string) => void;
+  onTerviaOpen?: (input: TerviaOpenInput) => void;
+  onTerviaSpawnTab?: (input: TerviaSpawnTabInput) => void;
+  /** Fires on SSH connection state change. */
+  onSshStatus?: (status: SshStatus) => void;
+  /** Fires when an AI CLI starts, changes state, or exits. */
+  onAiCliStatus?: (status: AiCliStatus) => void;
+  /**
+   * Fires once whenever the session acquires a daemon-side UUID
+   * (`pty_open` / `pty_attach` returning a non-empty `sessionId`).
+   * Stamp it onto the leaf so the workspace serializer persists it.
+   */
+  onPtyId?: (ptyId: string) => void;
+};
+
+export function useTerminalSession({
+  leafId,
+  container,
+  visible,
+  focused = true,
+  initialCwd,
+  hostId,
+  savedPtyId,
+  savedActiveTool,
+  terminalThemeId,
+  onSearchReady,
+  onExit,
+  onCwd,
+  onDetectedLocalUrl,
+  onTerviaOpen,
+  onTerviaSpawnTab,
+  onSshStatus,
+  onAiCliStatus,
+  onPtyId,
+}: Options) {
+  const cbRef = useRef({
+    onSearchReady,
+    onExit,
+    onCwd,
+    onDetectedLocalUrl,
+    onTerviaOpen,
+    onTerviaSpawnTab,
+    onSshStatus,
+    onAiCliStatus,
+    onPtyId,
+  });
+  cbRef.current = {
+    onSearchReady,
+    onExit,
+    onCwd,
+    onDetectedLocalUrl,
+    onTerviaOpen,
+    onTerviaSpawnTab,
+    onSshStatus,
+    onAiCliStatus,
+    onPtyId,
+  };
+
+  /**
+   * `visible` / `focused` as of the LATEST render.
+   *
+   * The attach effect's dep array is `[leafId]`, so everything it closes over is
+   * frozen at mount - and `tryAttach` can land seconds later: it waits up to
+   * `MAX_ATTACH_FRAMES` for the container ref (the react-resizable-panels measure
+   * pass during workspace restore) and then polls. Taking focus on the mount-time
+   * answer pulls the caret out of whatever the user switched to in the meantime.
+   *
+   * This is also what `paneCaret` reads to decide, one frame after a claim,
+   * whether the claim is still warranted - so the same ref covers the slow
+   * attach and the fast tab switch with one answer instead of two.
+   */
+  const liveFocus = useRef({ visible, focused });
+  liveFocus.current = { visible, focused };
+
+  /**
+   * Ask for the caret, rather than take it.
+   *
+   * Every path in this hook that wants the caret goes through here, and none of
+   * them calls `term.focus()` directly: a `.focus()` issued while reacting to a
+   * tab switch is overwritten a moment later by the browser focusing the tab
+   * chip that was clicked (`@/lib/paneCaret` has the measured sequence). The
+   * arbiter re-reads `liveFocus` at flush time, so a claim from an attach that
+   * resolved seconds ago is dropped rather than honoured.
+   */
+  const claimCaret = useCallback(() => {
+    paneCaret.claim(leafId, {
+      // The whole leaf frame, not just the xterm host: a click on this pane's
+      // own header buttons has to count as "the caret is already in my pane",
+      // or the claim would pull it back off the button a frame later. Falls
+      // back to the xterm host in a float window, which has no pane frame.
+      pane: () => container.current?.closest<HTMLElement>("[data-pane-leaf]") ?? container.current,
+      stillOnScreen: () => liveFocus.current.visible && liveFocus.current.focused,
+      take: () => sessions.get(leafId)?.term.focus(),
+    });
+  }, [leafId, container]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let rafId: number | null = null;
+    let attachIntervalId: ReturnType<typeof setInterval> | null = null;
+    let stuckTimer: ReturnType<typeof setTimeout> | null = null;
+    const s = ensureSession(
+      leafId,
+      initialCwd,
+      hostId,
+      savedPtyId,
+      terminalThemeId,
+      savedActiveTool,
+    );
+    // Seed visibility before `attachSession` below, which is what decides
+    // whether this leaf takes a WebGL context on first attach. The layout
+    // effect that tracks `visible` cannot do it: the session does not exist yet
+    // when it runs on mount (this effect is what creates it).
+    s.visible = visible;
+    // Pre-spawn, accept a fresher initialCwd (e.g. explorerRoot resolved between mounts).
+    if (!s.pty && !s.ptyOpening && initialCwd && s.initialCwd !== initialCwd) {
+      s.initialCwd = initialCwd;
+    }
+    const callbacks: Callbacks = {
+      onSearchReady: (a) => cbRef.current.onSearchReady?.(a),
+      onExit: (c) => cbRef.current.onExit?.(c),
+      onCwd: (c) => cbRef.current.onCwd?.(c),
+      onDetectedLocalUrl: (u) => cbRef.current.onDetectedLocalUrl?.(u),
+      onTerviaOpen: (input) => cbRef.current.onTerviaOpen?.(input),
+      onTerviaSpawnTab: (input) => cbRef.current.onTerviaSpawnTab?.(input),
+      onSshStatus: (status) => cbRef.current.onSshStatus?.(status),
+      onAiCliStatus: (status) => cbRef.current.onAiCliStatus?.(status),
+      onPtyId: (ptyId) => cbRef.current.onPtyId?.(ptyId),
+    };
+    // Wait for the container ref. Up to 120 rAF frames (~2s) covers
+    // react-resizable-panels measure-pass during workspace restore; after
+    // that, poll every 250ms until cleanup runs.
+    const MAX_ATTACH_FRAMES = 120;
+    const ATTACH_FALLBACK_INTERVAL_MS = 250;
+    const tryAttach = (framesLeft: number) => {
+      if (cancelled) return;
+      if (container.current) {
+        attachSession(leafId, container.current, callbacks);
+        claimCaret();
+        return;
+      }
+      if (framesLeft <= 0) {
+        console.warn(
+          `useTerminalSession: container ref never settled for leaf ${leafId} within ${MAX_ATTACH_FRAMES} frames; falling back to interval poll`,
+        );
+        attachIntervalId = setInterval(() => {
+          if (cancelled) {
+            if (attachIntervalId !== null) {
+              clearInterval(attachIntervalId);
+              attachIntervalId = null;
+            }
+            return;
+          }
+          if (!container.current) return;
+          if (attachIntervalId !== null) {
+            clearInterval(attachIntervalId);
+            attachIntervalId = null;
+          }
+          attachSession(leafId, container.current, callbacks);
+          claimCaret();
+        }, ATTACH_FALLBACK_INTERVAL_MS);
+        return;
+      }
+      rafId = requestAnimationFrame(() => tryAttach(framesLeft - 1));
+    };
+    s.ready
+      .then(() => {
+        if (cancelled) return;
+        tryAttach(MAX_ATTACH_FRAMES);
+      })
+      .catch((e) => {
+        // session.ready failed (font load, OSC register). Surface a retry hint.
+        // Still attach so the message is visible.
+        if (cancelled) return;
+        const msg = describeError(e);
+        s.lastPtyError = msg;
+        console.error("session ready failed:", e);
+        writePtyError(s, msg);
+        tryAttach(MAX_ATTACH_FRAMES);
+      });
+
+    // Stuck-recovery watchdog. Fires once; no-ops if the leaf is healthy.
+    // See STUCK_RECOVERY_MS.
+    stuckTimer = setTimeout(() => {
+      stuckTimer = null;
+      if (cancelled || s.disposed) return;
+      if (s.pty) return; // healthy
+      if (s.lastPtyError !== null) return; // Enter-to-retry handles it
+      // In-flight spawn is legitimate progress (typically queued behind
+      // Rust's SPAWN_LOCK during rapid splits). `SPAWN_TIMEOUT_MS` handles
+      // the genuinely-hung case. Re-arming a spawn here would double-queue
+      // a ConPTY init and the late resolution would just close as stale.
+      if (s.ptyOpening) return;
+      console.warn(
+        `[tervia-pty] stuck-recovery: leaf=${leafId} pty=null lastPtyError=null ptyOpening=${s.ptyOpening} sshConn=${s.hostId ?? "-"} sshStatus=${s.sshStatus.kind} containerAttached=${s.term.element !== undefined} after ${STUCK_RECOVERY_MS}ms - forcing retry`,
+      );
+      if (s.hostId) {
+        // SSH has its own reconnect. Only intervene from idle.
+        if (s.sshStatus.kind === "idle") {
+          void retrySsh(s);
+        }
+      } else {
+        void retryPty(s);
+      }
+    }, STUCK_RECOVERY_MS);
+
+    return () => {
+      cancelled = true;
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      if (attachIntervalId !== null) {
+        clearInterval(attachIntervalId);
+        attachIntervalId = null;
+      }
+      if (stuckTimer !== null) clearTimeout(stuckTimer);
+      // A claim outlives the render that made it by a frame, so an unmount
+      // between the two would otherwise focus a disposed session's terminal.
+      paneCaret.release(leafId);
+      detachSession(leafId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leafId]);
+
+  const baseFontSize = usePreferencesStore((p) => p.terminalFontSize);
+  const contentZoom = usePreferencesStore((p) => p.contentZoom);
+  const fontSize = effectiveTerminalFontSize(baseFontSize, contentZoom);
+  useEffect(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    if (s.term.options.fontSize === fontSize) return;
+    s.term.options.fontSize = fontSize;
+    reloadWebglAndRefit(s);
+  }, [leafId, fontSize]);
+
+  const fontFamilyPref = usePreferencesStore((p) => p.fontFamily);
+  useEffect(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    const family = buildContentFontFamily(fontFamilyPref);
+    if (s.term.options.fontFamily === family) return;
+    s.term.options.fontFamily = family;
+    reloadWebglAndRefit(s);
+  }, [leafId, fontFamilyPref]);
+
+  const scrollback = usePreferencesStore((p) => p.terminalScrollback);
+  useEffect(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    if (s.term.options.scrollback === scrollback) return;
+    // Lowering trims the live history ring immediately (frees memory); raising
+    // lets the terminal retain more going forward. Viewport size is unchanged,
+    // so no refit is needed.
+    s.term.options.scrollback = scrollback;
+  }, [leafId, scrollback]);
+
+  const webglPref = usePreferencesStore((p) => p.terminalWebglEnabled);
+  useEffect(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    s.webglEnabled = webglPref;
+    syncRendererForWallpaper(s);
+  }, [leafId, webglPref]);
+
+  // Per-leaf terminal theme override. `resolveTerminalPreset` returns the
+  // preset's stable palette object (or null), so the dep only changes when the
+  // chosen id actually changes. Writes the override onto the session and
+  // rebuilds the xterm theme so the pane repaints in its own palette without
+  // touching the global terminal theme or any sibling pane.
+  const terminalThemeOverride = resolveTerminalPreset(terminalThemeId);
+  useEffect(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    if (s.terminalThemeOverride === terminalThemeOverride) return;
+    s.terminalThemeOverride = terminalThemeOverride;
+    syncRendererForWallpaper(s);
+    s.term.options.theme = buildTerminalTheme(terminalThemeOverride);
+    s.term.refresh(0, s.term.rows - 1);
+  }, [leafId, terminalThemeOverride]);
+
+  useLayoutEffect(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    // Hand the GPU context back while this pane sits in an inactive tab, and
+    // take it again on the way in. Cheap both ways: the DOM renderer is fine for
+    // a pane nobody is looking at, and the glyph atlas repopulates lazily on the
+    // next paint. A swap refits itself; the refit below covers a show that did
+    // not swap.
+    s.visible = visible;
+    syncRendererForWallpaper(s);
+    if (!visible) return;
+    // The ResizeObserver does tick on show (a hidden tab is `display: none`, so
+    // 0px), but that tick can dedupe against lastW/lastH and it delays the PTY
+    // push, so refit and sync now. `refitSession` skips a 0px container (window
+    // minimized), which would reflow the buffer the same way the ResizeObserver
+    // path guards against. Focus still runs.
+    refitSession(s);
+    // Claimed, not taken. This effect runs INSIDE the mousedown that switched
+    // the tab (Radix `Tabs` changes value on mousedown and React 19 flushes the
+    // commit synchronously there), so a `term.focus()` here is undone by the
+    // browser focusing the tab chip immediately afterwards - which is how the
+    // caret stopped coming back to the terminal at all. The arbiter
+    // re-checks visible/focused before it hands the caret over.
+    if (focused) claimCaret();
+  }, [leafId, visible, focused, claimCaret]);
+
+  const write = useCallback((data: string) => sessions.get(leafId)?.pty?.write(data), [leafId]);
+
+  /**
+   * Start an AI CLI in this pane and tag it as running `tool`. `write` goes
+   * straight to the PTY, so the command never passes through xterm's `onData`
+   * and the detector's type-a-command activation never fires - hence the
+   * explicit `activate`, which also covers a renamed launcher (`claude-start`)
+   * that `TOOL_PATTERNS` cannot match. `tool: null` just runs the command.
+   */
+  const launchAgent = useCallback(
+    (command: string, tool: AiCliKind | null) => {
+      const s = sessions.get(leafId);
+      if (!s?.pty) return;
+      s.pty.write(`${command}\r`);
+      if (tool) s.aiCliDetector?.activate(tool);
+    },
+    [leafId],
+  );
+
+  const focus = useCallback(() => {
+    sessions.get(leafId)?.term.focus();
+  }, [leafId]);
+
+  const getBuffer = useCallback(
+    (maxLines = 200): string | null => {
+      const s = sessions.get(leafId);
+      if (!s) return null;
+      const buf = s.term.buffer.active;
+      const total = buf.length;
+      const lines: string[] = [];
+      const start = Math.max(0, total - maxLines);
+      for (let i = start; i < total; i++) {
+        lines.push(buf.getLine(i)?.translateToString(true) ?? "");
+      }
+      while (lines.length && lines[lines.length - 1] === "") lines.pop();
+      return lines.join("\n");
+    },
+    [leafId],
+  );
+
+  const getSelection = useCallback((): string | null => {
+    const sel = sessions.get(leafId)?.term.getSelection() ?? "";
+    return sel.length > 0 ? sel : null;
+  }, [leafId]);
+
+  /** Drop the xterm selection. Used after a right-click copy so the next
+   *  right-click pastes (Windows Terminal convention) instead of re-copying the
+   *  same range while the highlight lingers. */
+  const clearSelection = useCallback((): void => {
+    sessions.get(leafId)?.term.clearSelection();
+  }, [leafId]);
+
+  /**
+   * Paste via xterm so bracketed paste mode (zsh/bash/fish/pwsh) wraps the
+   * payload in `\e[200~ ... \e[201~`. Raw `pty.write` would skip the wrapper
+   * and run every line of a multi-line snippet on paste.
+   */
+  const paste = useCallback((data: string) => sessions.get(leafId)?.term.paste(data), [leafId]);
+
+  // True when the cursor line matches a shell PS1 on the normal screen. Used
+  // by the AI's run_in_terminal to refuse disrupting a running command or TUI.
+  // Alt-screen (vim, htop, top, etc.) is always treated as busy.
+  const isAtPrompt = useCallback((): boolean => {
+    const s = sessions.get(leafId);
+    if (!s) return false;
+    try {
+      const buf = s.term.buffer.active;
+      if (buf.type === "alternate") return false;
+      const line = buf.getLine(buf.baseY + buf.cursorY);
+      const text = line ? line.translateToString(true) : "";
+      return cursorLineLooksLikeShellPrompt(text);
+    } catch {
+      return false;
+    }
+  }, [leafId]);
+
+  // True when a foreground command is actually running - see `isSessionBusy`,
+  // shared with the quit prompt. Unlike `isAtPrompt` it does not guess from the
+  // PS1 text, so an idle terminal with a custom prompt never reads as busy.
+  const isProcessRunning = useCallback((): boolean => {
+    const s = sessions.get(leafId);
+    return s ? isSessionBusy(s) : false;
+  }, [leafId]);
+
+  const applyTheme = useCallback(() => {
+    const s = sessions.get(leafId);
+    if (!s) return;
+    syncRendererForWallpaper(s);
+    // Honor a per-leaf override so a global theme change (this callback's
+    // trigger) never clobbers a pane that opted into its own palette.
+    s.term.options.theme = buildTerminalTheme(s.terminalThemeOverride);
+    s.term.refresh(0, s.term.rows - 1);
+  }, [leafId]);
+
+  return {
+    write,
+    launchAgent,
+    focus,
+    getBuffer,
+    getSelection,
+    clearSelection,
+    paste,
+    isAtPrompt,
+    isProcessRunning,
+    applyTheme,
+  };
+}

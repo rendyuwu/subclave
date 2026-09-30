@@ -1,0 +1,2975 @@
+//! Interactive SSH client sessions.
+//!
+//! One authenticated session per `ssh_open`, carrying any number of shell
+//! channels (`ssh_shell_open`/`ssh_shell_write`/`ssh_shell_resize`/
+//! `ssh_shell_close`) until `ssh_close`, so the frontend can swap a local PTY
+//! for a remote shell with minimal plumbing. Auth supports the local ssh-agent (the
+//! private key stays inside the agent; Tervia only ever sees signatures), a
+//! private key, or a password.
+//! Host-key handling: SHA-256 fingerprint pinning. The first connect to
+//! a new host is trust-on-first-use (the seen fingerprint is reported to the
+//! frontend, which persists it as `lastFingerprint` in the connection store).
+//! Every later connect passes that fingerprint as `expected_fingerprint`; a
+//! mismatch aborts the handshake with a "host key mismatch / possible MITM"
+//! error (see `session::HostKeyVerifier`). To re-trust a legitimately rotated
+//! key the user clears the saved fingerprint on the connection.
+
+mod session;
+pub mod sftp;
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use getrandom::SysRng;
+use russh::keys::ssh_key::rand_core::UnwrapErr;
+use russh::keys::ssh_key::{LineEnding, PrivateKey};
+use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PublicKey};
+use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
+use tauri::AppHandle;
+use tokio::runtime::Runtime;
+use tokio::sync::watch;
+use zeroize::Zeroizing;
+
+use crate::modules::secrets::{SecretSource, SecretsState};
+pub use session::{SshConnectError, SshEvent};
+use session::{SshSession, SshShell};
+
+/// Shared tokio runtime for every SSH session. russh is async-first; driving
+/// it from per-session executors would duplicate thread pools. A single
+/// multi-thread runtime keeps overhead flat.
+fn ssh_runtime() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tervia-ssh")
+            .build()
+            .expect("init ssh tokio runtime")
+    })
+}
+
+pub struct SshState {
+    /// `pub(crate)` so the sibling `sftp` module can look up an existing
+    /// session by id to issue file-system commands. `Arc`-wrapped so the
+    /// janitor task spawned per session can hold a handle for eviction
+    /// after the session's connection ends.
+    pub(crate) sessions: Arc<tokio::sync::RwLock<HashMap<u32, Arc<SshSession>>>>,
+    next_id: AtomicU32,
+}
+
+impl Default for SshState {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            next_id: AtomicU32::new(1),
+        }
+    }
+}
+
+/// One hop in a ProxyJump chain. Resolved on the frontend (the chain is walked
+/// from saved connections and each hop's credentials become keychain
+/// references), then passed in connect order so the backend just dials them in
+/// sequence. The references are dereferenced here, in `ssh_open`, so no saved
+/// secret transits the webview.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshJumpHop {
+    /// Saved-connection id this hop came from, so the backend can echo it back
+    /// in `JumpConnected` and the frontend pins the fingerprint on the right row.
+    pub connection_id: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// Authenticate this hop through the local ssh-agent. Takes precedence over
+    /// the two fields below, which are then absent.
+    #[serde(default)]
+    pub use_agent: bool,
+    pub password: Option<SecretSource>,
+    /// Where the PEM-encoded private key text comes from.
+    pub private_key: Option<SecretSource>,
+    pub private_key_passphrase: Option<SecretSource>,
+    pub expected_fingerprint: Option<String>,
+    /// OpenSSH certificate text for this hop, paired with `private_key` -
+    /// set only for a vault entry of the `cert` kind. Public, so unlike
+    /// every field above it never goes through `SecretSource`.
+    pub certificate: Option<String>,
+    /// Restrict `use_agent` to the ssh-agent identity with this SHA256
+    /// fingerprint - set for a vault entry of the `hardware` kind. `None`
+    /// means "any key the agent offers", today's behaviour.
+    pub agent_key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshOpenInput {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// Authenticate through the local ssh-agent: the agent signs the handshake
+    /// and the private key never reaches Tervia. One of this, `password` or
+    /// `private_key` must be set.
+    #[serde(default)]
+    pub use_agent: bool,
+    /// Where the password comes from.
+    pub password: Option<SecretSource>,
+    /// Where the PEM-encoded private key text (OpenSSH or PKCS8) comes from.
+    /// Optional passphrase in `private_key_passphrase`.
+    pub private_key: Option<SecretSource>,
+    pub private_key_passphrase: Option<SecretSource>,
+    /// SHA256 fingerprint ("SHA256:...") of the server key recorded by a
+    /// previous successful connect. When set, the handshake fails fast if
+    /// the server presents a different key, blocking silent MITM on saved
+    /// connections. `None` on first connect (TOFU) and on dialog-time
+    /// test connections for brand-new hosts.
+    pub expected_fingerprint: Option<String>,
+    /// OpenSSH certificate text, paired with `private_key` - set only for a
+    /// vault entry of the `cert` kind. Public, so unlike every secret field
+    /// above it never goes through `SecretSource`.
+    pub certificate: Option<String>,
+    /// Restrict `use_agent` to the ssh-agent identity with this SHA256
+    /// fingerprint - set for a vault entry of the `hardware` kind. `None`
+    /// means "any key the agent offers", today's behaviour.
+    pub agent_key_fingerprint: Option<String>,
+    /// ProxyJump chain in connect order (publicly-reachable entry host first;
+    /// the hop closest to the target last). Empty/absent = direct connection.
+    #[serde(default)]
+    pub jumps: Vec<SshJumpHop>,
+}
+
+/// What `ssh_open` returns: the session id every later command names, and the
+/// SHA256 fingerprint the target presented, for the frontend to pin.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshOpened {
+    pub id: u32,
+    pub fingerprint: String,
+}
+
+/// Independent metric groups from one Linux SSH host sample. Missing kernel
+/// files or fields leave only the affected metric unavailable.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshResourceSample {
+    pub hostname: Option<String>,
+    pub version: Option<String>,
+    pub uptime_seconds: Option<f64>,
+    pub cpu_total: Option<u64>,
+    pub cpu_idle: Option<u64>,
+    pub memory_total: Option<u64>,
+    pub memory_available: Option<u64>,
+    pub memory_cached: Option<u64>,
+    pub memory_buffers: Option<u64>,
+    pub disk_read_bytes: Option<u64>,
+    pub disk_write_bytes: Option<u64>,
+    pub filesystems: Option<Vec<SshFilesystemUsage>>,
+    pub network_interfaces: Option<Vec<SshNetworkInterface>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshFilesystemUsage {
+    pub source: String,
+    pub mount: String,
+    pub total_kib: u64,
+    pub used_kib: u64,
+    pub available_kib: u64,
+    pub use_percent: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshNetworkInterface {
+    pub name: String,
+    pub received_bytes: u64,
+    pub received_errors: u64,
+    pub received_dropped: u64,
+    pub sent_bytes: u64,
+    pub sent_errors: u64,
+    pub sent_dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SshResourceStreamEvent {
+    Sample {
+        sample: SshResourceSample,
+    },
+    Ping {
+        host: String,
+        latency_ms: Option<f64>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshResourceStreamStart {
+    pub stream_id: u32,
+    pub ping_enabled: bool,
+}
+
+/// Parse each metric independently; unavailable fields do not drop an otherwise
+/// useful frame. Device-family and platform limits are listed in
+/// `KNOWN-LIMITS.md`.
+fn parse_resource_sample(raw: &str) -> SshResourceSample {
+    let mut hostname = None;
+    let mut version = None;
+    let mut uptime_seconds = None;
+    let mut cpu = None;
+    let mut memory_total = None;
+    let mut memory_available = None;
+    let mut memory_cached = None;
+    let mut memory_buffers = None;
+    let mut disk_read_bytes: Option<u64> = None;
+    let mut disk_write_bytes: Option<u64> = None;
+    let mut filesystems: Option<Vec<SshFilesystemUsage>> = None;
+    let mut network_interfaces: Option<Vec<SshNetworkInterface>> = None;
+    let mut section = "";
+
+    for line in raw.lines() {
+        let line = line.trim();
+        match line {
+            "HOST" => {
+                section = "host";
+                continue;
+            }
+            "VERSION" => {
+                section = "version";
+                continue;
+            }
+            "UPTIME" => {
+                section = "uptime";
+                continue;
+            }
+            "CPU" => {
+                section = "cpu";
+                continue;
+            }
+            "MEM" => {
+                section = "memory";
+                continue;
+            }
+            "NET" => {
+                section = "network";
+                network_interfaces = Some(Vec::new());
+                continue;
+            }
+            "DISK" => {
+                section = "disk";
+                disk_read_bytes = None;
+                disk_write_bytes = None;
+                continue;
+            }
+            "FS" => {
+                section = "filesystems";
+                filesystems = Some(Vec::new());
+                continue;
+            }
+            _ => {}
+        }
+
+        match section {
+            "host" => {
+                hostname = Some(line.to_string());
+                section = "";
+            }
+            "version" => {
+                version = Some(line.to_string());
+                section = "";
+            }
+            "uptime" => {
+                uptime_seconds = line
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<f64>().ok());
+                section = "";
+            }
+            "cpu" if line.starts_with("cpu ") => {
+                let values = line
+                    .split_whitespace()
+                    .skip(1)
+                    .map(str::parse::<u64>)
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(values) = values else {
+                    section = "";
+                    continue;
+                };
+                if values.len() >= 5 {
+                    // Guest time is already included in user/nice, so only sum
+                    // the first eight Linux CPU counters.
+                    cpu = Some((
+                        values.iter().take(8).sum(),
+                        values[3].saturating_add(values[4]),
+                    ));
+                }
+            }
+            "memory" => {
+                if let Some(value) = line.strip_prefix("MemTotal:") {
+                    memory_total = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                } else if let Some(value) = line.strip_prefix("MemAvailable:") {
+                    memory_available = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                } else if let Some(value) = line.strip_prefix("Cached:") {
+                    memory_cached = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                } else if let Some(value) = line.strip_prefix("Buffers:") {
+                    memory_buffers = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                }
+            }
+            "network" => {
+                if let Some((name, counters)) = line.split_once(':') {
+                    let name = name.trim();
+                    if !is_virtual_network_interface(name) {
+                        let fields = counters
+                            .split_whitespace()
+                            .map(str::parse::<u64>)
+                            .collect::<Result<Vec<_>, _>>();
+                        if let Ok(fields) = fields {
+                            if fields.len() >= 16 {
+                                network_interfaces
+                                    .as_mut()
+                                    .unwrap()
+                                    .push(SshNetworkInterface {
+                                        name: name.to_string(),
+                                        received_bytes: fields[0],
+                                        received_errors: fields[2],
+                                        received_dropped: fields[3],
+                                        sent_bytes: fields[8],
+                                        sent_errors: fields[10],
+                                        sent_dropped: fields[11],
+                                    });
+                            }
+                        }
+                    }
+                }
+            }
+            "disk" => {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() >= 10 && is_whole_disk(fields[2]) {
+                    if let (Ok(read_sectors), Ok(write_sectors)) =
+                        (fields[5].parse::<u64>(), fields[9].parse::<u64>())
+                    {
+                        disk_read_bytes = Some(
+                            disk_read_bytes
+                                .unwrap_or_default()
+                                .saturating_add(read_sectors.saturating_mul(512)),
+                        );
+                        disk_write_bytes = Some(
+                            disk_write_bytes
+                                .unwrap_or_default()
+                                .saturating_add(write_sectors.saturating_mul(512)),
+                        );
+                    }
+                }
+            }
+            "filesystems" if !line.starts_with("Filesystem") => {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() >= 6 {
+                    if let (Ok(total), Ok(used), Ok(available), Ok(use_percent)) = (
+                        fields[1].parse(),
+                        fields[2].parse(),
+                        fields[3].parse(),
+                        fields[4].trim_end_matches('%').parse(),
+                    ) {
+                        filesystems.as_mut().unwrap().push(SshFilesystemUsage {
+                            source: fields[0].to_string(),
+                            mount: fields[5..].join(" "),
+                            total_kib: total,
+                            used_kib: used,
+                            available_kib: available,
+                            use_percent,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (cpu_total, cpu_idle) = cpu.map_or((None, None), |(total, idle)| (Some(total), Some(idle)));
+    SshResourceSample {
+        hostname: hostname.filter(|value| !value.is_empty()),
+        version: version.filter(|value| !value.is_empty()),
+        uptime_seconds,
+        cpu_total,
+        cpu_idle,
+        memory_total,
+        memory_available,
+        memory_cached,
+        memory_buffers,
+        disk_read_bytes,
+        disk_write_bytes,
+        filesystems,
+        network_interfaces,
+    }
+}
+
+fn is_virtual_network_interface(name: &str) -> bool {
+    name == "lo"
+        || [
+            "docker",
+            "veth",
+            "br",
+            "virbr",
+            "tun",
+            "tap",
+            "wg",
+            "tailscale",
+            "ifb",
+            "flannel",
+            "cni",
+            "podman",
+            "vnet",
+            "bond",
+            "team",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+fn is_whole_disk(name: &str) -> bool {
+    name.starts_with("sd")
+        && !name[2..].is_empty()
+        && name[2..].chars().all(|c| c.is_ascii_lowercase())
+        || name.starts_with("vd")
+            && !name[2..].is_empty()
+            && name[2..].chars().all(|c| c.is_ascii_lowercase())
+        || name.starts_with("xvd")
+            && !name[3..].is_empty()
+            && name[3..].chars().all(|c| c.is_ascii_lowercase())
+        || name.starts_with("hd")
+            && !name[2..].is_empty()
+            && name[2..].chars().all(|c| c.is_ascii_lowercase())
+        || name.strip_prefix("nvme").is_some_and(|part| {
+            part.split_once('n').is_some_and(|(device, namespace)| {
+                !device.is_empty()
+                    && device.chars().all(|c| c.is_ascii_digit())
+                    && !namespace.is_empty()
+                    && namespace.chars().all(|c| c.is_ascii_digit())
+            })
+        })
+        || name
+            .strip_prefix("mmcblk")
+            .is_some_and(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// One hop's secrets, read out of the keychain at the command boundary.
+#[derive(Default)]
+pub struct HopSecrets {
+    pub password: Option<Zeroizing<String>>,
+    pub private_key: Option<Zeroizing<String>>,
+    pub private_key_passphrase: Option<Zeroizing<String>>,
+}
+
+/// Every secret one connect needs. `jumps` is index-aligned with
+/// [`SshOpenInput::jumps`] BY CONSTRUCTION: [`resolve_secrets`] builds both
+/// from the same input, so the two can never drift apart.
+pub struct SshSecrets {
+    pub target: HopSecrets,
+    pub jumps: Vec<HopSecrets>,
+}
+
+/// Dereference every credential an input names, here rather than in the
+/// webview.
+///
+/// At the command boundary because `tauri::State` is borrowed from the
+/// invocation and cannot cross into the SSH runtime - the same constraint
+/// `rdp_open` already works under.
+fn resolve_secrets(
+    app: &AppHandle,
+    state: &SecretsState,
+    input: &SshOpenInput,
+) -> Result<SshSecrets, String> {
+    let one = |hop_password: &Option<SecretSource>,
+               hop_key: &Option<SecretSource>,
+               hop_passphrase: &Option<SecretSource>|
+     -> Result<HopSecrets, String> {
+        Ok(HopSecrets {
+            password: hop_password
+                .as_ref()
+                .map(|s| s.resolve(app, state))
+                .transpose()?
+                .flatten(),
+            private_key: hop_key
+                .as_ref()
+                .map(|s| s.resolve(app, state))
+                .transpose()?
+                .flatten(),
+            private_key_passphrase: hop_passphrase
+                .as_ref()
+                .map(|s| s.resolve(app, state))
+                .transpose()?
+                .flatten(),
+        })
+    };
+    Ok(SshSecrets {
+        target: one(
+            &input.password,
+            &input.private_key,
+            &input.private_key_passphrase,
+        )?,
+        jumps: input
+            .jumps
+            .iter()
+            .map(|h| one(&h.password, &h.private_key, &h.private_key_passphrase))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// One key the local ssh-agent is holding. Read-only: the agent never hands out
+/// the private half, so this is everything Tervia can know about it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshAgentKey {
+    /// Wire algorithm name, e.g. `ssh-ed25519`.
+    pub algorithm: String,
+    /// The comment the key was added with, usually `user@machine`. Often empty.
+    pub comment: String,
+    /// `SHA256:...`, the same form `ssh-add -l` prints.
+    pub fingerprint: String,
+    /// The `.pub` line (`to_openssh()`), empty when the crate could not build
+    /// one. Lets a vault `hardware` key editor fill its public-key field from
+    /// a picked agent identity, the same shape a pasted line classifies as
+    /// (`ssh_key_classify`), rather than the agent only ever naming a
+    /// fingerprint.
+    pub public_key: String,
+}
+
+/// Keys currently loaded in the local ssh-agent. Backs the connection dialog's
+/// agent panel: with no field to fill in, "is the agent up and does it hold a
+/// key" IS the validation for agent auth, so it is answered before saving
+/// rather than at dial time.
+#[tauri::command]
+pub async fn ssh_agent_keys() -> Result<Vec<SshAgentKey>, String> {
+    ssh_runtime()
+        .spawn(async {
+            // Flattened back to a string on purpose. This command feeds the
+            // dialog's agent panel, which shows the sentence and has no ladder
+            // to gate - the kind is only meaningful to a caller that decides
+            // whether to retry, and this one does not.
+            let (_agent, keys) = session::agent_keys().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(
+                keys.iter()
+                    .map(|k| SshAgentKey {
+                        algorithm: k.algorithm().to_string(),
+                        comment: k.comment().to_string(),
+                        fingerprint: k.fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+                        public_key: k.to_openssh().unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        })
+        .await
+        .map_err(|e| format!("ssh agent task join failed: {e}"))?
+}
+
+/// What a pasted private key can be described as without dialing anything.
+/// Filled by `ssh_key_inspect` so a saved key carries its algorithm and
+/// fingerprint from the moment it is imported.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKeyInfo {
+    /// `false` means the caller must ask for a passphrase and call again: the
+    /// key is readable, but its container hides everything below.
+    pub parsed: bool,
+    pub encrypted: bool,
+    /// Wire algorithm name, e.g. `ssh-ed25519`, `ecdsa-sha2-nistp256`.
+    pub key_type: Option<String>,
+    /// `SHA256:...`, the same form `ssh-keygen -lf` prints.
+    pub fingerprint: Option<String>,
+    /// The `.pub` line: `ssh-ed25519 AAAA... comment`, minus the comment when
+    /// that is not readable (see below).
+    pub public_key: Option<String>,
+    /// Absent for an encrypted `openssh-key-v1` key inspected without its
+    /// passphrase: that container keeps the public half in cleartext but seals
+    /// the comment inside the private section. Pass the passphrase to get it.
+    pub comment: Option<String>,
+}
+
+/// `ssh_key_generate`'s answer: the freshly minted private key, plus the
+/// SAME metadata `ssh_key_inspect` would report for it, flattened onto this
+/// struct rather than nested - so the frontend can hand `info` straight to
+/// `describeKeyInfo`/`vaultKeyFactsFrom` (`src/modules/vault/keyInspect.ts`)
+/// exactly as it already does for a pasted key, with no second translation
+/// for a generated one.
+///
+/// No `Debug` derive: `pem` is `Zeroizing<String>`, which does not implement
+/// it (the same reason `HopSecrets`/`SshSecrets` above derive no `Debug`
+/// either) - a stray `{:?}` must not become a place a private key leaks.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKeyGenerated {
+    /// OpenSSH `openssh-key-v1` PEM, LF line endings, encrypted when a
+    /// passphrase was given. The only place the private key material leaves
+    /// this function - the caller stores it exactly as a pasted key's body.
+    pub pem: Zeroizing<String>,
+    #[serde(flatten)]
+    pub info: SshKeyInfo,
+}
+
+/// Header-level shape of pasted key text, decided before any parse attempt.
+/// Four of these variants are dead ends inside russh, and without this step
+/// every one of them surfaces as the same `Could not read key`, which tells the
+/// user nothing about which of their key files to try next.
+#[derive(Debug)]
+enum KeyFormat {
+    /// `openssh-key-v1`. The container keeps the public half in cleartext next
+    /// to the encrypted private section, so metadata needs no passphrase.
+    OpenSsh,
+    /// Any other container russh accepts: PKCS#1, PKCS#8, PuTTY `.ppk`.
+    /// `encrypted` comes from the header (`ENCRYPTED PRIVATE KEY`, `DEK-Info:`,
+    /// PuTTY's `Encryption:`); these formats seal the public half away too, so
+    /// `true` means nothing at all is knowable until the passphrase arrives.
+    Other {
+        encrypted: bool,
+    },
+    /// A `.pub` / `authorized_keys` line, or a PEM public block.
+    PublicKey,
+    /// russh has no DSA branch and our build leaves its `dsa` feature off.
+    Dsa,
+    /// SEC1. russh matches the label but routes it to the PKCS#8 decoder,
+    /// which is a different encoding, so it fails with a misleading error.
+    Sec1,
+    /// PKCS#1 under a PEM cipher russh does not implement (only AES-128-CBC is
+    /// wired up; AES-256 and 3DES fall through to the DER decoder).
+    UnsupportedPemCipher,
+    Unknown,
+}
+
+/// Algorithm names as they appear at the start of a `.pub` line.
+const PUBLIC_KEY_PREFIXES: &[&str] = &[
+    "ssh-rsa",
+    "ssh-dss",
+    "ssh-ed25519",
+    "ssh-ed448",
+    "ecdsa-sha2-",
+    "sk-ssh-ed25519",
+    "sk-ecdsa-sha2-",
+];
+
+/// A PKCS#1 block sealed with a PEM cipher names it in a `DEK-Info:` header.
+/// russh only builds a decryptor for AES-128-CBC.
+fn pkcs1_cipher(text: &str) -> KeyFormat {
+    for line in text.lines().map(str::trim) {
+        if let Some(cipher) = line.strip_prefix("DEK-Info:") {
+            return if cipher.trim_start().starts_with("AES-128-CBC,") {
+                KeyFormat::Other { encrypted: true }
+            } else {
+                KeyFormat::UnsupportedPemCipher
+            };
+        }
+    }
+    KeyFormat::Other { encrypted: false }
+}
+
+/// Classifies `text`, and also hands back the slice of it the winning marker
+/// actually starts at. That slice - not the full paste - is what the caller
+/// must feed to the real parser: `ssh_key::PrivateKey::from_openssh` (behind
+/// `KeyFormat::OpenSsh`) only understands one encapsulated PEM message and
+/// takes the label of whichever `-----BEGIN ...-----` line it meets first, so
+/// if an earlier public-key block's own label rides along, the *real* key's
+/// closing `-----END-----` no longer matches it and a good private key comes
+/// back unreadable. Trimming the paste down to "the winning marker onward"
+/// avoids that regardless of what came before it.
+fn classify(text: &str) -> (KeyFormat, &str) {
+    // A private-key marker anywhere in the paste wins, even over a public-key
+    // marker earlier in the text - bare `.pub` line or PEM block alike: a user
+    // pasting both halves out of one file listing, or a PEM-reencoded public
+    // half (`ssh-keygen -e`) pasted above their real key, should get the
+    // private key, not a "that is a public key" bounce. So a public-key label
+    // only sets a pending verdict and keeps scanning; every other label is
+    // still a dead end the moment it is seen, same as before.
+    let mut pending_public = false;
+    // Walked one line at a time via `split_once`, rather than `text.lines()`,
+    // so `rest` stays a real slice of `text` running from the current line to
+    // the paste's end - exactly what a winning marker further down needs to
+    // hand back, with no byte-index arithmetic of our own.
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (line, after) = rest.split_once('\n').unwrap_or((rest, ""));
+        let trimmed = line.trim();
+        if trimmed.starts_with("PuTTY-User-Key-File-") {
+            let encrypted = rest.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("Encryption:")
+                    .is_some_and(|v| v.trim() != "none")
+            });
+            return (KeyFormat::Other { encrypted }, rest);
+        }
+        if let Some(label) = trimmed
+            .strip_prefix("-----BEGIN ")
+            .and_then(|l| l.strip_suffix("-----"))
+        {
+            match label {
+                "OPENSSH PRIVATE KEY" => return (KeyFormat::OpenSsh, rest),
+                "DSA PRIVATE KEY" => return (KeyFormat::Dsa, rest),
+                "EC PRIVATE KEY" => return (KeyFormat::Sec1, rest),
+                "ENCRYPTED PRIVATE KEY" => return (KeyFormat::Other { encrypted: true }, rest),
+                "PRIVATE KEY" => return (KeyFormat::Other { encrypted: false }, rest),
+                "RSA PRIVATE KEY" => return (pkcs1_cipher(rest), rest),
+                "PUBLIC KEY" | "RSA PUBLIC KEY" | "SSH2 PUBLIC KEY" => pending_public = true,
+                _ => return (KeyFormat::Unknown, rest),
+            }
+        }
+        rest = after;
+    }
+    if pending_public {
+        return (KeyFormat::PublicKey, text);
+    }
+
+    // No BEGIN marker and no PuTTY header anywhere: the only shapes left are
+    // a bare `.pub` / authorized_keys line and the RFC 4716 public format
+    // (which spells its delimiters with four dashes and spaces, not
+    // `-----BEGIN `), and both are only ever public keys.
+    let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return (KeyFormat::Unknown, text);
+    };
+    if PUBLIC_KEY_PREFIXES.iter().any(|p| first.starts_with(p))
+        || first.starts_with("---- BEGIN SSH2 PUBLIC KEY ----")
+    {
+        return (KeyFormat::PublicKey, text);
+    }
+    (KeyFormat::Unknown, text)
+}
+
+/// Everything `SshKeyInfo` can say about a key. Also runs on a still-encrypted
+/// `openssh-key-v1` handle, where the public half is cleartext.
+///
+/// Fallible, and deliberately the only way a parsed key becomes an `SshKeyInfo`:
+/// the DSA refusal below has to hold at every one of `ssh_key_inspect_inner`'s
+/// returns, and living here means a future fifth return cannot quietly skip it.
+/// There is no infallible constructor left to reach for, so forgetting the check
+/// is a type error at the new call site rather than a silent hole.
+fn key_info(key: &PrivateKey, encrypted: bool) -> Result<SshKeyInfo, String> {
+    // The container format cannot answer "is this DSA?", so `classify` cannot
+    // be where this is decided: it only sees DSA when a PEM `DSA PRIVATE KEY`
+    // label spells it out, and a modern `ssh-keygen -t dsa` writes
+    // `openssh-key-v1` instead - which classifies as `OpenSsh`, parses
+    // perfectly well, and reported `ssh-dss` with a real fingerprint and public
+    // half for a key that can never authenticate (russh is built without its
+    // `dsa` feature - see `KeyFormat::Dsa`), leaving the user to discover that
+    // at dial time instead. So the guard is on the parsed algorithm, and it is
+    // checked before any of the key's facts are read.
+    if key.algorithm().is_dsa() {
+        return Err(ERR_DSA.into());
+    }
+    let comment = key.comment().trim();
+    Ok(SshKeyInfo {
+        parsed: true,
+        encrypted,
+        key_type: Some(key.algorithm().to_string()),
+        fingerprint: Some(key.fingerprint(russh::keys::HashAlg::Sha256).to_string()),
+        public_key: key.public_key().to_openssh().ok(),
+        comment: (!comment.is_empty()).then(|| comment.to_string()),
+    })
+}
+
+/// The container sealed the public half away, so nothing is knowable yet. Not
+/// an `Err`: the caller prompts for the passphrase and calls again.
+fn needs_passphrase() -> SshKeyInfo {
+    SshKeyInfo {
+        parsed: false,
+        encrypted: true,
+        key_type: None,
+        fingerprint: None,
+        public_key: None,
+        comment: None,
+    }
+}
+
+// One message per dead end. russh answers every unreadable key with the same
+// `Could not read key` and a wrong passphrase with a raw `Unpad Error`, neither
+// of which tells the user which of their key files to reach for next. None of
+// these ever interpolate the key body or the passphrase.
+const ERR_EMPTY: &str = "ssh: no key text - paste a private key or pick a key file";
+const ERR_PUBLIC_KEY: &str =
+    "ssh: that is a public key. Paste the private key instead - the same file, without the \
+     .pub suffix";
+const ERR_DSA: &str =
+    "ssh: DSA keys are not supported (OpenSSH disables them too). Generate an Ed25519 key: \
+     ssh-keygen -t ed25519";
+const ERR_SEC1: &str =
+    "ssh: this is a SEC1 \"EC PRIVATE KEY\" file, which Tervia cannot read. Rewrite it in \
+     OpenSSH format: ssh-keygen -p -f <keyfile>";
+const ERR_PEM_CIPHER: &str =
+    "ssh: this PEM key is sealed with a cipher Tervia cannot read (only AES-128-CBC). Rewrite \
+     it in OpenSSH format: ssh-keygen -p -f <keyfile>";
+const ERR_UNKNOWN: &str =
+    "ssh: unrecognised key format. Expected a \"-----BEGIN ... PRIVATE KEY-----\" block or a \
+     PuTTY .ppk; the text may also be truncated";
+const ERR_OPENSSH_BODY: &str =
+    "ssh: could not read this OpenSSH private key - the block looks truncated or altered";
+const ERR_UNREADABLE: &str =
+    "ssh: could not read this private key - the block looks truncated, altered, or uses an \
+     unsupported cipher";
+const ERR_WRONG_PASSPHRASE: &str = "ssh: wrong passphrase for this private key";
+const ERR_PASSPHRASE_OR_CORRUPT: &str =
+    "ssh: wrong passphrase for this private key, or the encrypted block is truncated or corrupt";
+
+/// Describe a private key the user just pasted or picked, without connecting.
+/// Backs the vault's key editor, which stores the algorithm, fingerprint and
+/// `.pub` line next to the secret so a saved key stays identifiable later.
+///
+/// Rust rather than the frontend for two reasons: nothing in the JS tree parses
+/// an SSH key, and `crypto.subtle` is undefined at the bundled app's
+/// `http://tauri.localhost` origin (it is secure-context only), so a JS
+/// implementation would work under `tauri dev` and fail only in the release
+/// bundle - the most expensive place to find out.
+///
+/// Async because unlocking a key runs bcrypt-pbkdf, and the round count comes
+/// from the key file's own header: a hand-edited key can make that take as long
+/// as it likes, which on a sync command is a frozen WebView2 window.
+#[tauri::command]
+pub async fn ssh_key_inspect(
+    pem: String,
+    passphrase: Option<String>,
+) -> Result<SshKeyInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_key_inspect_inner(&pem, passphrase.as_deref()))
+        .await
+        .map_err(|e| format!("ssh_key_inspect join error: {e}"))?
+}
+
+fn ssh_key_inspect_inner(pem: &str, passphrase: Option<&str>) -> Result<SshKeyInfo, String> {
+    let text = pem.trim();
+    if text.is_empty() {
+        return Err(ERR_EMPTY.into());
+    }
+    let pass = passphrase.filter(|p| !p.is_empty());
+
+    // `key_text` is `text` trimmed down to "the winning marker onward" - see
+    // `classify`'s own doc comment for why the two can differ and why the
+    // parse below must use `key_text`, not `text`.
+    let (format, key_text) = classify(text);
+    let encrypted = match format {
+        KeyFormat::PublicKey => return Err(ERR_PUBLIC_KEY.into()),
+        KeyFormat::Dsa => return Err(ERR_DSA.into()),
+        KeyFormat::Sec1 => return Err(ERR_SEC1.into()),
+        KeyFormat::UnsupportedPemCipher => return Err(ERR_PEM_CIPHER.into()),
+        KeyFormat::Unknown => return Err(ERR_UNKNOWN.into()),
+        // openssh-key-v1 declares its cipher inside the container and parses
+        // either way, so here the parse is what decides `encrypted`.
+        KeyFormat::OpenSsh => {
+            let key =
+                PrivateKey::from_openssh(key_text).map_err(|_| ERR_OPENSSH_BODY.to_string())?;
+            if !key.is_encrypted() {
+                return key_info(&key, false);
+            }
+            return match pass {
+                // Decrypting proves the passphrase before dial time, and is
+                // also the only route to the comment: the container keeps the
+                // public half in cleartext but seals the comment away with the
+                // private one.
+                Some(pass) => key
+                    .decrypt(pass)
+                    .map_err(|_| ERR_WRONG_PASSPHRASE.to_string())
+                    .and_then(|open| key_info(&open, true)),
+                // The public half is cleartext here, so the algorithm is
+                // knowable without the passphrase - which means a DSA key is
+                // refused now rather than being reported and deferred.
+                None => key_info(&key, true),
+            };
+        }
+        KeyFormat::Other { encrypted } => encrypted,
+    };
+
+    if encrypted && pass.is_none() {
+        return Ok(needs_passphrase());
+    }
+    match russh::keys::decode_secret_key(key_text, pass) {
+        Ok(key) => key_info(&key, encrypted),
+        // Backstop for a container that did not announce its encryption in a
+        // header spelling `classify` recognises.
+        Err(russh::keys::Error::KeyIsEncrypted) if pass.is_none() => Ok(needs_passphrase()),
+        // PKCS#8's own truncation does surface as a distinct DER error, but
+        // PKCS#1 under AES-128-CBC - the other format that reaches this
+        // branch - fails a truncated body and a wrong passphrase identically
+        // (both trip the same padding error). `encrypted` alone cannot tell
+        // which format this was, so splitting on the crate's error variant
+        // would be right for one and confidently wrong for the other. Name
+        // both possibilities instead of picking.
+        Err(_) if encrypted => Err(ERR_PASSPHRASE_OR_CORRUPT.into()),
+        Err(_) => Err(ERR_UNREADABLE.into()),
+    }
+}
+
+const ERR_CERT_UNREADABLE: &str =
+    "ssh: could not read this OpenSSH certificate - the block looks truncated or altered";
+const ERR_PUBLIC_KEY_UNREADABLE: &str = "ssh: could not read this public key line";
+
+/// What `ssh_key_classify` reports pasted text as: a private key (unlock and
+/// describe it with `ssh_key_inspect`), an OpenSSH certificate (full
+/// metadata, here), a bare public-key line (also full metadata, here), or
+/// neither. Internally tagged the same way `SshEvent` (`session.rs`) is, so
+/// the frontend switches on one `kind` field rather than guessing a shape
+/// from which other fields are present.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SshTextClassification {
+    /// Says only that this is one - unlocking and describing it is
+    /// `ssh_key_inspect`'s job, unchanged, for both a `pem` key and a
+    /// `cert` key's signing half.
+    PrivateKey,
+    Certificate {
+        /// The signing CA's own fingerprint - `signature_key()`.
+        ca_fingerprint: String,
+        /// The CERTIFIED key's fingerprint - `public_key()`. Compared
+        /// against the signing key's `ssh_key_inspect` fingerprint at save
+        /// time, so a certificate pasted for the wrong key is refused
+        /// before it is stored.
+        fingerprint: String,
+        key_id: String,
+        principals: Vec<String>,
+        /// Unix seconds.
+        valid_after: u64,
+        /// Unix seconds, or `None` when the certificate never expires
+        /// (OpenSSH's `u64::MAX` "forever" sentinel).
+        valid_before: Option<u64>,
+    },
+    PublicKey {
+        algorithm: String,
+        fingerprint: String,
+        comment: Option<String>,
+        /// The `.pub` line, re-encoded - the same field
+        /// `SshAgentKey::public_key` carries, so a pasted line and a picked
+        /// ssh-agent identity produce one shape.
+        public_key: String,
+    },
+    Unsupported {
+        reason: String,
+    },
+}
+
+/// Classify pasted text as a private key, an OpenSSH certificate, a public
+/// key line, or neither - backs the vault key editor's `cert` and
+/// `hardware` kinds, which each need to know what the user just pasted
+/// without russh's own "Could not read key" collapsing every dead end into
+/// one message. Async like `ssh_key_inspect`: the text is user-supplied and
+/// may be a private key, so parsing stays off the WebView2 UI thread.
+#[tauri::command]
+pub async fn ssh_key_classify(text: String) -> Result<SshTextClassification, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh_key_classify_inner(&text))
+        .await
+        .map_err(|e| format!("ssh_key_classify join error: {e}"))?
+}
+
+fn ssh_key_classify_inner(text: &str) -> Result<SshTextClassification, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(ERR_EMPTY.into());
+    }
+    // Checked before `classify()`'s own verdict: a cert line's algorithm
+    // token (`ssh-ed25519-cert-v01@openssh.com`) STARTS WITH a plain
+    // algorithm name (`ssh-ed25519`), so `classify()`'s substring match
+    // against `PUBLIC_KEY_PREFIXES` would otherwise misfile it as a bare
+    // public key.
+    let first_word = trimmed.split_whitespace().next().unwrap_or("");
+    if first_word.ends_with("-cert-v01@openssh.com") {
+        let cert =
+            Certificate::from_openssh(trimmed).map_err(|_| ERR_CERT_UNREADABLE.to_string())?;
+        let valid_before = cert.valid_before();
+        return Ok(SshTextClassification::Certificate {
+            ca_fingerprint: cert
+                .signature_key()
+                .fingerprint(HashAlg::Sha256)
+                .to_string(),
+            fingerprint: cert.public_key().fingerprint(HashAlg::Sha256).to_string(),
+            key_id: cert.key_id().to_string(),
+            principals: cert.valid_principals().to_vec(),
+            valid_after: cert.valid_after(),
+            valid_before: (valid_before < u64::MAX).then_some(valid_before),
+        });
+    }
+    let (format, key_text) = classify(trimmed);
+    match format {
+        KeyFormat::PublicKey => {
+            let key = PublicKey::from_openssh(key_text)
+                .map_err(|_| ERR_PUBLIC_KEY_UNREADABLE.to_string())?;
+            let comment = key.comment().trim();
+            Ok(SshTextClassification::PublicKey {
+                algorithm: key.algorithm().to_string(),
+                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                comment: (!comment.is_empty()).then(|| comment.to_string()),
+                public_key: key.to_openssh().unwrap_or_default(),
+            })
+        }
+        KeyFormat::Unknown => Ok(SshTextClassification::Unsupported {
+            reason: ERR_UNKNOWN.into(),
+        }),
+        // DSA, SEC1, an unsupported PEM cipher, PuTTY, PKCS#8, openssh-key-v1
+        // - every one of these is a private-key-shaped header. Whether it
+        // actually decodes (and whether it needs a passphrase) is
+        // `ssh_key_inspect`'s job, not this one's.
+        KeyFormat::Dsa
+        | KeyFormat::Sec1
+        | KeyFormat::UnsupportedPemCipher
+        | KeyFormat::OpenSsh
+        | KeyFormat::Other { .. } => Ok(SshTextClassification::PrivateKey),
+    }
+}
+
+/// Wire names `ssh_key_generate` accepts for `algorithm`, matched exactly.
+/// Three rather than the crate's whole `Algorithm` surface: DSA is refused
+/// everywhere else in this file, and P-384/P-521 or a different RSA size have
+/// no picker slot in the key editor to offer them from.
+fn parse_key_generate_algorithm(algorithm: &str) -> Result<Algorithm, String> {
+    match algorithm {
+        "ed25519" => Ok(Algorithm::Ed25519),
+        "ecdsa-p256" => Ok(Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        }),
+        "rsa-4096" => Ok(Algorithm::Rsa { hash: None }),
+        other => Err(format!("ssh: unknown key algorithm \"{other}\"")),
+    }
+}
+
+/// Generate a new SSH key pair - the vault's other half of "import one".
+/// Backs the key editor's Generate action: the private key is built and
+/// serialized entirely here, and the caller only ever sees the `pem` this
+/// returns, exactly as it would a pasted key's body - nothing about a
+/// generated key takes a different path through `upsertKey`
+/// (`src/modules/vault/store.ts`) than an imported one.
+///
+/// Rust rather than the frontend for the reason `ssh_key_inspect`'s own doc
+/// comment gives above: `crypto.subtle` is unavailable at the bundled app's
+/// origin.
+///
+/// Async and `spawn_blocking`, for the same reason `ssh_key_inspect` is:
+/// RSA-4096 generation runs a Miller-Rabin prime search that can take several
+/// seconds, and a sync command would freeze the WebView2 window for that span.
+#[tauri::command]
+pub async fn ssh_key_generate(
+    algorithm: String,
+    passphrase: Option<String>,
+    comment: Option<String>,
+) -> Result<SshKeyGenerated, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ssh_key_generate_inner(&algorithm, passphrase.as_deref(), comment.as_deref())
+    })
+    .await
+    .map_err(|e| format!("ssh_key_generate join error: {e}"))?
+}
+
+fn ssh_key_generate_inner(
+    algorithm: &str,
+    passphrase: Option<&str>,
+    comment: Option<&str>,
+) -> Result<SshKeyGenerated, String> {
+    let algo = parse_key_generate_algorithm(algorithm)?;
+    // `SysRng::try_fill_bytes` only fails if the OS RNG itself is unavailable;
+    // `UnwrapErr` turns that failure into a panic, which aborts the process
+    // under the release profile's `panic = "abort"` (a join error only in
+    // dev), rather than returning a key built from a failed RNG.
+    let mut rng = UnwrapErr(SysRng);
+    let mut key = PrivateKey::random(&mut rng, algo)
+        .map_err(|e| format!("ssh: could not generate key: {e}"))?;
+    if let Some(comment) = comment.map(str::trim).filter(|c| !c.is_empty()) {
+        key.set_comment(comment);
+    }
+    let pass = passphrase.filter(|p| !p.is_empty());
+    // Computed on `key` BEFORE it is (maybe) encrypted, and `encrypted` names
+    // the STORED form rather than `key`'s own (always-unencrypted) state:
+    // `PrivateKey::encrypt` (below) returns a value whose own public half is
+    // rebuilt from bare key data and carries no comment - `internal-russh-forked-ssh-key`
+    // 0.6.18's `PrivateKey::encrypt_with` constructs it as
+    // `self.public_key.key_data.clone().into()`, which drops the comment field
+    // entirely. That is the same asymmetry `ssh_key_inspect_inner` already
+    // relies on for an `openssh-key-v1` container inspected without its
+    // passphrase.
+    let info = key_info(&key, pass.is_some())?;
+    let stored = match pass {
+        Some(pass) => key
+            .encrypt(&mut rng, pass)
+            .map_err(|e| format!("ssh: could not encrypt generated key: {e}"))?,
+        None => key,
+    };
+    let pem = stored
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| format!("ssh: could not serialize generated key: {e}"))?;
+    Ok(SshKeyGenerated { pem, info })
+}
+
+#[tauri::command]
+pub async fn ssh_open(
+    app: AppHandle,
+    secrets: tauri::State<'_, SecretsState>,
+    state: tauri::State<'_, SshState>,
+    input: SshOpenInput,
+    on_event: Channel<SshEvent>,
+) -> Result<SshOpened, SshConnectError> {
+    // Before the spawn: `tauri::State` is borrowed from the invocation and
+    // cannot cross into the SSH runtime. A keychain read that fails is a
+    // `config` kind, which the frontend parks on - the same treatment a
+    // missing credential gets.
+    let secrets = resolve_secrets(&app, &secrets, &input).map_err(SshConnectError::config)?;
+    let rt = ssh_runtime();
+    let on_end = on_event.clone();
+    let session = rt
+        .spawn(session::connect(input, secrets, on_event))
+        .await
+        // A panicked or cancelled connect task says nothing about the host, so
+        // the next attempt may well succeed.
+        .map_err(|e| SshConnectError::transport(format!("ssh task join failed: {e}")))?
+        .map_err(|e| {
+            log::error!("ssh_open failed: {e:?}");
+            e
+        })?;
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    // Take the end receiver before handing the Arc to the map so the janitor
+    // can wait for the connection to end without racing another caller for
+    // the slot. It fires however the connection ends; an explicit `ssh_close`
+    // has already removed the id, so only a connection that ended on its own
+    // reaches the eviction and its `Disconnected`.
+    let ended = session.take_ended_signal();
+    let fingerprint = session.fingerprint.clone();
+    let sessions_handle = state.sessions.clone();
+    state.sessions.write().await.insert(id, session);
+    if let Some(rx) = ended {
+        rt.spawn(async move {
+            let _ = rx.await;
+            if sessions_handle.write().await.remove(&id).is_some() {
+                let _ = on_end.send(SshEvent::Disconnected);
+                log::info!("ssh session id={id} evicted after its connection ended");
+            }
+        });
+    }
+    log::info!("ssh opened id={id}");
+    Ok(SshOpened { id, fingerprint })
+}
+
+/// Look up one shell of one live session, for the commands that drive it.
+async fn shell_of(
+    state: &SshState,
+    id: u32,
+    shell_id: u32,
+    cmd: &str,
+) -> Result<Arc<SshShell>, String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| {
+            log::warn!("{cmd}: unknown id={id}");
+            "no session".to_string()
+        })?;
+    session.shell(shell_id).ok_or_else(|| {
+        log::warn!("{cmd}: unknown shell={shell_id} on id={id}");
+        "no shell".to_string()
+    })
+}
+
+const RESOURCE_STREAM_BEGIN: &str = "__TERVIA_RESOURCE_BEGIN__";
+const RESOURCE_STREAM_END: &str = "__TERVIA_RESOURCE_END__";
+const RESOURCE_STREAM_SCRIPT: &str = r#"first=1;tick=0;while :; do printf '\n__TERVIA_RESOURCE_BEGIN__\n'; if [ "$first" -eq 1 ]; then printf 'HOST\n'; hostname 2>/dev/null; printf 'VERSION\n'; uname -sr 2>/dev/null; first=0; fi; awk 'BEGIN { printf "UPTIME\n"; if ((getline line < "/proc/uptime") > 0) { split(line, a); print a[1] } close("/proc/uptime"); printf "CPU\n"; while ((getline line < "/proc/stat") > 0) { if (line ~ /^cpu /) { print line; break } } close("/proc/stat"); printf "MEM\n"; while ((getline line < "/proc/meminfo") > 0) { if (line ~ /^(MemTotal|MemAvailable|Cached|Buffers):/) print line } close("/proc/meminfo"); printf "NET\n"; n=0; while ((getline line < "/proc/net/dev") > 0) { if (++n > 2) print line } close("/proc/net/dev"); printf "DISK\n"; while ((getline line < "/proc/diskstats") > 0) { sub(/^[ \t]+/, "", line); split(line, f, /[ \t]+/); name=f[3]; if (name ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$/) print line } close("/proc/diskstats") }'; if [ "$tick" -eq 0 ] && command -v timeout >/dev/null 2>&1; then printf 'FS\n'; timeout 3 df -Pk / 2>/dev/null; fi; printf '__TERVIA_RESOURCE_END__\n'; tick=$(( (tick + 1) % 30 )); sleep 1 || exit 0; done"#;
+
+fn resource_stream_command() -> String {
+    format!("sh -c {}", shell_quote(RESOURCE_STREAM_SCRIPT))
+}
+
+fn parse_resource_stream_chunk(
+    pending: &mut String,
+    frame: &mut Option<String>,
+    chunk: &[u8],
+) -> Result<Vec<SshResourceSample>, String> {
+    const FRAME_CAP: usize = 4 * 1024 * 1024;
+    let mut samples = Vec::new();
+    pending.push_str(&String::from_utf8_lossy(chunk));
+    let mut consumed = 0;
+    while let Some(relative_newline) = pending[consumed..].find('\n') {
+        let newline = consumed + relative_newline;
+        let line = pending[consumed..newline].trim_end_matches('\r');
+        if line == RESOURCE_STREAM_BEGIN {
+            *frame = Some(String::new());
+        } else if line == RESOURCE_STREAM_END {
+            if let Some(raw) = frame.take() {
+                samples.push(parse_resource_sample(&raw));
+            }
+        } else if let Some(raw) = frame.as_mut() {
+            raw.push_str(line);
+            raw.push('\n');
+            if raw.len() > FRAME_CAP {
+                return Err("ssh resource sample exceeded 4 MiB".to_string());
+            }
+        }
+        consumed = newline + 1;
+    }
+    if consumed > 0 {
+        pending.drain(..consumed);
+    }
+    if pending.len() > FRAME_CAP {
+        return Err("ssh resource stream line exceeded 4 MiB".to_string());
+    }
+    Ok(samples)
+}
+
+fn consume_resource_stream_chunk(
+    pending: &mut String,
+    frame: &mut Option<String>,
+    chunk: &[u8],
+    on_event: &Channel<SshResourceStreamEvent>,
+) -> Result<bool, String> {
+    let samples = parse_resource_stream_chunk(pending, frame, chunk)?;
+    let completed_sample = !samples.is_empty();
+    for sample in samples {
+        on_event
+            .send(SshResourceStreamEvent::Sample { sample })
+            .map_err(|error| format!("ssh resource IPC channel failed: {error}"))?;
+    }
+    Ok(completed_sample)
+}
+
+fn parse_local_ping_latency(output: &str) -> Option<f64> {
+    for line in output.lines() {
+        let lowercase = line.to_lowercase();
+        let marker = [
+            "time=",
+            "time<",
+            "zeit=",
+            "zeit<",
+            "temps=",
+            "temps<",
+            "время=",
+            "время<",
+        ]
+        .iter()
+        .filter_map(|marker| lowercase.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index);
+        let Some((start, marker)) = marker else {
+            continue;
+        };
+        let rest = &lowercase[start + marker.len()..];
+        let number_len = rest
+            .chars()
+            .take_while(|character| character.is_ascii_digit() || matches!(character, '.' | ','))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if number_len == 0 {
+            continue;
+        }
+        let unit = rest[number_len..].trim_start();
+        if !unit.starts_with("ms") && !unit.starts_with("мс") {
+            continue;
+        }
+        let milliseconds = rest[..number_len].replace(',', ".").parse::<f64>().ok()?;
+        return Some(if marker.ends_with('<') {
+            0.5
+        } else {
+            milliseconds
+        });
+    }
+    None
+}
+
+fn run_local_ping(host: &str) -> Option<f64> {
+    if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let mut command = std::process::Command::new("ping");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command.args(["-n", "1", "-w", "1000"]);
+    }
+    #[cfg(target_os = "macos")]
+    command.args(["-n", "-c", "1", "-W", "1000"]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    command.args(["-n", "-c", "1", "-W", "1"]);
+    #[cfg(not(any(unix, target_os = "windows")))]
+    return None;
+
+    let mut child = command
+        .arg(host)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started_at = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
+                if !status.success() {
+                    return None;
+                }
+                return parse_local_ping_latency(&String::from_utf8_lossy(&output.stdout));
+            }
+            Ok(None) if started_at.elapsed() < std::time::Duration::from_millis(1500) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+async fn stream_local_ping(
+    host: String,
+    mut cancel: watch::Receiver<bool>,
+    on_event: Channel<SshResourceStreamEvent>,
+) {
+    // This is local ICMP, not a probe through SSH. ProxyJump sessions skip the
+    // task in `ssh_resource_stream_start`; see `KNOWN-LIMITS.md`.
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                let target = host.clone();
+                let ping = tokio::task::spawn_blocking(move || run_local_ping(&target));
+                let latency_ms = tokio::select! {
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                    result = ping => result.ok().flatten(),
+                };
+                if on_event.send(SshResourceStreamEvent::Ping {
+                    host: host.clone(),
+                    latency_ms,
+                }).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Start the optional remote sampler. The stream ID is minted by Rust and
+/// belongs to the SSH session, which keeps cancellation valid in release
+/// builds and makes the session the owner of its extra SSH channel. Platform,
+/// retry, and connection limits are documented in `KNOWN-LIMITS.md`.
+#[tauri::command]
+pub async fn ssh_resource_stream_start(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    on_event: Channel<SshResourceStreamEvent>,
+) -> Result<SshResourceStreamStart, String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no SSH session".to_string())?;
+
+    let (stream_id, cancel_rx) = session.begin_resource_stream()?;
+    let ping_enabled = !session.has_jump_hosts();
+    let ping_cancel = cancel_rx.clone();
+    let ping_host = session.target_host().to_string();
+    let ping_channel = on_event.clone();
+    ssh_runtime().spawn(async move {
+        let ping_task = ping_enabled
+            .then(|| ssh_runtime().spawn(stream_local_ping(ping_host, ping_cancel, ping_channel)));
+        let command = resource_stream_command();
+        let mut pending = String::new();
+        let mut frame = None;
+        let result = session
+            .exec_stream(&command, cancel_rx, |chunk| {
+                consume_resource_stream_chunk(&mut pending, &mut frame, chunk, &on_event)
+            })
+            .await;
+
+        session.stop_resource_stream(stream_id);
+        if let Some(ping_task) = ping_task {
+            let _ = ping_task.await;
+        }
+        if let Err(error) = result {
+            let _ = on_event.send(SshResourceStreamEvent::Error { message: error });
+        }
+    });
+    Ok(SshResourceStreamStart {
+        stream_id,
+        ping_enabled,
+    })
+}
+
+/// Stop just the monitor started by this status bar instance.
+#[tauri::command]
+pub async fn ssh_resource_stream_stop(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    stream_id: u32,
+) -> Result<(), String> {
+    if let Some(session) = state.sessions.read().await.get(&id) {
+        session.stop_resource_stream(stream_id);
+    }
+    Ok(())
+}
+
+/// Open one more interactive shell (a terminal tab) on the live session `id`,
+/// streaming its output to `on_event`. Returns the shell's id within the
+/// session.
+#[tauri::command]
+pub async fn ssh_shell_open(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    cols: u16,
+    rows: u16,
+    on_event: Channel<SshEvent>,
+) -> Result<u32, String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| {
+            log::warn!("ssh_shell_open: unknown id={id}");
+            "no session".to_string()
+        })?;
+    // On the SSH runtime, not tauri's: the pump and the russh channel it
+    // drains must be driven by the same reactor.
+    let shell_id = ssh_runtime()
+        .spawn(async move { session.open_shell(cols, rows, on_event).await })
+        .await
+        .map_err(|e| format!("ssh shell task join failed: {e}"))??;
+    log::info!("ssh shell opened id={id} shell={shell_id}");
+    Ok(shell_id)
+}
+
+#[tauri::command]
+pub async fn ssh_shell_write(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    shell_id: u32,
+    data: String,
+) -> Result<(), String> {
+    shell_of(&state, id, shell_id, "ssh_shell_write")
+        .await?
+        .write(data.as_bytes())
+        .await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_resize(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    shell_id: u32,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    shell_of(&state, id, shell_id, "ssh_shell_resize")
+        .await?
+        .resize(cols, rows)
+        .await
+}
+
+/// Close one shell, leaving the session and its other shells up. Idempotent:
+/// an unknown session or shell - already ended, or already closed - is `Ok`.
+#[tauri::command]
+pub async fn ssh_shell_close(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    shell_id: u32,
+) -> Result<(), String> {
+    let session = state.sessions.read().await.get(&id).cloned();
+    if let Some(s) = session {
+        if s.close_shell(shell_id).await {
+            log::info!("ssh shell closed id={id} shell={shell_id}");
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ssh_close(state: tauri::State<'_, SshState>, id: u32) -> Result<(), String> {
+    let session = state.sessions.write().await.remove(&id);
+    if let Some(s) = session {
+        s.close().await;
+        log::info!("ssh closed id={id}");
+    } else {
+        log::debug!("ssh_close: unknown id={id}");
+    }
+    Ok(())
+}
+
+/// What names ONE live `ssh -L` listener, and the whole of what
+/// `ssh_forward_close` accepts.
+///
+/// A struct rather than a tuple because a tuple crosses the IPC as a positional
+/// array: the frontend would read `[port, generation]`, and a half that
+/// reordered or dropped one of them would be a silent re-interpretation instead
+/// of a field name that stopped resolving.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshForwardHandle {
+    /// The port actually bound, which for a request of 0 is not the number that
+    /// was sent.
+    pub bound_port: u16,
+    /// Unique within this session, so it names THIS listener on `bound_port`
+    /// rather than whichever one holds that port later. The port alone cannot:
+    /// a Stop frees it immediately and the next Start rebinds the same number.
+    /// `abort_forward` in `session.rs` is where the comparison is made and
+    /// where the consequence of dropping it is written out.
+    pub generation: u64,
+}
+
+/// `ssh -L`: bind `127.0.0.1:local_port` on this machine and tunnel every
+/// connection to `remote_host:remote_port` as resolved from the SERVER, over
+/// the live session `id` (so a ProxyJump chain applies for free). `local_port`
+/// 0 picks a free port; the `SshForwardHandle` naming the listener is returned,
+/// and BOTH of its halves have to come back to `ssh_forward_close`.
+///
+/// One forward at a time: `ssh_forward_close` below stops a single listener
+/// without touching the session, and the session's own teardown drops whatever
+/// is left.
+#[tauri::command]
+pub async fn ssh_forward_open(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+) -> Result<SshForwardHandle, String> {
+    let remote_host = remote_host.trim().to_string();
+    if remote_host.is_empty() {
+        return Err("ssh: port forward needs a remote host".into());
+    }
+    if remote_port == 0 {
+        return Err("ssh: port forward needs a remote port".into());
+    }
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| {
+            log::warn!("ssh_forward_open: unknown id={id}");
+            "no session".to_string()
+        })?;
+    // Bind and accept on the SSH runtime, not tauri's: the listener and the
+    // russh channels it feeds must be driven by the same reactor.
+    let (bound_port, generation) = ssh_runtime()
+        .spawn(async move {
+            session
+                .open_forward(local_port, remote_host, remote_port)
+                .await
+        })
+        .await
+        .map_err(|e| format!("ssh forward task join failed: {e}"))??;
+    Ok(SshForwardHandle {
+        bound_port,
+        generation,
+    })
+}
+
+/// Close ONE `ssh -L` listener without touching the session.
+///
+/// `ssh_forward_open`'s doc comment above used to say a close command did not
+/// exist on purpose. That was true while forwards were declared on a saved
+/// connection and re-opened on every connect; a Port Forwarding page with a
+/// Stop button needs one listener to go away while the session and its other
+/// forwards stay up.
+///
+/// Returns `false` for an unknown session, an unknown port, or a `generation`
+/// the port has moved past, rather than `Err`. That is the opposite of
+/// `ssh_forward_open`, which errors on an unknown id, and the asymmetry is the
+/// point: an open that cannot find its session has failed at the thing it was
+/// asked to do, while a close that cannot find its forward has arrived at the
+/// state it was asked for.
+///
+/// `generation` is what makes the third of those cases exist, and it is why a
+/// port is not enough to name a forward: aborting a listener frees its port
+/// immediately, so a Stop followed by a Start on the same pinned port has two
+/// listeners under one key in sequence, and a close still in flight from the
+/// first would abort the second. `abort_forward` in `session.rs` makes the
+/// comparison; the frontend keeps the pair together in `SshForwardHandle`
+/// (`src/modules/ssh/bridge.ts`).
+///
+/// What this does NOT do, and the UI has to say so: aborting the accept task
+/// drops the listener, so the local port is immediately rebindable and no new
+/// connection is accepted - but every connection already established runs in
+/// its own `copy_bidirectional` task (`SshSession::open_forward` in
+/// `src-tauri/src/modules/ssh/session.rs`) until one side closes.
+/// That is what OpenSSH does when a `-L` is cancelled at runtime.
+#[tauri::command]
+pub async fn ssh_forward_close(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    bound_port: u16,
+    generation: u64,
+) -> Result<bool, String> {
+    let Some(session) = state.sessions.read().await.get(&id).cloned() else {
+        log::debug!("ssh_forward_close: unknown id={id}");
+        return Ok(false);
+    };
+    Ok(session.close_forward(bound_port, generation).await)
+}
+
+/// Blank `bind_address` - an empty field left on the form, or the frontend's
+/// own default - means "let the server pick its own bind address", the same
+/// as a blank OpenSSH `-R` bind address, so it is normalised to `"localhost"`
+/// once here rather than in each of `ssh_remote_forward_open` and
+/// `ssh_remote_forward_close` separately.
+fn normalize_bind_address(bind_address: String) -> String {
+    let trimmed = bind_address.trim();
+    if trimmed.is_empty() {
+        "localhost".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `ssh -R`: ask the server to listen on `bind_address:bind_port`
+/// (`bind_port` 0 lets the SERVER pick) and route every connection it accepts
+/// back to `local_host:local_port` on THIS machine, over the live session
+/// `id` - `SshSession::open_remote_forward` in `session.rs` is where that
+/// routing actually happens, through the target hop's
+/// `HostKeyVerifier::server_channel_open_forwarded_tcpip` override. Returns
+/// the `SshForwardHandle` shape `ssh_forward_open` does; both halves have to
+/// come back to `ssh_remote_forward_close`.
+#[tauri::command]
+pub async fn ssh_remote_forward_open(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    bind_address: String,
+    bind_port: u16,
+    local_host: String,
+    local_port: u16,
+) -> Result<SshForwardHandle, String> {
+    let bind_address = normalize_bind_address(bind_address);
+    let local_host = local_host.trim().to_string();
+    if local_host.is_empty() {
+        return Err("ssh: remote forward needs a local target host".into());
+    }
+    if local_port == 0 {
+        return Err("ssh: remote forward needs a local target port".into());
+    }
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| {
+            log::warn!("ssh_remote_forward_open: unknown id={id}");
+            "no session".to_string()
+        })?;
+    let (bound_port, generation) = ssh_runtime()
+        .spawn(async move {
+            session
+                .open_remote_forward(bind_address, bind_port, local_host, local_port)
+                .await
+        })
+        .await
+        .map_err(|e| format!("ssh remote forward task join failed: {e}"))??;
+    Ok(SshForwardHandle {
+        bound_port,
+        generation,
+    })
+}
+
+/// Close ONE `-R` listener without touching the session - the same contract
+/// `ssh_forward_close` has for `-L`. `false` for an unknown session, an
+/// unknown port, or a `generation` a later open has moved past.
+#[tauri::command]
+pub async fn ssh_remote_forward_close(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    bind_address: String,
+    bound_port: u16,
+    generation: u64,
+) -> Result<bool, String> {
+    let Some(session) = state.sessions.read().await.get(&id).cloned() else {
+        log::debug!("ssh_remote_forward_close: unknown id={id}");
+        return Ok(false);
+    };
+    let bind_address = normalize_bind_address(bind_address);
+    ssh_runtime()
+        .spawn(async move {
+            session
+                .close_remote_forward(bind_address, bound_port, generation)
+                .await
+        })
+        .await
+        .map_err(|e| format!("ssh remote forward close task join failed: {e}"))?
+}
+
+/// `ssh -D`: bind a local SOCKS5 listener on `127.0.0.1:local_port` (0 picks a
+/// free port) over the live session `id`. `SshSession::open_socks` in
+/// `session.rs` speaks the minimal RFC 1928 subset a working proxy needs and
+/// opens one `channel_open_direct_tcpip` per accepted CONNECT - the same call
+/// `ssh_forward_open` makes for `-L`. Returns the SAME `SshForwardHandle`
+/// shape `-L` does, and closes through the SAME `ssh_forward_close`: a SOCKS5
+/// listener lives in the identical per-session forward map `-L`'s does, so it
+/// needs no close command of its own.
+#[tauri::command]
+pub async fn ssh_socks_open(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    local_port: u16,
+) -> Result<SshForwardHandle, String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| {
+            log::warn!("ssh_socks_open: unknown id={id}");
+            "no session".to_string()
+        })?;
+    let (bound_port, generation) = ssh_runtime()
+        .spawn(async move { session.open_socks(local_port).await })
+        .await
+        .map_err(|e| format!("ssh socks task join failed: {e}"))??;
+    Ok(SshForwardHandle {
+        bound_port,
+        generation,
+    })
+}
+
+/// Answer a first-connect `HostKeyPrompt`. `accept = true` lets the paused
+/// handshake proceed (and the connection pins the fingerprint on success);
+/// `accept = false` aborts the connect before any credential is sent. Called
+/// by the frontend confirmation dialog. No-op (Err) if the prompt already
+/// timed out or was answered.
+#[tauri::command]
+pub fn ssh_confirm_host_key(prompt_id: String, accept: bool) -> Result<(), String> {
+    match session::take_pending_host_key(&prompt_id) {
+        Some(tx) => {
+            // Receiver may already be gone if the connect timed out; ignore.
+            let _ = tx.send(accept);
+            Ok(())
+        }
+        None => Err("ssh: unknown or already-answered host-key prompt".into()),
+    }
+}
+
+/// Metadata for one live SSH shell, returned by `ssh_list_sessions`. Lets the
+/// remote-access bridge enumerate SSH tabs the GUI has open (they live here, not
+/// in the PTY daemon) before attaching to mirror them.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshSessionInfo {
+    pub id: u32,
+    pub shell_id: u32,
+    pub host: String,
+    pub user: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub alive: bool,
+    pub created_at_ms: u64,
+}
+
+#[tauri::command]
+pub async fn ssh_list_sessions(
+    state: tauri::State<'_, SshState>,
+) -> Result<Vec<SshSessionInfo>, String> {
+    let map = state.sessions.read().await;
+    let mut out = Vec::with_capacity(map.len());
+    for (id, s) in map.iter() {
+        for (shell_id, host, user, cols, rows, alive, created_at_ms) in s.shell_infos() {
+            out.push(SshSessionInfo {
+                id: *id,
+                shell_id,
+                host,
+                user,
+                cols,
+                rows,
+                alive,
+                created_at_ms,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Attach an additional event sink to one shell of an existing SSH session so
+/// a second consumer (the remote-access bridge) mirrors its output + writes
+/// input via `ssh_shell_write`. Replays the recent ring on attach. Returns
+/// `alive`.
+#[tauri::command]
+pub async fn ssh_attach(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    shell_id: u32,
+    on_event: Channel<SshEvent>,
+) -> Result<bool, String> {
+    Ok(shell_of(&state, id, shell_id, "ssh_attach")
+        .await?
+        .add_mirror_sink(on_event))
+}
+
+/// Single-quote a value for a POSIX shell so a remote-supplied path can never
+/// break out of its argument. `cwd` reaches us from the remote shell's OSC 7
+/// escape, i.e. it is attacker-controlled if the host is compromised.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Last non-empty line of a remote command's stdout.
+///
+/// sshd runs an exec request through the user's login shell, and bash sources
+/// `~/.bashrc` on that path, so anything an rc file echoes (a greeting, nvm /
+/// conda / direnv chatter) is prepended to the output we asked for. Every value
+/// we read back is single-line, so the last line is the answer.
+fn last_line(s: &str) -> &str {
+    s.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+
+/// `git status` for the repo containing `cwd` on the remote, so Source Control
+/// follows the machine you are working on instead of the local workspace. The
+/// caller picks `cwd` (the folder the Remote tree is browsing, else the SSH
+/// terminal's OSC 7 cwd); empty means the remote login directory.
+///
+/// Read-only by design: it reuses the existing porcelain parsers but skips the
+/// numstat / line-count enrichment, which reads the LOCAL disk. `added`,
+/// `removed` and `binary` therefore stay at their defaults for remote entries.
+#[tauri::command]
+pub async fn ssh_git_status(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    cwd: String,
+) -> Result<crate::modules::git::commands::GitStatus, String> {
+    use crate::modules::git::commands::{parse_branch_header, parse_porcelain_v1, GitStatus};
+
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no session".to_string())?;
+
+    let not_a_repo = || GitStatus {
+        is_repo: false,
+        root: None,
+        branch: None,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        changes: Vec::new(),
+    };
+
+    let cd = if cwd.is_empty() {
+        String::new()
+    } else {
+        format!("-C {} ", shell_quote(&cwd))
+    };
+    // No `2>/dev/null`: stderr arrives on its own channel, so it cannot mix into
+    // stdout, and dropping it is what made every failure look like "no repo".
+    let root = match session
+        .exec_capture(&format!("git {cd}rev-parse --show-toplevel"))
+        .await
+    {
+        Ok(s) => s,
+        // The one expected failure. Anything else (git not on sshd's PATH,
+        // dubious ownership, a cwd that no longer exists, exec denied) is a real
+        // error the user needs to read, not a silent empty panel.
+        //
+        // Matching on git's English text is safe here: we send no env, so an
+        // sshd exec channel runs in the C locale and git does not translate.
+        Err(e) if e.contains("not a git repository") => return Ok(not_a_repo()),
+        Err(e) => return Err(e),
+    };
+    let root = last_line(&root);
+    if root.is_empty() {
+        return Ok(not_a_repo());
+    }
+
+    let raw = session
+        .exec_capture(&format!(
+            "git -C {} status --porcelain=v1 --branch -z --untracked-files=all",
+            shell_quote(root)
+        ))
+        .await?;
+    // `--branch` always emits a header, so this is only reachable when the
+    // remote git was killed by a signal: russh reports that as ExitSignal, not
+    // ExitStatus, so `exit` stays 0 and we get a successful-looking empty read.
+    if raw.is_empty() {
+        return Ok(not_a_repo());
+    }
+    // The `--branch` header is the first -z record; the rest are file entries.
+    let (header, entries) = raw.split_once('\0').unwrap_or((raw.as_str(), ""));
+    // Same rc-noise guard as the root above, so a chatty ~/.bashrc can't be
+    // parsed as the branch name.
+    let header = last_line(header);
+    let (branch, upstream, ahead, behind) = parse_branch_header(header);
+    Ok(GitStatus {
+        is_repo: true,
+        root: Some(root.to_string()),
+        branch,
+        upstream,
+        ahead,
+        behind,
+        // `root.join(rel)` on a Windows host yields a mixed separator, which
+        // the parser's `to_forward` normalizes back to a POSIX path.
+        changes: parse_porcelain_v1(std::path::Path::new(root), entries),
+    })
+}
+
+/// Run one whitelisted git subcommand in `cwd` on the remote and return its
+/// stdout; a non-zero exit is an `Err` carrying the remote's stderr.
+///
+/// The counterpart to `git_run`, taking the identical argument vector, so the
+/// Source Control panel drives a remote repository through the same code path
+/// as a local one instead of a parallel remote-only implementation. Every
+/// argument is single-quoted before it reaches the remote shell, and the
+/// subcommand is held to the same list as the local runner.
+#[tauri::command]
+pub async fn ssh_git(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    cwd: String,
+    args: Vec<String>,
+) -> Result<String, String> {
+    crate::modules::git::commands::check_args(&args)?;
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no session".to_string())?;
+
+    let mut cmd = String::from("git");
+    if !cwd.is_empty() {
+        cmd.push_str(" -C ");
+        cmd.push_str(&shell_quote(&cwd));
+    }
+    for a in &args {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(a));
+    }
+    session.exec_capture(&cmd).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_whole_disk, last_line, parse_local_ping_latency, parse_resource_sample,
+        parse_resource_stream_chunk, shell_quote, ssh_key_classify_inner, ssh_key_generate_inner,
+        ssh_key_inspect_inner, SshTextClassification, SysRng, UnwrapErr, ERR_EMPTY,
+        ERR_OPENSSH_BODY, ERR_PASSPHRASE_OR_CORRUPT, ERR_UNKNOWN, ERR_UNREADABLE,
+        ERR_WRONG_PASSPHRASE,
+    };
+
+    #[cfg(unix)]
+    use super::resource_stream_command;
+
+    /// `ssh-keygen -t ed25519 -N '' -C tervia-test@localhost`.
+    const PLAIN_ED25519: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACCpiSS98IJopmYjIYYYws9TOgU3Ea4xkeK/EOt/MFC7DgAAAJgXJ7ZJFye2
+SQAAAAtzc2gtZWQyNTUxOQAAACCpiSS98IJopmYjIYYYws9TOgU3Ea4xkeK/EOt/MFC7Dg
+AAAEDH4z8V4hBdxn69onazIThdJ8CfUxtV6E2q/d90hwg0NamJJL3wgmimZiMhhhjCz1M6
+BTcRrjGR4r8Q638wULsOAAAAFXRlcnZpYS10ZXN0QGxvY2FsaG9zdA==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// Same generator, `-N 'correct horse' -C locked@localhost`. Sealed with
+    /// aes256-ctr + bcrypt, i.e. what `ssh-keygen` writes today.
+    const LOCKED_ED25519: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABCwylXWi+
+kiYmMux9+mAHW7AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIIV04PSMQuoltd8p
+xWSst9WNSgq6TbtLy8n97mOwx0fCAAAAoPWSFxWm0Yr2fDdXJIGaXhv574j3UhPQn3/aPd
+fS9FItOIt5N/GdGWGlAmky6lVGOYgGn4/UvCO9fqbbPjiviHZTu+RLlfn1sJQMW8v/5Y9T
+qnNmSdmyWZ6SzYQKSVg3Zs20dzS/AZE8Q6O6vMvTR75vPl9ROvzNQZo9bkPuuuwW+A3tth
+wjku8Bjzhc/ZHJ8MP4SAn9x5GySFuup/SKJ+E=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    const LOCKED_PASSPHRASE: &str = "correct horse";
+
+    /// The `.pub` half of `LOCKED_ED25519`, as the file on disk holds it.
+    const LOCKED_PUB: &str = "ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIIV04PSMQuoltd8pxWSst9WNSgq6TbtLy8n97mOwx0fC locked@localhost
+";
+
+    /// `ssh-keygen -e -m PKCS8` (or `openssl pkey -pubout`) over an unrelated
+    /// Ed25519 key: SubjectPublicKeyInfo, the PEM shape a user gets from
+    /// re-encoding their `.pub` file, not just the bare `ssh-ed25519 ...` line.
+    const PEM_PUBLIC_KEY: &str = "\
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAbs85KIUTamLr4OvfDmLEO74OpTXKm6pyFFCLdlLhYd4=
+-----END PUBLIC KEY-----
+";
+
+    /// `openssl rsa -in key.pem -RSAPublicKey_out`: PKCS#1's own public form,
+    /// distinct from the SubjectPublicKeyInfo one above.
+    const PEM_RSA_PUBLIC_KEY: &str = "\
+-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEAx1AI3he4sbMMg+T8xX7bwAdu2DWL6hQVhETToDeqJcWEORq/NDk0
+tjQNeoXC/RCerKA8XycykuF3Zezyr/+1qHhhUeOl2S+so65R9IH+LCzbp2sZFqG+
+qhEOb19emMcmlO7z1pmCfYx0dxuBqOJjIMS+tKr84+enWSaHyHet/aoMjUOXTJTO
+nqtJeMrRZZM7htLsycZ2bLkykuOfSfN0axbymKPz2EpOZ7O124PxzMfZIFSbaQjf
+zab6fud4hufXIrVuI6/hXANa/NxXQe1NG1YdFGy6O58Uh09hWxphRR66AJCWMfwf
+1O6JanFfHZGdO8dHMevhjJOoDl1LjjNY+wIDAQAB
+-----END RSA PUBLIC KEY-----
+";
+
+    /// The five-dash `-----BEGIN SSH2 PUBLIC KEY-----` spelling `classify`
+    /// matches in its main scan - distinct from the real RFC 4716 delimiter
+    /// (`---- BEGIN SSH2 PUBLIC KEY ----`, four dashes with a space) that only
+    /// the no-BEGIN-marker fallback recognises. Body content is never parsed
+    /// for a `PublicKey` verdict, so any base64-shaped filler is fine.
+    const PEM_SSH2_PUBLIC_KEY: &str = "\
+-----BEGIN SSH2 PUBLIC KEY-----
+Comment: \"locked@localhost\"
+AAAAC3NzaC1lZDI1NTE5AAAAIIV04PSMQuoltd8pxWSst9WNSgq6TbtLy8n97mOwx0fC
+-----END SSH2 PUBLIC KEY-----
+";
+
+    /// `openssl pkcs8 -topk8 -v2 aes-256-cbc` over an Ed25519 key. PKCS#8 seals
+    /// the public half too, which is what makes it the `parsed: false` case.
+    const LOCKED_PKCS8: &str = "\
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIGbMFcGCSqGSIb3DQEFDTBKMCkGCSqGSIb3DQEFDDAcBAgwfFRyLE9zWAICCAAw
+DAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEELjoxHK6zugwvcWrUOvS+BgEQL2v
+mK+rW02yV3neLVo54432BYqBtEx0YS330rlSCGuoCr/xtFkRhVmIomUdBkLAHLaW
+NFLh6spvancYRsI2aeg=
+-----END ENCRYPTED PRIVATE KEY-----
+";
+
+    /// Unlike `LOCKED_PKCS8` above, this one's passphrase is known, so a test
+    /// can prove a successful decrypt rather than only the locked state.
+    /// `openssl genpkey -algorithm ed25519 | openssl pkcs8 -topk8 -v2 \
+    /// aes-256-cbc -passout pass:"correct horse"`.
+    const PKCS8_WITH_PASSPHRASE: &str = "\
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIGbMFcGCSqGSIb3DQEFDTBKMCkGCSqGSIb3DQEFDDAcBAikhE7BR4YNCAICCAAw
+DAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEKIjpvTXc999fuVotdE2JkMEQMCP
+ofFkAiIlNcNnazc463ZNbpAlYoNR+P8z5ZoTM4HIZKbYN5Mv52sNyVzkTsRR+Gm5
+KNd5sJnk8aPMfCfuMgw=
+-----END ENCRYPTED PRIVATE KEY-----
+";
+
+    const PKCS8_PASSPHRASE: &str = "correct horse";
+
+    /// `PKCS8_WITH_PASSPHRASE` with its last body line cut - a paste stopped
+    /// short before the `-----END` marker.
+    const PKCS8_TRUNCATED: &str = "\
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIGbMFcGCSqGSIb3DQEFDTBKMCkGCSqGSIb3DQEFDDAcBAikhE7BR4YNCAICCAAw
+DAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEKIjpvTXc999fuVotdE2JkMEQMCP
+ofFkAiIlNcNnazc463ZNbpAlYoNR+P8z5ZoTM4HIZKbYN5Mv52sNyVzkTsRR+Gm5
+-----END ENCRYPTED PRIVATE KEY-----
+";
+
+    /// `openssl ecparam -name prime256v1 -genkey`: SEC1, not PKCS#8.
+    const SEC1_EC: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIF+Z87dQ+QZ7HKVouBriKFkmgwSQkFmU07SO7mw0mP4/oAoGCCqGSM49
+AwEHoUQDQgAErb3d6eqMzYQ2LKS02m6gajVJ/Rioqr8Ua03ulJiJUsWO7xqYtppl
+j5UVz/3hnNtMPH5LS8Ch+X/SqvjoyTix5A==
+-----END EC PRIVATE KEY-----
+";
+
+    /// `openssl dsaparam -genkey 1024` then `openssl pkey -traditional`.
+    const DSA_KEY: &str = "\
+-----BEGIN DSA PRIVATE KEY-----
+MIIBygIBAAKBgQCwOgKbIx8T+tWvMkuiqFapRCtwsOA2/ZlI+GeZQNxSPtCgNnTu
+5glKxTjc05dmpX/oMMRVLJ0hcw/wHNeg7M3GW2zTEgMNTfF9t06s8X20tgFbuH9a
+TqSb7ysMX/VERF+//dQuDIi454V1BWAaClUHekFtxhjbxHdpi/6tAIImbQIdALJV
+3k0qGonFe97i3IRYsLSqXJVsEBdM2NDIhLECgYAJWCRBRT01gP57qNyTV8RoZMnb
+4370twOlDyW2AIrc92QODU1UGIvcQIR0QddGAPRogxRZdHXJiH01pux3DAqfjebv
+5WT5HN7sxTqz3aOCMmkPwpKlt7QwGgRPY1QKPgT9hPtEGg6Sr2HpKMS3W6Qmriw2
+e2zta+WiCVDqhYd9lwKBgF3FTTUClJ2mWFPNxp+b7fnv00wbiCU5jxCuUB2kJPhg
+D/yuNSIgX20n7qqEjVIcmmPKBpATO6l2qAfULsdHtXTuDXapAg2cNSax1VnIVnwy
+uBL9s7PvVY1A2gLfCEIMmm1TgQev0OKPkH9IU/SKbA3aD+sHLEKMzZAoA7kw+7Lm
+AhwCeWeDtuExuzPD2Rg81xs9YHAnUA1ZGBDZniIh
+-----END DSA PRIVATE KEY-----
+";
+
+    /// The shape a modern `ssh-keygen -t dsa -N ''` actually writes:
+    /// `openssh-key-v1` carrying `ssh-dss`, NOT the PEM `DSA_KEY` above. This is
+    /// the reachable DSA case - it classifies as `OpenSsh`, parses, and was
+    /// reported with full facts until the guard moved onto the algorithm.
+    /// `-C dsa-plain@tervia`, OpenSSH 9.6p1.
+    const DSA_OPENSSH: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABsQAAAAdzc2gtZH
+NzAAAAgQCh0uAznz/kP76VCW0co1cEdLQyl2RFapJztA+v+098InkCxp12YDnv0oXd3CPu
+SFT344Ncy96GaaHJ40xJSktAay5XQJzQ/Ilthf7TRqgs2ozxPVkua9mtD84g81nsrn/mQK
+Ojg+RcVew1r0E8AK26SE6WTzJ7JYF9QpDreKmUyQAAABUAgMSrJyqPBBbDkdIDojnB8Pza
+CZMAAACALUyQt1mYIEdhKyIhJXYO3oVTptIcP9kYD6Mm8CED6EwH7LVmvESIdBMJCy7CiE
+TTRGImWKd//R0WjABMyuhtKoZBlQSiEbi5WsjlCyL9Z28j+OPwPakYSt7dw43qb0CMJvtO
+5bKcy2ZGhV2XM9DChBk5D3ZX42Y3VU63kf2qrdsAAACAaTywEM2QbW94Xi8Y/wVUEIzr9C
+Kv52MsFs7swPWWcGCWwtEylesSWeyWVJP4Ic/lK1czJNIpRDIxOJ8TrxJUaQqu7BK0KyG/
+CJqRwjyR1R3++2RlcvqFATsMnziOsKuiCxlEiiQVcKy4Jrb7lKH1JdOREiRumvjp8hunYH
+Bo3XgAAAHo42Id0uNiHdIAAAAHc3NoLWRzcwAAAIEAodLgM58/5D++lQltHKNXBHS0Mpdk
+RWqSc7QPr/tPfCJ5AsaddmA579KF3dwj7khU9+ODXMvehmmhyeNMSUpLQGsuV0Cc0PyJbY
+X+00aoLNqM8T1ZLmvZrQ/OIPNZ7K5/5kCjo4PkXFXsNa9BPACtukhOlk8yeyWBfUKQ63ip
+lMkAAAAVAIDEqycqjwQWw5HSA6I5wfD82gmTAAAAgC1MkLdZmCBHYSsiISV2Dt6FU6bSHD
+/ZGA+jJvAhA+hMB+y1ZrxEiHQTCQsuwohE00RiJlinf/0dFowATMrobSqGQZUEohG4uVrI
+5Qsi/WdvI/jj8D2pGEre3cON6m9AjCb7TuWynMtmRoVdlzPQwoQZOQ92V+NmN1VOt5H9qq
+3bAAAAgGk8sBDNkG1veF4vGP8FVBCM6/Qir+djLBbO7MD1lnBglsLRMpXrElnsllST+CHP
+5StXMyTSKUQyMTifE68SVGkKruwStCshvwiakcI8kdUd/vtkZXL6hQE7DJ84jrCrogsZRI
+okFXCsuCa2+5Sh9SXTkRIkbpr46fIbp2BwaN14AAAAFCeiDXchxHP4t75NntWOFFHFjj+c
+AAAAEGRzYS1wbGFpbkB0ZXJ2aWEBAgM=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// Same generator, `-N hunter2 -C dsa-enc@tervia`. Sealed with aes256-ctr +
+    /// bcrypt, so the private section is unreadable but the `ssh-dss` public
+    /// half is not - which is exactly why this one has to be refused without a
+    /// passphrase rather than reported and deferred.
+    const DSA_OPENSSH_LOCKED: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABA0EOyftK
+clfaEu5B/FvGK/AAAAGAAAAAEAAAGyAAAAB3NzaC1kc3MAAACBAMUSV3Cr8et+GRDhR2+q
+He3JARPPYMrZm1U/yUoopEuvRcJegg1+GLbecmpAGenmLQo13n7Oo30DY0sPRN+OgR/2z0
+GtbXjBG1x8D0t5XdZao1wHepL8+6sI+fwAfAOvTRi0DR73+s49uAYvfB3M2B5vdm+s/NmV
+FUqY+SaUmxOtAAAAFQCWl4GxBy2YkQrQpi9igWGFgbC1FQAAAIA+PnKWINPPl0koriJHBb
+9U7pN0r1lyEr5IrkG1V6TmrgyTtGpvDN5+sU1ccHZth3DvU0ExD5OPRBpltDi2+65h4eLg
+sFphMUcQzr7+A2myjAHAyrpIBIVSV5xrRJ0CbHz6s3cPWffP/hgwb8EL+KTueCVeRc5dcY
+BFjKw+JJYhAwAAAIEAt4oRSEuTmwI++Hb/fzEZ1ROc/tyfvMVt8Frk8njIcUlIPXxF+Ru8
+WSOTZRBZdLBIwRgbekA0rPrGfSNRzz7G2fk/wHVBiOKvdD8HiUUyP7IrRMwH1npoVKGRd8
+U0uPEm31zsOFiok0Z03qPuEuT7TUQryeeZcVEXJxykp7u+6vIAAAHw35RbSdLAAzvNWdPQ
+k7tE2tpKy+CvdFlzx90gAxTVCoWvnnX2q3hXl9SbAlNmolKLHagUBaKfAZWBPthjtcYJcU
+/9pSP/QlvxUWM0Iat4ZWg4YUSpSGjMx/U9GxpN2EBkBx8Yv1ABw8TiyX+baSpS8sqOAQh3
+WLQ1R7TXoQyv4NoAK7HcKWIwAOJS00YTBOf1vXLqaX/nwUeNdBKqjbob2WwmLM1/iVO9EB
+UPIBpbzwu0obfh/9AKPfqLEsETcY04uSr5kpsngx6G3fUYkRWTW/K4DwCOZiQgpjcqTT2Z
+uXVWaXGuCK8KI51HbXCoKu9NX6dZHD6bnDqtcLT2NrsDeEIJFxnyld8V9IghPt7TKsUPgx
+ZHQGc5BjfBDHwEY7ANHi8GqDbF5i4GBYAKMiCVRZY4udI2kU1P6ROgYCnThfJBEIGSBwHQ
+4OaUoHB9sRFLDC0prg/SEnXc+OomXMAZL00sHKiJguQWVQJMF9/wlRhZt4nmNUWuEQnvgZ
+rEaioGlMcmehAGRKgTcRqivSXnt0kCJYelBOTOGxG53h7lnFAOpGU8yolyMnP1Vi4xNYlk
+DA1Sjyjb6sHqJmJF6w2tgFyJJM5jQkcp31ELgHRP7S0Ip2qn7ylryzlXa0QvVID7QnhX3W
+f+ibVfSVYFrOr5Wg==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    const DSA_OPENSSH_PASSPHRASE: &str = "hunter2";
+
+    /// A DSA key in the one container that reaches `decode_secret_key`:
+    /// `openssl genpkey -genparam -algorithm DSA` then `openssl genpkey
+    /// -paramfile`, i.e. unencrypted PKCS#8, which `classify` calls
+    /// `Other { encrypted: false }`.
+    const DSA_PKCS8: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIIBSgIBADCCASsGByqGSM44BAEwggEeAoGBAJktnRHPslx0V9BrjjtSycz+7Odz
+NMbv/MBynDzlIbLpx1J9WokI2xKU5eEHhfgwKZQbUETRBKG8cxcjxKk2Xqg7OINI
+MQPtmooAws98kzvDYJ3pWh/KWYVIvx3ymDjH/5T1IOImkbibGR8VIf9Wk88kq3sk
+xda8pdLQZydDK+3BAhUAtPxmLCeChPFSmhKtMc9BjYRi3RECgYBPHBL0ng+XcRTu
+oawx9HBs6ZRfw80iP5lSGJCnwmVxxEYFhk4v4alqr6Pw7Em06Ztggi0nXKIjbfHZ
+AKfC4wSnzqDi9+o+uIJ8odjI70948hH/bL8GJR/yO7cL6KiZfuE0f8L/grHOauZ+
++HhE+149VI8lvOhVL2LmGmoawky17AQWAhQFQ8W3FJqzDvpYkXcKLYgSYZtRaQ==
+-----END PRIVATE KEY-----
+";
+
+    /// The negative control for the DSA refusals, generated by the same
+    /// `ssh-keygen` in the same batch as `DSA_OPENSSH`: `-t ed25519 -N ''
+    /// -C ed-neg@tervia`. Without it, a guard that refused every
+    /// `openssh-key-v1` key would pass the DSA tests just as well.
+    const ED25519_CONTROL: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACC5x3v+LqbeU+Aqw0+h3FZ6Qxme9fLMj7azlYjEUZ8SqgAAAJC4XCe1uFwn
+tQAAAAtzc2gtZWQyNTUxOQAAACC5x3v+LqbeU+Aqw0+h3FZ6Qxme9fLMj7azlYjEUZ8Sqg
+AAAEBZuBdpyWDn7eNJdlZASctO6ttvCdtTK5CnbOPKJbePcLnHe/4upt5T4CrDT6HcVnpD
+GZ718syPtrOViMRRnxKqAAAADWVkLW5lZ0B0ZXJ2aWE=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// Header-only fixture: the cipher name in `DEK-Info` is rejected before
+    /// anything reads the body, so the body here is deliberately not a key.
+    const PEM_3DES: &str = "\
+-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: DES-EDE3-CBC,9F2A1B3C4D5E6F70
+
+Ym9ndXMgYm9keSwgbmV2ZXIgcmVhY2hlZA==
+-----END RSA PRIVATE KEY-----
+";
+
+    #[test]
+    fn plain_openssh_key_reports_type_fingerprint_and_public_key() {
+        let info = ssh_key_inspect_inner(PLAIN_ED25519, None).expect("plain key parses");
+        assert!(info.parsed);
+        assert!(!info.encrypted);
+        assert_eq!(info.key_type.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("SHA256:pIbp0wpphTpwY1ZzG103sjQDjaI+c8CicInkWVfKNiQ")
+        );
+        assert_eq!(info.comment.as_deref(), Some("tervia-test@localhost"));
+        let pub_key = info.public_key.expect("public key rendered");
+        assert!(pub_key.starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"));
+        assert!(pub_key.ends_with("tervia-test@localhost"));
+    }
+
+    /// The load-bearing behaviour: `openssh-key-v1` stores the public half in
+    /// cleartext, so type, fingerprint and `.pub` line all read out of an
+    /// encrypted key. That is what lets the vault import one without unlocking
+    /// it. The comment is the exception - it sits inside the encrypted section.
+    #[test]
+    fn locked_openssh_key_reports_metadata_without_a_passphrase() {
+        let info = ssh_key_inspect_inner(LOCKED_ED25519, None).expect("locked key still parses");
+        assert!(info.parsed);
+        assert!(info.encrypted);
+        assert_eq!(info.key_type.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("SHA256:dbLm8WcA5UjVznFwZUkhFoL/umm2mBsxo6H46sYI3yc")
+        );
+        assert_eq!(info.comment, None);
+        // Same key material as the `.pub` file on disk, just without its
+        // trailing comment.
+        let expected = LOCKED_PUB.trim().replace(" locked@localhost", "");
+        assert_eq!(info.public_key.as_deref(), Some(expected.as_str()));
+    }
+
+    /// With the passphrase the comment comes back too, so an import that starts
+    /// locked and then unlocks ends up with the full record.
+    #[test]
+    fn locked_openssh_key_accepts_the_right_passphrase() {
+        let info = ssh_key_inspect_inner(LOCKED_ED25519, Some(LOCKED_PASSPHRASE))
+            .expect("right passphrase unlocks");
+        assert!(info.parsed);
+        assert!(info.encrypted);
+        assert_eq!(info.key_type.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("SHA256:dbLm8WcA5UjVznFwZUkhFoL/umm2mBsxo6H46sYI3yc")
+        );
+        assert_eq!(info.comment.as_deref(), Some("locked@localhost"));
+        assert_eq!(info.public_key.as_deref(), Some(LOCKED_PUB.trim()));
+    }
+
+    /// russh surfaces a bad passphrase as a bare `Unpad Error`. Say what is
+    /// actually wrong, and do not echo the secret that was tried.
+    #[test]
+    fn wrong_passphrase_says_so_and_leaks_nothing() {
+        let err = ssh_key_inspect_inner(LOCKED_ED25519, Some("hunter2"))
+            .expect_err("wrong passphrase is an error");
+        assert!(err.contains("passphrase"), "{err}");
+        assert!(!err.contains("Unpad"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    /// PKCS#8 encrypts the public half along with everything else, so there is
+    /// nothing to report yet. `parsed: false` tells the editor to prompt rather
+    /// than to show a failure.
+    #[test]
+    fn locked_pkcs8_asks_for_a_passphrase_instead_of_failing() {
+        let info = ssh_key_inspect_inner(LOCKED_PKCS8, None).expect("not an error, just locked");
+        assert!(!info.parsed);
+        assert!(info.encrypted);
+        assert_eq!(info.key_type, None);
+        assert_eq!(info.fingerprint, None);
+        assert_eq!(info.public_key, None);
+    }
+
+    #[test]
+    fn public_key_paste_gets_its_own_message() {
+        let err = ssh_key_inspect_inner(LOCKED_PUB, None).expect_err("a .pub is not a key");
+        assert!(err.contains("public key"), "{err}");
+        assert!(err.contains(".pub"), "{err}");
+    }
+
+    #[test]
+    fn dsa_key_gets_its_own_message() {
+        let err = ssh_key_inspect_inner(DSA_KEY, None).expect_err("dsa is unsupported");
+        assert!(err.contains("DSA"), "{err}");
+    }
+
+    /// The `decode_secret_key` path, which is the only route a PKCS#8 or `.ppk`
+    /// DSA key could take. It never reaches the algorithm guard: russh is built
+    /// without its `dsa` feature, so the decoder rejects the DSA OID outright
+    /// (`Unknown key algorithm: 1.2.840.10040.4.1`) and this surfaces as the
+    /// generic `ERR_UNREADABLE` rather than the DSA message. Pinned anyway, for
+    /// the invariant that actually matters and that holds either way: the key is
+    /// refused, and the refusal describes none of its facts. If russh ever gains
+    /// a DSA branch this key starts parsing, `key_info` catches it, and the
+    /// assertions below still pass - the message simply gets better.
+    #[test]
+    fn pkcs8_dsa_key_is_refused_and_describes_nothing() {
+        let err = ssh_key_inspect_inner(DSA_PKCS8, None).expect_err("dsa never parses here");
+        assert!(!err.contains("ssh-dss"), "{err}");
+        assert!(!err.contains("SHA256:"), "{err}");
+    }
+
+    /// The reachable DSA case, and the one a human hand test caught: a modern
+    /// `ssh-keygen -t dsa` writes `openssh-key-v1`, not PEM, so the container
+    /// says `OpenSsh`, the parse succeeds, and only the parsed algorithm can
+    /// refuse it. Before the guard moved off the header this reported `ssh-dss`
+    /// with a real fingerprint for a key russh cannot authenticate with.
+    #[test]
+    fn openssh_dsa_key_is_refused_not_described() {
+        let err = ssh_key_inspect_inner(DSA_OPENSSH, None).expect_err("dsa is unsupported");
+        assert!(err.contains("DSA"), "{err}");
+        // The facts that used to leak. None of them may reach the caller.
+        assert!(!err.contains("ssh-dss"), "{err}");
+        assert!(!err.contains("SHA256:"), "{err}");
+    }
+
+    /// Case 3: `openssh-key-v1` keeps the public half in cleartext, so the
+    /// algorithm is knowable with no passphrase - which means this must refuse
+    /// here rather than hand back `ssh-dss` facts and defer the failure to the
+    /// passphrase round (or, worse, to dial time).
+    #[test]
+    fn locked_openssh_dsa_key_is_refused_without_a_passphrase() {
+        let err = ssh_key_inspect_inner(DSA_OPENSSH_LOCKED, None)
+            .expect_err("a locked dsa key is still dsa");
+        assert!(err.contains("DSA"), "{err}");
+        assert!(!err.contains("ssh-dss"), "{err}");
+    }
+
+    /// Case 2: the same key with the right passphrase. The decrypt succeeds, so
+    /// this return is only reached after a valid parse - and it must still
+    /// refuse rather than reward the correct passphrase with a saved record.
+    #[test]
+    fn locked_openssh_dsa_key_is_refused_with_the_right_passphrase() {
+        let err = ssh_key_inspect_inner(DSA_OPENSSH_LOCKED, Some(DSA_OPENSSH_PASSPHRASE))
+            .expect_err("the right passphrase does not make dsa supported");
+        assert!(err.contains("DSA"), "{err}");
+        assert!(!err.contains("passphrase"), "{err}");
+    }
+
+    /// The negative control, without which every test above would also pass
+    /// against a guard that simply refused everything. Same `ssh-keygen`, same
+    /// batch, same container as `DSA_OPENSSH` - only the algorithm differs, and
+    /// this one still reports its full facts.
+    #[test]
+    fn a_non_dsa_key_from_the_same_batch_still_inspects() {
+        let info = ssh_key_inspect_inner(ED25519_CONTROL, None).expect("ed25519 is supported");
+        assert!(info.parsed);
+        assert!(!info.encrypted);
+        assert_eq!(info.key_type.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("SHA256:dkFoCH+fQkAnq3M7uANqfFkEpS3N3AzFrQMgh63AvcE")
+        );
+        assert_eq!(info.comment.as_deref(), Some("ed-neg@tervia"));
+        assert_eq!(
+            info.public_key.as_deref(),
+            Some(
+                "ssh-ed25519 \
+                 AAAAC3NzaC1lZDI1NTE5AAAAILnHe/4upt5T4CrDT6HcVnpDGZ718syPtrOViMRRnxKq \
+                 ed-neg@tervia"
+            )
+        );
+    }
+
+    #[test]
+    fn sec1_ec_key_gets_its_own_message() {
+        let err = ssh_key_inspect_inner(SEC1_EC, None).expect_err("sec1 is unsupported");
+        assert!(err.contains("SEC1"), "{err}");
+        assert!(err.contains("ssh-keygen -p"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_pem_cipher_gets_its_own_message() {
+        let err = ssh_key_inspect_inner(PEM_3DES, None).expect_err("only aes-128-cbc is wired up");
+        assert!(err.contains("AES-128-CBC"), "{err}");
+    }
+
+    /// Arbitrary pasted text reaches this command, and `panic = "abort"` turns
+    /// any panic into a process kill rather than a rejected promise.
+    #[test]
+    fn junk_input_errors_without_panicking() {
+        for junk in [
+            "",
+            "   \n\t\n ",
+            "hello",
+            "\u{1f600}\u{4e2d}\u{6587}",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nbm90IGEga2V5\n-----END OPENSSH PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----",
+            "PuTTY-User-Key-File-9: ssh-ed25519",
+        ] {
+            let Err(err) = ssh_key_inspect_inner(junk, None) else {
+                panic!("expected an error for {junk:?}");
+            };
+            assert!(err.starts_with("ssh: "), "{err}");
+        }
+    }
+
+    /// Distinct inputs must not collapse back onto one message - that
+    /// indistinguishability is the whole reason this command classifies.
+    #[test]
+    fn every_dead_end_has_a_distinct_message() {
+        let mut msgs: Vec<String> = [LOCKED_PUB, DSA_KEY, SEC1_EC, PEM_3DES, "junk", ""]
+            .iter()
+            .map(|k| ssh_key_inspect_inner(k, None).expect_err("dead end"))
+            .collect();
+        let total = msgs.len();
+        msgs.sort();
+        msgs.dedup();
+        assert_eq!(msgs.len(), total, "duplicate message: {msgs:?}");
+    }
+
+    /// The bug this guards: a truncated PKCS#8 block paired with the
+    /// *correct* passphrase used to be told "wrong passphrase" forever,
+    /// because `decode_secret_key` folds parsing and decrypting into one
+    /// call. The widened message must name truncation/corruption as a
+    /// possibility and must not collapse onto the plain wrong-passphrase
+    /// message used elsewhere.
+    #[test]
+    fn truncated_pkcs8_with_the_right_passphrase_names_truncation_too() {
+        // Sanity check: the untruncated key with its real passphrase parses,
+        // so the truncated case below is testing truncation, not a typo.
+        ssh_key_inspect_inner(PKCS8_WITH_PASSPHRASE, Some(PKCS8_PASSPHRASE))
+            .expect("full key with its real passphrase parses");
+
+        let err = ssh_key_inspect_inner(PKCS8_TRUNCATED, Some(PKCS8_PASSPHRASE))
+            .expect_err("a truncated block is still unreadable, even with the right passphrase");
+        assert!(
+            err.contains("truncated") || err.contains("corrupt"),
+            "{err}"
+        );
+        assert!(err.contains("passphrase"), "{err}");
+        assert_ne!(err, ERR_WRONG_PASSPHRASE);
+        assert_eq!(err, ERR_PASSPHRASE_OR_CORRUPT);
+    }
+
+    /// The other bug this guards: `classify` used to sniff only the first
+    /// line, so a public key pasted ahead of its own private key made the
+    /// private key unreachable. A private-key marker anywhere in the paste
+    /// must win - but a paste that really is only a public key must still be
+    /// refused, so both directions of the fix are checked here.
+    #[test]
+    fn public_key_line_does_not_shadow_a_following_private_key() {
+        let err = ssh_key_inspect_inner(LOCKED_PUB, None).expect_err("a lone .pub is not a key");
+        assert!(err.contains("public key"), "{err}");
+
+        let pasted_both = format!("{LOCKED_PUB}{LOCKED_ED25519}");
+        let info = ssh_key_inspect_inner(&pasted_both, None)
+            .expect("the private key after the public line must still parse");
+        assert!(info.parsed);
+        assert!(info.encrypted);
+        assert_eq!(info.key_type.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("SHA256:dbLm8WcA5UjVznFwZUkhFoL/umm2mBsxo6H46sYI3yc")
+        );
+    }
+
+    /// The PEM-block counterpart to the test above. The comment on `classify`
+    /// claims a private-key marker anywhere in the paste wins "even over a
+    /// public-key line earlier in the text", but the old scan returned on the
+    /// first `-----BEGIN ...-----` it saw - so a PEM public-key block (say,
+    /// from `ssh-keygen -e -m PKCS8`) pasted ahead of the real private key
+    /// still bounced with the public-key message, never reaching the private
+    /// key below it. This is the gap the bare-`.pub`-line test above does not
+    /// cover.
+    #[test]
+    fn pem_public_key_block_does_not_shadow_a_following_private_key() {
+        let err = ssh_key_inspect_inner(PEM_PUBLIC_KEY, None)
+            .expect_err("a lone PEM public key is not a key");
+        assert!(err.contains("public key"), "{err}");
+
+        let pasted_both = format!("{PEM_PUBLIC_KEY}{LOCKED_ED25519}");
+        let info = ssh_key_inspect_inner(&pasted_both, None)
+            .expect("the private key after the PEM public block must still parse");
+        assert!(info.parsed);
+        assert!(info.encrypted);
+        assert_eq!(info.key_type.as_deref(), Some("ssh-ed25519"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("SHA256:dbLm8WcA5UjVznFwZUkhFoL/umm2mBsxo6H46sYI3yc")
+        );
+    }
+
+    /// Every PEM public-key label `classify` recognises - not just the one
+    /// used above - must still be refused with the public-key message when it
+    /// really is the only thing pasted.
+    #[test]
+    fn every_pem_public_key_label_alone_gets_the_public_key_message() {
+        for pem in [PEM_PUBLIC_KEY, PEM_RSA_PUBLIC_KEY, PEM_SSH2_PUBLIC_KEY] {
+            let err =
+                ssh_key_inspect_inner(pem, None).expect_err("a PEM public-key block is not a key");
+            assert!(err.contains("public key"), "{pem}: {err}");
+        }
+    }
+
+    /// Both dead ends read "truncated or altered" in similar words, and
+    /// `every_dead_end_has_a_distinct_message` above never exercises this
+    /// pair: `ERR_OPENSSH_BODY` comes from `from_openssh` failing before any
+    /// passphrase is involved, `ERR_UNREADABLE` from `decode_secret_key`
+    /// failing on an unencrypted, non-OpenSSH format.
+    #[test]
+    fn openssh_body_and_unreadable_are_distinct_and_both_reachable() {
+        let openssh_err = ssh_key_inspect_inner(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nbm90IGEga2V5\n-----END OPENSSH PRIVATE KEY-----",
+            None,
+        )
+        .expect_err("garbage openssh-v1 body");
+        let unreadable_err = ssh_key_inspect_inner(
+            "-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----",
+            None,
+        )
+        .expect_err("garbage pkcs8 body");
+        assert_eq!(openssh_err, ERR_OPENSSH_BODY);
+        assert_eq!(unreadable_err, ERR_UNREADABLE);
+        assert_ne!(openssh_err, unreadable_err);
+    }
+
+    #[test]
+    fn unknown_algorithm_is_refused() {
+        // `SshKeyGenerated` has no `Debug` (its PEM is `Zeroizing`), so no `expect_err`.
+        let Err(err) = ssh_key_generate_inner("dsa", None, None) else {
+            panic!("dsa has no generate path");
+        };
+        assert!(err.contains("unknown key algorithm"), "{err}");
+    }
+
+    /// Every offered algorithm generates a key `decode_secret_key` re-reads,
+    /// whose fingerprint survives that round trip - proof the PEM this
+    /// command hands back is exactly what `ssh_key_inspect` would parse back
+    /// out, and RSA-4096 in particular proves `rsa`'s feature gate on
+    /// `PrivateKey::random` is actually wired up rather than merely present in
+    /// `src-tauri/Cargo.toml`.
+    #[test]
+    fn every_algorithm_generates_a_key_that_round_trips() {
+        for algorithm in ["ed25519", "ecdsa-p256", "rsa-4096"] {
+            let generated = ssh_key_generate_inner(algorithm, None, None)
+                .unwrap_or_else(|e| panic!("{algorithm}: generation failed: {e}"));
+            assert!(generated.info.parsed, "{algorithm}");
+            assert!(!generated.info.encrypted, "{algorithm}");
+            let reread = russh::keys::decode_secret_key(&generated.pem, None)
+                .unwrap_or_else(|e| panic!("{algorithm}: generated key did not decode: {e}"));
+            assert_eq!(
+                reread.fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+                generated
+                    .info
+                    .fingerprint
+                    .clone()
+                    .expect("fingerprint recorded"),
+                "{algorithm}: round-tripped key reports a different fingerprint"
+            );
+
+            // The same PEM through the actual inspect path a saved key takes,
+            // proving the two commands agree rather than merely both
+            // compiling.
+            let inspected = ssh_key_inspect_inner(&generated.pem, None)
+                .unwrap_or_else(|e| panic!("{algorithm}: did not inspect clean: {e}"));
+            assert_eq!(
+                inspected.fingerprint, generated.info.fingerprint,
+                "{algorithm}"
+            );
+            assert_eq!(inspected.key_type, generated.info.key_type, "{algorithm}");
+        }
+    }
+
+    /// The passphrase-encrypted path: the PEM only decodes with the right
+    /// passphrase, and the fingerprint recorded before encryption still
+    /// matches the key `decode_secret_key` hands back after it - the same
+    /// property the unencrypted test above checks, over the arm
+    /// `keySecretsForSave` (`src/modules/vault/editor/draft.ts`) reaches when
+    /// the key editor's passphrase field is filled in before Generate.
+    #[test]
+    fn a_passphrase_encrypts_the_generated_key() {
+        let generated = ssh_key_generate_inner("ed25519", Some("correct horse"), None)
+            .expect("generation should succeed");
+        assert!(generated.info.encrypted);
+        let fingerprint = generated
+            .info
+            .fingerprint
+            .clone()
+            .expect("fingerprint recorded");
+
+        russh::keys::decode_secret_key(&generated.pem, None)
+            .expect_err("an encrypted key must not decode with no passphrase");
+
+        let reread = russh::keys::decode_secret_key(&generated.pem, Some("correct horse"))
+            .expect("the right passphrase decodes it");
+        assert_eq!(
+            reread.fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+            fingerprint
+        );
+
+        // openssh-key-v1 keeps the public half in cleartext, so the facts read
+        // out without the passphrase - the contract
+        // `locked_openssh_key_reports_metadata_without_a_passphrase` pins for an
+        // imported key.
+        let locked = ssh_key_inspect_inner(&generated.pem, None)
+            .expect("metadata readable without the passphrase");
+        assert!(locked.parsed);
+        assert!(locked.encrypted);
+        assert_eq!(locked.fingerprint.as_deref(), Some(fingerprint.as_str()));
+        let unlocked = ssh_key_inspect_inner(&generated.pem, Some("correct horse"))
+            .expect("right passphrase unlocks");
+        assert_eq!(unlocked.fingerprint, Some(fingerprint));
+    }
+
+    /// The comment is readable in the metadata this command returns (computed
+    /// before encryption - see the doc comment on `ssh_key_generate_inner`),
+    /// and on the unencrypted PEM it also survives the round trip through
+    /// `ssh_key_inspect_inner`: the same "cleartext public half" carrier a
+    /// pasted key's own comment already relies on.
+    #[test]
+    fn a_comment_is_set_and_survives_an_unencrypted_round_trip() {
+        let generated = ssh_key_generate_inner("ed25519", None, Some("tervia-test@localhost"))
+            .expect("generation should succeed");
+        assert_eq!(
+            generated.info.comment.as_deref(),
+            Some("tervia-test@localhost")
+        );
+        let reread = ssh_key_inspect_inner(&generated.pem, None).expect("round trip parses");
+        assert_eq!(reread.comment.as_deref(), Some("tervia-test@localhost"));
+    }
+
+    /// Empty and whitespace-only input are refused the same way
+    /// `ssh_key_inspect` refuses them, before any of the three shapes below
+    /// is even considered.
+    #[test]
+    fn classify_refuses_empty_text() {
+        assert_eq!(ssh_key_classify_inner("").unwrap_err(), ERR_EMPTY);
+        assert_eq!(ssh_key_classify_inner("   \n\t").unwrap_err(), ERR_EMPTY);
+    }
+
+    /// A private key, its own `.pub` line, and garbage all classify
+    /// distinctly - the acceptance box this command exists for.
+    #[test]
+    fn classify_tells_a_private_key_a_public_key_and_garbage_apart() {
+        assert!(
+            matches!(
+                ssh_key_classify_inner(PLAIN_ED25519),
+                Ok(SshTextClassification::PrivateKey)
+            ),
+            "a private key must classify as PrivateKey"
+        );
+
+        let pub_line = ssh_key_inspect_inner(PLAIN_ED25519, None)
+            .expect("inspect the fixture")
+            .public_key
+            .expect("fixture has a public half");
+        match ssh_key_classify_inner(&pub_line) {
+            Ok(SshTextClassification::PublicKey {
+                algorithm,
+                fingerprint,
+                public_key,
+                ..
+            }) => {
+                assert_eq!(algorithm, "ssh-ed25519");
+                assert!(fingerprint.starts_with("SHA256:"));
+                assert_eq!(
+                    public_key.split_whitespace().next(),
+                    pub_line.split_whitespace().next(),
+                    "the re-encoded line names the same algorithm/key data"
+                );
+            }
+            other => panic!("a .pub line must classify as PublicKey, got {other:?}"),
+        }
+
+        match ssh_key_classify_inner("this is not a key") {
+            Ok(SshTextClassification::Unsupported { reason }) => {
+                assert_eq!(reason, ERR_UNKNOWN);
+            }
+            other => panic!("garbage must classify as Unsupported, got {other:?}"),
+        }
+    }
+
+    /// The full set of facts a `cert` vault entry needs, read straight off a
+    /// certificate this test signs itself - CA fingerprint, the CERTIFIED
+    /// key's own fingerprint (not the CA's), key id, principals and the
+    /// validity window. Mirrors `create_test_cert`, russh's own dev-only
+    /// test helper for signing a certificate, substituting this crate's own
+    /// `UnwrapErr(SysRng)` for the nonce RNG `ssh_key_generate_inner`
+    /// already uses, rather than the `rand` crate that helper reaches for
+    /// (not a `src-tauri` dependency).
+    #[test]
+    fn classify_reads_a_signed_certificate_s_own_facts() {
+        use russh::keys::ssh_key::certificate::{Builder, CertType};
+
+        let ca = russh::keys::decode_secret_key(
+            &ssh_key_generate_inner("ed25519", None, None)
+                .expect("generate ca key")
+                .pem,
+            None,
+        )
+        .expect("decode ca key");
+        let user = russh::keys::decode_secret_key(
+            &ssh_key_generate_inner("ed25519", None, None)
+                .expect("generate user key")
+                .pem,
+            None,
+        )
+        .expect("decode user key");
+        let ca_fingerprint = ca.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+        let user_fingerprint = user.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+
+        let mut builder = Builder::new_with_random_nonce(
+            &mut UnwrapErr(SysRng),
+            user.public_key(),
+            1_700_000_000,
+            1_800_000_000,
+        )
+        .expect("builder construction");
+        builder.key_id("tervia-test").expect("key id");
+        builder.cert_type(CertType::User).expect("cert type");
+        builder.valid_principal("tervia").expect("principal");
+        let cert = builder.sign(&ca).expect("sign");
+        let cert_text = cert.to_openssh().expect("serialize cert");
+
+        match ssh_key_classify_inner(&cert_text) {
+            Ok(SshTextClassification::Certificate {
+                ca_fingerprint: got_ca,
+                fingerprint: got_fp,
+                key_id,
+                principals,
+                valid_after,
+                valid_before,
+            }) => {
+                assert_eq!(got_ca, ca_fingerprint);
+                assert_eq!(got_fp, user_fingerprint);
+                assert_eq!(key_id, "tervia-test");
+                assert_eq!(principals, vec!["tervia".to_string()]);
+                assert_eq!(valid_after, 1_700_000_000);
+                assert_eq!(valid_before, Some(1_800_000_000));
+            }
+            other => panic!("a signed certificate must classify as Certificate, got {other:?}"),
+        }
+    }
+
+    /// The rc-noise guard: a chatty remote `~/.bashrc` prepends its own output
+    /// to every `ssh host cmd` capture, so the value we want is the last line.
+    #[test]
+    fn last_line_survives_rc_chatter() {
+        assert_eq!(last_line("/home/u/app"), "/home/u/app");
+        assert_eq!(
+            last_line("Welcome!\nnvm loaded\n/home/u/app\n"),
+            "/home/u/app"
+        );
+        assert_eq!(last_line("/home/u/app\n\n"), "/home/u/app");
+        assert_eq!(last_line("  /home/u/app  "), "/home/u/app");
+        assert_eq!(last_line(""), "");
+        assert_eq!(last_line("\n \n"), "");
+        // A branch header behind a greeting still parses as the header.
+        assert_eq!(
+            last_line("motd\n## main...origin/main"),
+            "## main...origin/main"
+        );
+    }
+
+    /// `cwd` reaches us from the remote shell's OSC 7, i.e. it is untrusted.
+    #[test]
+    fn shell_quote_blocks_injection() {
+        assert_eq!(shell_quote("/home/u/app"), "'/home/u/app'");
+        assert_eq!(
+            shell_quote("/tmp/x'; rm -rf ~ ;'"),
+            r"'/tmp/x'\''; rm -rf ~ ;'\'''"
+        );
+    }
+
+    const RESOURCE_LINUX_FRAME: &str = "HOST\nvm-node-01\nVERSION\nLinux 6.8.7\nUPTIME\n123.45 12.3\nCPU\ncpu 100 20 30 400 50 0 0 0\nMEM\nMemTotal: 2048 kB\nMemAvailable: 1024 kB\nCached: 256 kB\nBuffers: 128 kB\nNET\nInter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo frame compressed multicast\neth0: 100 0 1 2 0 0 0 0 200 0 3 4 0 0 0 0\nveth123: 900 0 0 0 0 0 0 0 900 0 0 0 0 0 0 0\nDISK\n8 0 sda 1 0 12 0 4 0 32 0 0 0 0\n8 1 sda1 1 0 999 0 4 0 999 0 0 0 0\nFS\nFilesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 100 900 10% /\n";
+
+    #[test]
+    fn parses_linux_sample_and_filters_virtual_devices() {
+        let sample = parse_resource_sample(RESOURCE_LINUX_FRAME);
+        assert_eq!(sample.hostname.as_deref(), Some("vm-node-01"));
+        assert_eq!(sample.version.as_deref(), Some("Linux 6.8.7"));
+        assert_eq!(sample.uptime_seconds, Some(123.45));
+        assert_eq!(sample.cpu_total, Some(600));
+        assert_eq!(sample.cpu_idle, Some(450));
+        assert_eq!(sample.memory_total, Some(2048));
+        assert_eq!(sample.memory_available, Some(1024));
+        assert_eq!(sample.disk_read_bytes, Some(12 * 512));
+        assert_eq!(sample.disk_write_bytes, Some(32 * 512));
+        assert_eq!(sample.network_interfaces.as_ref().unwrap().len(), 1);
+        assert_eq!(sample.network_interfaces.as_ref().unwrap()[0].name, "eth0");
+        assert_eq!(sample.filesystems.as_ref().unwrap()[0].mount, "/");
+    }
+
+    #[test]
+    fn whole_disk_filter_matches_sampler_device_families() {
+        assert!(is_whole_disk("sda"));
+        assert!(is_whole_disk("xvdb"));
+        assert!(is_whole_disk("nvme0n1"));
+        assert!(is_whole_disk("mmcblk0"));
+        assert!(!is_whole_disk("sd"));
+        assert!(!is_whole_disk("sda1"));
+    }
+
+    #[test]
+    fn missing_mem_available_does_not_discard_other_metrics() {
+        let sample = parse_resource_sample(
+            "CPU\ncpu 1 2 3 4 5\nMEM\nMemTotal: 1024 kB\nNET\neth0: 1 0 0 0 0 0 0 0 2 0 0 0 0 0 0 0\n",
+        );
+        assert_eq!(sample.cpu_total, Some(15));
+        assert_eq!(sample.memory_total, Some(1024));
+        assert_eq!(sample.memory_available, None);
+        assert_eq!(sample.network_interfaces.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn non_linux_sample_keeps_independent_metrics_unavailable() {
+        let sample = parse_resource_sample("HOST\nmacbook\nVERSION\nDarwin 24.0\n");
+        assert_eq!(sample.hostname.as_deref(), Some("macbook"));
+        assert_eq!(sample.cpu_total, None);
+        assert_eq!(sample.memory_total, None);
+        assert_eq!(sample.disk_read_bytes, None);
+        assert_eq!(sample.network_interfaces, None);
+        assert_eq!(sample.filesystems, None);
+    }
+
+    #[test]
+    fn df_header_and_dash_usage_are_unavailable_filesystem_data() {
+        let sample = parse_resource_sample(
+            "FS\nFilesystem 1K-blocks Used Available Use% Mounted on\nserver:share 1 1 0 - /mnt/share\n",
+        );
+        assert_eq!(sample.filesystems, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resource_chunk_parser_handles_split_markers_crlf_and_noise() {
+        let mut pending = String::new();
+        let mut frame = None;
+        let mut samples = parse_resource_stream_chunk(
+            &mut pending,
+            &mut frame,
+            b"remote startup noise\r\n__TERVIA_RESOURCE_",
+        )
+        .unwrap();
+        assert!(samples.is_empty());
+        samples.extend(
+            parse_resource_stream_chunk(
+                &mut pending,
+                &mut frame,
+                b"BEGIN__\r\nHOST\r\nnode\r\nCPU\r\ncpu 1 1 1 1 1\r\n__TERVIA_RESOURCE_END__\r\n",
+            )
+            .unwrap(),
+        );
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].hostname.as_deref(), Some("node"));
+        assert_eq!(samples[0].cpu_total, Some(5));
+    }
+
+    #[test]
+    fn resource_chunk_parser_ignores_end_without_begin() {
+        let mut pending = String::new();
+        let mut frame = None;
+        let samples = parse_resource_stream_chunk(
+            &mut pending,
+            &mut frame,
+            b"noise\n__TERVIA_RESOURCE_END__\n",
+        )
+        .unwrap();
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn resource_chunk_parser_caps_pending_and_frame_size() {
+        const CAP: usize = 4 * 1024 * 1024;
+        let mut pending = String::new();
+        let mut frame = None;
+        assert!(
+            parse_resource_stream_chunk(&mut pending, &mut frame, &vec![b'x'; CAP + 1],)
+                .unwrap_err()
+                .contains("line exceeded")
+        );
+
+        let mut pending = String::new();
+        let mut frame = None;
+        let mut input = Vec::with_capacity(CAP + 64);
+        input.extend_from_slice(b"__TERVIA_RESOURCE_BEGIN__\n");
+        input.resize(CAP + 32, b'x');
+        input.extend_from_slice(b"\n__TERVIA_RESOURCE_END__\n");
+        assert!(
+            parse_resource_stream_chunk(&mut pending, &mut frame, &input)
+                .unwrap_err()
+                .contains("sample exceeded")
+        );
+    }
+
+    #[test]
+    fn local_ping_parser_accepts_common_localized_windows_output() {
+        assert_eq!(
+            parse_local_ping_latency("64 bytes from app2ms.example.com: time=3.25 ms"),
+            Some(3.25)
+        );
+        assert_eq!(
+            parse_local_ping_latency("Ответ от 192.0.2.1: число байт=32 время<1мс TTL=64"),
+            Some(0.5)
+        );
+        assert_eq!(
+            parse_local_ping_latency("app2ms.example.com unreachable"),
+            None
+        );
+        assert_eq!(
+            parse_local_ping_latency("Antwort von 192.0.2.1: Zeit=2 ms"),
+            Some(2.0)
+        );
+        assert_eq!(
+            parse_local_ping_latency("Réponse de 192.0.2.1: temps=2,5 ms"),
+            Some(2.5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_stream_command_emits_a_parseable_linux_sample() {
+        use std::{
+            io::Read,
+            process::{Command, Stdio},
+            sync::mpsc,
+            thread,
+            time::Duration,
+        };
+
+        if !std::path::Path::new("/proc/stat").exists() {
+            return;
+        }
+
+        let command = resource_stream_command();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the resource stream command through sh -c");
+        let mut stdout = child.stdout.take().expect("capture resource stream stdout");
+        let (sample_tx, sample_rx) = mpsc::channel();
+
+        let reader = thread::spawn(move || {
+            let mut pending = String::new();
+            let mut frame = None;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let size = match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(size) => size,
+                };
+                if let Ok(samples) =
+                    parse_resource_stream_chunk(&mut pending, &mut frame, &chunk[..size])
+                {
+                    if let Some(sample) = samples.into_iter().next() {
+                        let _ = sample_tx.send(sample);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let sample = sample_rx.recv_timeout(Duration::from_secs(6));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+
+        let sample = sample.expect("sampler should emit a frame within six seconds");
+        assert!(
+            sample.cpu_total.is_some(),
+            "sampler frame did not contain Linux CPU counters: {sample:?}"
+        );
+    }
+}

@@ -1,0 +1,152 @@
+import { isPdfPath, pathToFileUrl } from "@/lib/path";
+import { type Tab } from "@/modules/tabs";
+import type { SshConnectionBinding } from "@/modules/ssh/status";
+import { leaves } from "@/modules/terminal";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useCallback } from "react";
+import { type TabsApi } from "./tabsApi";
+
+type Params = {
+  tabs: Tab[];
+  disposeTab: (id: number) => void;
+  /** Live session per saved SSH connection, from `useSshLeafState`. Lets a file
+   *  opened from the remote tree record which PROFILE it came from, not just the
+   *  session number, so the tab can be restored after a restart. */
+  sshBindingByConnection: Map<string, SshConnectionBinding>;
+} & Pick<TabsApi, "openFileTab" | "setEditorLeafPath">;
+
+/** `path` after `from` became `to`: `to` itself, or `to` plus the suffix of a
+ *  path under `from`. Null when `path` is unaffected. */
+function renamedPath(path: string, from: string, to: string): string | null {
+  if (path === from) return to;
+  if (path.startsWith(`${from}/`)) return `${to}${path.slice(from.length)}`;
+  return null;
+}
+
+/** The saved profile id behind a live SSH session, undefined for ad-hoc ones. */
+function connectionOf(
+  bindings: Map<string, SshConnectionBinding>,
+  sessionId: number,
+): string | undefined {
+  for (const [connId, binding] of bindings) {
+    if (binding.sessionId === sessionId) return connId;
+  }
+  return undefined;
+}
+
+/**
+ * File-open / rename / delete wiring shared by the local explorer, the SSH
+ * tree, the extension workspace bridge, and OS file drops. Moved verbatim from
+ * App with identical dependency arrays. `disposeTab` is threaded in (it stays
+ * in App).
+ *
+ * `handleOpenFile` is the single place that decides WHICH surface a local file
+ * opens in, so every one of those callers agrees. Adding the choice at one
+ * call site instead would leave the others opening a PDF as "Binary file".
+ */
+export function useFileActions({
+  tabs,
+  disposeTab,
+  openFileTab,
+  setEditorLeafPath,
+  sshBindingByConnection,
+}: Params): {
+  handleOpenFile: (path: string, pin?: boolean) => void;
+  handleOpenRemoteFile: (path: string, sessionId: number, hostLabel: string | null) => void;
+  handlePathRenamed: (from: string, to: string) => void;
+  handleRemotePathRenamed: (sessionId: number, from: string, to: string) => void;
+  handlePathDeleted: (path: string) => void;
+} {
+  const handleOpenFile = useCallback(
+    (path: string, pin?: boolean) => {
+      // PDF goes to the OS handler; everything else to an editor tab. Images
+      // need no branch here - `fs_read_file` returns them as a data URL and
+      // `EditorPane` renders it. A non-absolute path yields a null URL and
+      // falls through to the editor rather than opening nothing.
+      const url = isPdfPath(path) ? pathToFileUrl(path) : null;
+      if (url) {
+        void openUrl(url).catch(console.error);
+        return;
+      }
+      openFileTab(path, pin ?? false);
+    },
+    [openFileTab],
+  );
+
+  // SSH tree calls this when the user clicks a remote file. Pin the tab
+  // because preview-mode shares one slot with local previews and would
+  // silently replace whichever local file is in preview.
+  const handleOpenRemoteFile = useCallback(
+    (path: string, sessionId: number, hostLabel: string | null) => {
+      // Record the saved profile behind this session, not just the session
+      // number: the number dies with the app, the profile is what lets the tab
+      // come back and rebind after a restart. Ad-hoc sessions have none, and
+      // stay session-only.
+      const hostId = connectionOf(sshBindingByConnection, sessionId);
+      openFileTab(path, true, {
+        hostId,
+        sshSessionId: sessionId,
+        sshHostLabel: hostLabel ?? "remote",
+      });
+    },
+    [openFileTab, sshBindingByConnection],
+  );
+
+  const handlePathRenamed = useCallback(
+    (from: string, to: string) => {
+      for (const t of tabs) {
+        if (t.kind !== "pane") continue;
+        for (const leaf of leaves(t.paneTree)) {
+          if (leaf.leafKind !== "editor") continue;
+          const next = renamedPath(leaf.path, from, to);
+          if (next !== null) setEditorLeafPath(leaf.id, next);
+        }
+      }
+    },
+    [tabs, setEditorLeafPath],
+  );
+
+  // The Remote tree moved or renamed `from` to `to` on `sessionId`. Retarget
+  // only that host's editor leaves; matching the profile also catches a
+  // restored tab not yet rebound (see `isRemoteEditorLeaf`).
+  const handleRemotePathRenamed = useCallback(
+    (sessionId: number, from: string, to: string) => {
+      const hostId = connectionOf(sshBindingByConnection, sessionId);
+      for (const t of tabs) {
+        if (t.kind !== "pane") continue;
+        for (const leaf of leaves(t.paneTree)) {
+          if (leaf.leafKind !== "editor") continue;
+          const sameHost =
+            (hostId !== undefined && leaf.hostId === hostId) || leaf.sshSessionId === sessionId;
+          if (!sameHost) continue;
+          const next = renamedPath(leaf.path, from, to);
+          if (next !== null) setEditorLeafPath(leaf.id, next);
+        }
+      }
+    },
+    [tabs, setEditorLeafPath, sshBindingByConnection],
+  );
+
+  const handlePathDeleted = useCallback(
+    (path: string) => {
+      for (const t of tabs) {
+        if (t.kind !== "pane") continue;
+        // If any editor leaf in this tab references the deleted path, drop
+        // the whole tab. Matches the prior single-leaf behavior.
+        const affected = leaves(t.paneTree).some(
+          (l) => l.leafKind === "editor" && (l.path === path || l.path.startsWith(`${path}/`)),
+        );
+        if (affected) disposeTab(t.id);
+      }
+    },
+    [tabs, disposeTab],
+  );
+
+  return {
+    handleOpenFile,
+    handleOpenRemoteFile,
+    handlePathRenamed,
+    handleRemotePathRenamed,
+    handlePathDeleted,
+  };
+}

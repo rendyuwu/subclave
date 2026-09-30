@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  # Keep in sync with ci.yml's list of the same name — the point of sharing the
+  # script below is that the PR bundle and the released bundle link the same
+  # libraries.
+  LINUX_DEPS: >-
+    libwebkit2gtk-4.1-dev
+    libgtk-3-dev
+    librsvg2-dev
+    libssl-dev
+    libdbus-1-dev
+    libxcb1-dev
+    libxcb-randr0-dev
+    patchelf
+
+jobs:
+  # Create the draft release ONCE, before the build matrix runs. The parallel
+  # matrix then uploads every platform's artifacts into this single release via
+  # `releaseId`, instead of each job racing to create its own. That race
+  # previously produced duplicate draft releases and a `latest.json` that was
+  # missing a platform (breaking auto-update for it). Doing it here also means
+  # the release body is composed in one place, so the release page and the
+  # in-app updater notes always match what shipped.
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Build the release body from the CHANGELOG entry for this tag. Falls back
+      # to a changelog link if the version has no section, so it never blocks a
+      # release.
+      - name: Compose release notes from CHANGELOG
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo 'body<<TERVIA_NOTES_EOF'
+            node scripts/release-notes.mjs "$TAG"
+            echo 'TERVIA_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        id: create-release
+        uses: actions/github-script@v9
+        env:
+          TAG: ${{ github.ref_name }}
+          RELEASE_BODY: ${{ steps.notes.outputs.body }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Tervia ${tag}`,
+              body: process.env.RELEASE_BODY,
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  publish-tauri:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+            rust-target: aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+            rust-target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+            rust-target: ""
+          - platform: windows-latest
+            args: ""
+            rust-target: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same package list and same script as ci.yml's bundle matrix, so a green
+      # PR build means the release build has the same libraries under it. The
+      # script also pins the apt mirror and bounds apt's timeouts; see its header.
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        timeout-minutes: 10
+        run: bash .github/scripts/install-linux-deps.sh ${{ env.LINUX_DEPS }}
+
+      # This was pinned to v4 because pnpm/action-setup@v6's self-installer
+      # crashed on windows-2025 runners with STATUS_STACK_BUFFER_OVERRUN
+      # (0xC0000409). v6.0.8 fixed that by dropping patchPnpmEnv, and v4 runs on
+      # Node 20, which the runners now force onto Node 24 and warn about.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: ${{ matrix.platform }}-${{ matrix.rust-target }}
+          # Persist the dependency cache even when a build fails, so the next
+          # attempt reuses the compiled deps instead of starting cold.
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build the `tervia` console-subsystem launcher (Windows only). The
+      # NSIS hook in `installer.nsh` `File`s the resulting binary from
+      # `src-tauri/target/release/tervia.exe` into the install dir alongside
+      # the GUI `TerviaApp.exe`. `tauri-action` below only builds the main
+      # binary (the one named by `default-run`), so the stub needs an
+      # explicit step. Cargo's incremental cache means the subsequent main
+      # build reuses everything compiled here.
+      - name: Build tervia console launcher (Windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        working-directory: src-tauri
+        # The launcher lives in the `tervia-cli/` workspace member - kept
+        # separate from the GUI package on purpose so Tauri 2's deb / dmg
+        # bundlers don't enumerate it as a `[[bin]]` to bundle on POSIX.
+        # The shared workspace target dir means the produced
+        # `target/release/tervia.exe` sits next to the GUI's TerviaApp.exe,
+        # ready for the NSIS hook's `File` directive.
+        run: cargo build --release -p tervia-cli
+
+      # tauri-action fills latest.json's `notes` (the in-app updater changelog)
+      # from `releaseBody`; without it the updater shows no notes. Recompute the
+      # same CHANGELOG-derived notes create-release used for the release body.
+      - name: Compose release notes from CHANGELOG
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo 'body<<TERVIA_NOTES_EOF'
+            node scripts/release-notes.mjs "$TAG"
+            echo 'TERVIA_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Uploads this platform's signed installers + updater artifacts into the
+      # single draft release created above (`releaseId`). No release-creation
+      # inputs here, so the jobs cannot race to create competing releases;
+      # `releaseBody` only populates the updater notes, it does not re-create.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS: ad-hoc sign the bundle (APPLE_SIGNING_IDENTITY '-') and do NOT
+          # import a Developer ID certificate. A configured-but-invalid
+          # APPLE_CERTIFICATE secret makes `security import` hard-fail the whole
+          # build ("failed to import keychain certificate"), and the `|| ''`
+          # fallback only triggers when the secret is empty, not when it's bad.
+          # Skipping the import keeps releases building; macOS users clear the
+          # quarantine bit with `xattr -cr` (see the release notes). To restore
+          # Developer ID signing + notarization, re-add APPLE_CERTIFICATE /
+          # APPLE_CERTIFICATE_PASSWORD / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+          # here once a valid Developer ID cert is in the repo secrets.
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && '-' || '' }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          args: ${{ matrix.args }}

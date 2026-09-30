@@ -1,0 +1,444 @@
+pub mod background;
+pub mod ringbuffer;
+pub mod session;
+
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+use background::{BackgroundLogResponse, BackgroundProc, BackgroundProcInfo};
+use session::{SessionRunOutput, ShellSession};
+
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const MAX_TIMEOUT_SECS: u64 = 300;
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Serialize)]
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub truncated: bool,
+}
+
+/// Run a one-shot command via the user's login shell. Output is capped and
+/// the process is force-killed on timeout. Output does not flow into the
+/// user's interactive PTY (that would fight their input); AI tool calls
+/// surface in chat as a structured result.
+#[tauri::command]
+pub async fn shell_run_command(
+    command: String,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<CommandOutput, String> {
+    let trimmed = command.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("empty command".into());
+    }
+
+    let cwd_path = if let Some(dir) = cwd.as_deref().filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(dir);
+        if !p.is_dir() {
+            return Err(format!("cwd is not a directory: {}", p.display()));
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    let dur = Duration::from_secs(
+        timeout_secs
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS),
+    );
+
+    // Blocking spawn + wait on Tokio's dedicated blocking pool via Tauri's
+    // wrapper. The earlier hand-rolled `thread::spawn` + `rx.recv()` moved
+    // work off-thread but then blocked the async future on the channel,
+    // defeating the runtime.
+    tauri::async_runtime::spawn_blocking(move || run_blocking(trimmed, cwd_path, dur))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+pub(crate) fn run_blocking(
+    command: String,
+    cwd: Option<PathBuf>,
+    dur: Duration,
+) -> Result<CommandOutput, String> {
+    let mut cmd = build_oneshot_command(&command);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    // Unix: put the child in its own process group (it becomes the group
+    // leader) so a future group-kill could take down a backgrounded grandchild
+    // too. This mirrors `pty_daemon::spawn`. We do NOT force-kill the group on
+    // timeout here: neither `libc` nor `nix` is a dependency, so there is no
+    // std-only way to `kill(-pgid)`. The bounded-drain below is the portable
+    // mitigation; orphan grandchildren that hold the pipe are NOT force-killed
+    // in this build (Windows is covered by the Job Object).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        log::warn!("shell_run_command spawn failed: {e}");
+        e.to_string()
+    })?;
+
+    // Windows: assign the child to a kill-on-close Job Object so a timeout
+    // kill (or normal return) takes down the WHOLE process tree. `child.kill()`
+    // only kills the direct shell; a backgrounded grandchild that inherits the
+    // stdout/stderr pipe would otherwise keep the pipe open forever, so the
+    // drain threads below would never see EOF. The job handle drops at end of
+    // scope, killing any survivors.
+    #[cfg(windows)]
+    let _job = crate::modules::pty::job::PtyJob::create_for(child.id()).ok();
+
+    let mut stdout_pipe = child.stdout.take().ok_or("no stdout pipe")?;
+    let mut stderr_pipe = child.stderr.take().ok_or("no stderr pipe")?;
+
+    // Drain stdout/stderr on background threads so a full pipe buffer cannot
+    // deadlock the child. The threads write into shared buffers and signal
+    // completion over a channel, so we can collect output WITHOUT a blocking
+    // `join()` that would pin this Tokio blocking-pool slot forever if a
+    // grandchild keeps the pipe open after a timeout kill.
+    //
+    // `stop` bounds the drain threads on Unix where there is no Job Object to
+    // close the pipe: after the child is reaped + a grace window, the main
+    // thread sets it so the drain loops exit on their next read return instead
+    // of leaking the thread + FD + ring buffer forever. A fully silent held
+    // pipe still parks the thread until it closes, but the common
+    // trickle-output grandchild is now bounded.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stdout_buf: Arc<Mutex<(Vec<u8>, bool)>> = Arc::new(Mutex::new((Vec::new(), false)));
+    let stderr_buf: Arc<Mutex<(Vec<u8>, bool)>> = Arc::new(Mutex::new((Vec::new(), false)));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    {
+        let buf = stdout_buf.clone();
+        let tx = done_tx.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let res = drain(&mut stdout_pipe, &stop);
+            *buf.lock().unwrap() = res;
+            let _ = tx.send(());
+        });
+    }
+    {
+        let buf = stderr_buf.clone();
+        let tx = done_tx;
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let res = drain(&mut stderr_pipe, &stop);
+            *buf.lock().unwrap() = res;
+            let _ = tx.send(());
+        });
+    }
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let exit_code: Option<i32> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if started.elapsed() >= dur {
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            break None;
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+
+    // Wait for the drain threads to flush, but never block forever: a killed
+    // shell's backgrounded grandchild can hold the pipe open. On a clean exit
+    // both signals arrive immediately; on a stuck pipe we proceed with what was
+    // buffered. `stop` then tells the drain loops to exit on their next read
+    // return (the Windows Job makes that prompt by killing the tree; on Unix it
+    // bounds threads that would otherwise leak).
+    const DRAIN_GRACE: Duration = Duration::from_secs(2);
+    let _ = done_rx.recv_timeout(DRAIN_GRACE);
+    let _ = done_rx.recv_timeout(DRAIN_GRACE);
+    stop.store(true, Ordering::Release);
+    let (stdout_bytes, stdout_truncated) = stdout_buf.lock().unwrap().clone();
+    let (stderr_bytes, stderr_truncated) = stderr_buf.lock().unwrap().clone();
+
+    Ok(CommandOutput {
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        exit_code,
+        timed_out,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Persistent agent shell state + background process state.
+// ──────────────────────────────────────────────────────────────────────────
+
+pub struct ShellState {
+    sessions: RwLock<HashMap<u32, Arc<ShellSession>>>,
+    bg: RwLock<HashMap<u32, Arc<BackgroundProc>>>,
+    next_session_id: AtomicU32,
+    next_bg_id: AtomicU32,
+}
+
+impl Default for ShellState {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            bg: RwLock::new(HashMap::new()),
+            next_session_id: AtomicU32::new(1),
+            next_bg_id: AtomicU32::new(1),
+        }
+    }
+}
+
+#[tauri::command]
+pub fn shell_session_open(
+    state: tauri::State<ShellState>,
+    cwd: Option<String>,
+) -> Result<u32, String> {
+    let initial = match cwd.as_deref().filter(|s| !s.is_empty()) {
+        Some(c) => {
+            let p = PathBuf::from(c);
+            if !p.is_dir() {
+                return Err(format!("cwd is not a directory: {c}"));
+            }
+            p
+        }
+        None => dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+    };
+    let session = Arc::new(ShellSession::new(initial));
+    let id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
+    state.sessions.write().unwrap().insert(id, session);
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn shell_session_run(
+    state: tauri::State<'_, ShellState>,
+    id: u32,
+    command: String,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<SessionRunOutput, String> {
+    let session = state
+        .sessions
+        .read()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no shell session".to_string())?;
+    let dur = Duration::from_secs(
+        timeout_secs
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS),
+    );
+    tauri::async_runtime::spawn_blocking(move || session.run(command, cwd, dur))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub fn shell_session_close(state: tauri::State<ShellState>, id: u32) -> Result<(), String> {
+    state.sessions.write().unwrap().remove(&id);
+    Ok(())
+}
+
+/// Max EXITED background procs retained for post-mortem log inspection.
+/// Beyond this, the oldest exited entries are dropped on the next spawn so a
+/// long agent session that churns dev servers/watchers cannot grow `bg`
+/// without bound. Live procs are never reaped.
+const MAX_RETAINED_EXITED: usize = 32;
+
+/// Drop exited background procs beyond `MAX_RETAINED_EXITED`, oldest first
+/// (handle id ascends with spawn order). Dropping the `Arc` frees the ring
+/// buffer and OS/Job handles via `BackgroundProc::Drop`. Live procs are kept.
+fn reap_exited_bg(map: &mut HashMap<u32, Arc<BackgroundProc>>) {
+    let mut exited: Vec<u32> = map
+        .iter()
+        .filter(|(_, p)| p.exited.load(Ordering::Acquire))
+        .map(|(id, _)| *id)
+        .collect();
+    if exited.len() <= MAX_RETAINED_EXITED {
+        return;
+    }
+    exited.sort_unstable();
+    let drop_count = exited.len() - MAX_RETAINED_EXITED;
+    for id in exited.into_iter().take(drop_count) {
+        map.remove(&id);
+    }
+}
+
+/// The `CreateProcess` is offloaded: a sync `#[tauri::command]` runs on the
+/// WebView2 UI thread on Windows, and spawning through the host shell there
+/// costs hundreds of ms. `state` cannot cross into the blocking pool (it is
+/// borrowed, not `'static`), so only the spawn goes over; the registry insert
+/// after the await is a HashMap write.
+#[tauri::command]
+pub async fn shell_bg_spawn(
+    state: tauri::State<'_, ShellState>,
+    command: String,
+    cwd: Option<String>,
+) -> Result<u32, String> {
+    let proc = tauri::async_runtime::spawn_blocking(move || background::spawn(command, cwd))
+        .await
+        .map_err(|e| format!("shell_bg_spawn join error: {e}"))??;
+    let id = state.next_bg_id.fetch_add(1, Ordering::Relaxed);
+    let mut map = state.bg.write().unwrap();
+    reap_exited_bg(&mut map);
+    map.insert(id, proc);
+    Ok(id)
+}
+
+/// Background spawn that bypasses the host shell. The tracked PID is the
+/// binary itself, so `shell_bg_kill` actually terminates the program rather
+/// than a `pwsh` / `bash` wrapper that leaks the real child. Use this for
+/// sidecar processes where a leaked grandchild would keep an external
+/// connection alive after the parent is gone.
+#[tauri::command]
+pub async fn shell_bg_spawn_direct(
+    state: tauri::State<'_, ShellState>,
+    program: String,
+    args: Option<Vec<String>>,
+    cwd: Option<String>,
+) -> Result<u32, String> {
+    let proc = tauri::async_runtime::spawn_blocking(move || {
+        background::spawn_direct(program, args.unwrap_or_default(), cwd)
+    })
+    .await
+    .map_err(|e| format!("shell_bg_spawn_direct join error: {e}"))??;
+    let id = state.next_bg_id.fetch_add(1, Ordering::Relaxed);
+    let mut map = state.bg.write().unwrap();
+    reap_exited_bg(&mut map);
+    map.insert(id, proc);
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn shell_bg_logs(
+    state: tauri::State<ShellState>,
+    handle: u32,
+    since_offset: Option<u64>,
+) -> Result<BackgroundLogResponse, String> {
+    let proc = state
+        .bg
+        .read()
+        .unwrap()
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| "no background handle".to_string())?;
+    Ok(proc.read_logs(since_offset.unwrap_or(0)))
+}
+
+#[tauri::command]
+pub fn shell_bg_kill(state: tauri::State<ShellState>, handle: u32) -> Result<(), String> {
+    if let Some(proc) = state.bg.read().unwrap().get(&handle).cloned() {
+        proc.kill();
+    }
+    Ok(())
+}
+
+/// Drop a background proc from the registry. The `Arc` drop kills the child (a
+/// no-op if already exited) and frees its ring buffer + OS/Job handles via
+/// `BackgroundProc::Drop`. Use after the caller no longer needs its logs;
+/// exited entries are also reaped automatically on the next spawn.
+#[tauri::command]
+pub fn shell_bg_remove(state: tauri::State<ShellState>, handle: u32) -> Result<(), String> {
+    state.bg.write().unwrap().remove(&handle);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn shell_bg_list(state: tauri::State<ShellState>) -> Result<Vec<BackgroundProcInfo>, String> {
+    let map = state.bg.read().unwrap();
+    let mut out = Vec::with_capacity(map.len());
+    for (id, p) in map.iter() {
+        out.push(p.info(*id));
+    }
+    out.sort_by_key(|i| i.handle);
+    Ok(out)
+}
+
+pub(crate) fn build_oneshot_command(command: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = Command::new(shell);
+        cmd.arg("-lc").arg(command);
+        crate::modules::appimage::sanitize_env(&mut cmd);
+        cmd
+    }
+    #[cfg(windows)]
+    {
+        let shell = crate::modules::pty::shell_init::windows_shell_path();
+        let mut cmd = Command::new(&shell);
+        let is_cmd = shell
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("cmd.exe"))
+            .unwrap_or(false);
+        if is_cmd {
+            cmd.arg("/C").arg(command);
+        } else {
+            cmd.arg("-NoProfile").arg("-Command").arg(command);
+        }
+        cmd
+    }
+}
+
+fn drain<R: Read>(reader: &mut R, stop: &AtomicBool) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        // Bounded exit: once the caller signals stop (child reaped + grace
+        // elapsed) we stop draining instead of leaking this thread + FD when a
+        // grandchild holds the pipe open. Checked between reads, so a fully
+        // silent held pipe still parks until its next read return.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() >= MAX_OUTPUT_BYTES {
+                    truncated = true;
+                    continue;
+                }
+                let take = (MAX_OUTPUT_BYTES - out.len()).min(n);
+                out.extend_from_slice(&buf[..take]);
+                if take < n {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (out, truncated)
+}
