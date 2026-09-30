@@ -73,7 +73,7 @@
       "endpoints": [
         "https://github.com/rendyuwu/subclave/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk4RTM5MTA2QTBDOUFEQTgKUldTb3JjbWdCcEhqbUlxbGJ5R01IMTE3UjczSklLM3VxR0VGSFJUZWs3dlljellCaWdVVFVPd20K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NEZEMkU4QTM2QjQ5QzkKUldUSlNXdWo2TkpQcVlzUXlIczI1TlE3QlVuTXJ3YXJKUW5ZOGRQUGFlVjZvenNNUzFPK1lMcGMK",
       "windows": {
         "installMode": "passive"
       }
