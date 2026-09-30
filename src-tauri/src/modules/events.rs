@@ -9,8 +9,11 @@ pub const SETTINGS_TAB: &str = "subclave:settings-tab";
 
 /// Vault locked (payload: `{ reason: "manual" | "idle" }`).
 pub const VAULT_LOCKED: &str = "subclave:vault-locked";
-/// Vault content changed (payload: `{ ids: string[], origin: "local" }`).
+/// Vault content changed (payload: `{ ids: string[], origin: "local" | "sync" }`).
 pub const VAULT_CHANGED: &str = "subclave:vault-changed";
+/// Main window regained focus (payload: `null`). The webview rate-limits the
+/// pull it triggers.
+pub const SYNC_FOCUSED: &str = "subclave:sync-focused";
 /// Vault write failed, or `null` when a retry succeeded.
 pub const VAULT_SAVE_FAILED: &str = "subclave:vault-save-failed";
 

@@ -11,7 +11,7 @@ pub struct Strength {
 }
 
 /// The mapping from zxcvbn's estimate to the webview shape.
-fn strength_of(password: &str) -> Strength {
+pub(crate) fn strength_of(password: &str) -> Strength {
     let estimate = zxcvbn::zxcvbn(password, &[]);
     Strength {
         score: u8::from(estimate.score()),

@@ -33,4 +33,9 @@ export const IPC_EVENTS = {
    * The webview confirms, then calls `quit_subclave`. Payload: `null`.
    */
   QUIT_REQUESTED: "subclave:quit-requested",
+  /**
+   * Rust -> main webview: the main window regained focus. The sync module
+   * rate-limits its own pulls, so this fires on every focus. Payload: `null`.
+   */
+  SYNC_FOCUSED: "subclave:sync-focused",
 } as const;

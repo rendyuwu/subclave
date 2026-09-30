@@ -223,7 +223,7 @@ pub(crate) fn read_bak(dir: &Path) -> Option<VaultFile> {
 mod tests {
     use super::*;
     use crate::modules::vault::kdf::fresh_params;
-    use crate::modules::vault::model::{Entry, ROOT_ID};
+    use crate::modules::vault::model::{DeviceState, Entry, ROOT_ID};
 
     const CANARY: &str = "SUBCLAVE-CANARY-7f3a";
 
@@ -273,6 +273,7 @@ mod tests {
             }],
             groups: vec![],
             tombstones: vec![],
+            device: DeviceState::default(),
         }
     }
 

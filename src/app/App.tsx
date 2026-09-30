@@ -16,6 +16,7 @@ import { openSettingsWindow } from "@/modules/settings/openSettingsWindow";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { useGlobalShortcuts } from "@/modules/shortcuts";
 import { StatusBar } from "@/modules/statusbar";
+import { startSync } from "@/modules/sync";
 import { ThemeProvider } from "@/modules/theme";
 import { QuitConfirmDialog } from "@/modules/vault/QuitConfirmDialog";
 import { SaveFailedBanner } from "@/modules/vault/SaveFailedBanner";
@@ -41,6 +42,8 @@ export default function App() {
   useEffect(() => {
     void initVault();
   }, [initVault]);
+
+  useEffect(() => startSync(), []);
 
   const shortcutHandlers = useMemo(
     () => buildShortcutHandlers({ toggleCommandPalette: () => setCommandPaletteOpen((o) => !o) }),

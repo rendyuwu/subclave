@@ -5,6 +5,8 @@
 //! [`EntryDraft`]) are what crosses the IPC boundary. Timestamps are Unix
 //! milliseconds everywhere; the LWW stamp rule is [`stamp_next`].
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{de::Deserializer, Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroize;
@@ -125,15 +127,68 @@ pub enum TombstoneKind {
     Group,
 }
 
-/// The decrypted payload. Device-local state (sync credentials, browser
-/// pairings) is not carried here yet; when it lands it arrives with
-/// `#[serde(default)]`, so the format v1 files written today open unchanged.
+/// This installation's device-local state. It rides the vault file (not the
+/// sync objects), arrives with `#[serde(default)]`, and is never shared, so
+/// the fields here never join a wire envelope.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceState {
+    #[serde(default)]
+    pub sync: SyncDevice,
+}
+
+/// Sync state owned by this device: what remote it is joined to, the root key
+/// that opens that remote, the credentials, and the bookkeeping maps the
+/// engine needs to skip unchanged objects and re-push local edits.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDevice {
+    /// The remote this device is joined to, `"{provider}|{endpoint}|{bucket}|{prefix}"`.
+    /// The stored root key is only valid for this identity; a config that
+    /// names another remote drops both before a session opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Base64, 32 bytes: the unwrapped root key. The passphrase is never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_access_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_secret_access_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webdav_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webdav_password: Option<String>,
+    /// `"kind:id"` to the etag the remote gave that object.
+    #[serde(default)]
+    pub etags: BTreeMap<String, String>,
+    /// `"kind:id"` slots with local changes the remote has not seen.
+    #[serde(default)]
+    pub dirty: BTreeSet<String>,
+}
+
+impl SyncDevice {
+    /// Record that `kind:id` has a local change the remote has not seen.
+    pub fn mark_dirty(&mut self, kind: &str, id: &str) {
+        self.dirty.insert(format!("{kind}:{id}"));
+    }
+
+    /// Forget the remote, the root key, the credentials and the tracking maps.
+    pub fn clear(&mut self) {
+        *self = SyncDevice::default();
+    }
+}
+
+/// The decrypted payload. Device-local state rides in [`DeviceState`] with
+/// `#[serde(default)]`, so files written before it landed open unchanged.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultPayload {
     pub entries: Vec<Entry>,
     pub groups: Vec<Group>,
     pub tombstones: Vec<Tombstone>,
+    #[serde(default)]
+    pub device: DeviceState,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -452,7 +507,44 @@ impl VaultPayload {
                 field.value.zeroize();
             }
         }
+        // The sync credentials are secrets too: a locked process must not
+        // keep the root key or the storage passwords in memory.
+        self.device.sync.root_key.take();
+        self.device.sync.s3_access_key_id.take();
+        self.device.sync.s3_secret_access_key.take();
+        self.device.sync.webdav_username.take();
+        self.device.sync.webdav_password.take();
+        self.device.sync.etags.clear();
+        self.device.sync.dirty.clear();
     }
+}
+
+/// Add the reserved groups (`root`, `trash`, `browser`) that are absent, with
+/// `browser` parented to `root`. Returns the ids it added, so a join can mark
+/// exactly those dirty; the create path ignores the return.
+pub(crate) fn seed_reserved_groups(payload: &mut VaultPayload, now: u64) -> Vec<String> {
+    let reserved: [(&str, Option<&str>, &str); 3] = [
+        (ROOT_ID, None, "Root"),
+        (TRASH_ID, None, "Trash"),
+        (BROWSER_ID, Some(ROOT_ID), "Browser"),
+    ];
+    let mut added = Vec::new();
+    for (id, parent, name) in reserved {
+        if payload.groups.iter().any(|g| g.id == id) {
+            continue;
+        }
+        payload.groups.push(Group {
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            name: name.into(),
+            icon: None,
+            color: None,
+            created_at: now,
+            updated_at: now,
+        });
+        added.push(id.to_string());
+    }
+    added
 }
 
 #[cfg(test)]
@@ -584,7 +676,19 @@ mod tests {
             entries: vec![e],
             groups: vec![],
             tombstones: vec![],
+            device: DeviceState::default(),
         };
+        payload.device.sync.root_key = Some("root-key".into());
+        payload.device.sync.s3_access_key_id = Some("akid".into());
+        payload.device.sync.s3_secret_access_key = Some("s3-secret".into());
+        payload.device.sync.webdav_username = Some("dav-user".into());
+        payload.device.sync.webdav_password = Some("dav-secret".into());
+        payload
+            .device
+            .sync
+            .etags
+            .insert("entry:e1".into(), "etag".into());
+        payload.device.sync.dirty.insert("entry:e1".into());
         payload.wipe();
         let e = &payload.entries[0];
         assert_eq!(e.password, "");
@@ -594,6 +698,11 @@ mod tests {
         assert_eq!(e.history[0].password, "");
         assert_eq!(e.history[0].notes, "");
         assert_eq!(e.history[0].custom_fields[0].value, "");
+        assert_eq!(
+            payload.device.sync,
+            SyncDevice::default(),
+            "the sync credentials and maps are scrubbed"
+        );
         assert_eq!(e.title, "Site", "metadata is not scrubbed");
     }
 }

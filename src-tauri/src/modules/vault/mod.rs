@@ -16,6 +16,7 @@
 pub mod file;
 pub mod kdf;
 pub mod lock;
+pub mod merge_history;
 pub mod model;
 
 use std::path::{Path, PathBuf};
@@ -35,9 +36,9 @@ use crate::modules::vault::file::{
 use crate::modules::vault::kdf::{derive_key, fresh_params, Argon2Params};
 use crate::modules::vault::lock::{deadline_after, deadline_passed};
 use crate::modules::vault::model::{
-    detail_of, normalize_tags, stamp_next, summary_of, version_changed_names, version_of, Entry,
-    EntryDetail, EntryDraft, EntrySummary, EntryVersion, Group, GroupDraft, Tombstone,
-    TombstoneKind, VaultPayload, BROWSER_ID, ROOT_ID, TRASH_ID,
+    detail_of, normalize_tags, seed_reserved_groups, stamp_next, summary_of, version_changed_names,
+    version_of, Entry, EntryDetail, EntryDraft, EntrySummary, EntryVersion, Group, GroupDraft,
+    Tombstone, TombstoneKind, VaultPayload, BROWSER_ID, ROOT_ID, TRASH_ID,
 };
 
 pub const LOCKED_ERR: &str = "vault: locked";
@@ -225,7 +226,7 @@ impl VaultState {
 /// failure the seal is parked in `pending` and the error propagates; the
 /// in-memory payload is already mutated, which is the contract the retry
 /// path relies on.
-fn commit(state: &VaultState, dir: &Path) -> Result<(), String> {
+pub(crate) fn commit(state: &VaultState, dir: &Path) -> Result<(), String> {
     // The lock is held across the seal AND the write, so a commit is one
     // ordered unit: two commits can never seal in one order and land in the
     // other, and an older seal can never land after a newer one.
@@ -362,6 +363,9 @@ pub(crate) fn drain_auto_lock(app: &AppHandle) {
 /// Emit the locked event. `pub(crate)` so the tray and the window handlers can
 /// reuse the same emission the command shells use.
 pub(crate) fn emit_locked(app: &AppHandle, reason: LockReason) {
+    // Every lock reason (idle, manual, minimize, tray) drops the in-memory
+    // sync session; the next unlock reopens it from the stored root key.
+    crate::modules::sync::session_closed(app);
     let _ = app.emit(
         events::VAULT_LOCKED,
         serde_json::json!({ "reason": reason }),
@@ -369,11 +373,12 @@ pub(crate) fn emit_locked(app: &AppHandle, reason: LockReason) {
 }
 
 /// Only called on success; a failed mutation emits `vault-save-failed`
-/// instead.
-fn emit_changed(app: &AppHandle, ids: &[String]) {
+/// instead. `origin` is `"local"` for every vault-side mutation and `"sync"`
+/// for a pull that landed records.
+pub(crate) fn emit_changed(app: &AppHandle, ids: &[String], origin: &str) {
     let _ = app.emit(
         events::VAULT_CHANGED,
-        serde_json::json!({ "ids": ids, "origin": "local" }),
+        serde_json::json!({ "ids": ids, "origin": origin }),
     );
 }
 
@@ -487,47 +492,33 @@ pub async fn vault_create(app: AppHandle, master_password: String) -> Result<(),
     result
 }
 
-fn vault_create_inner(state: &VaultState, dir: &Path, master_password: &str) -> Result<(), String> {
+pub(crate) fn vault_create_inner(
+    state: &VaultState,
+    dir: &Path,
+    master_password: &str,
+) -> Result<(), String> {
     if dir.join(VAULT_FILE_NAME).exists() || dir.join(format!("{VAULT_FILE_NAME}.bak")).exists() {
         return Err("vault: a vault file already exists".to_string());
     }
+    let now = now_ms();
+    let mut payload = VaultPayload::default();
+    seed_reserved_groups(&mut payload, now);
+    install_new_vault(state, dir, master_password, payload)
+}
+
+/// Seal `payload` under `master_password`, write it fresh, and install it as
+/// the unlocked session. This is the lower half of [`vault_create_inner`],
+/// shared with the sync join path so a payload pulled from the remote can be
+/// installed without reaching into [`VaultState`] internals.
+pub(crate) fn install_new_vault(
+    state: &VaultState,
+    dir: &Path,
+    master_password: &str,
+    payload: VaultPayload,
+) -> Result<(), String> {
     if master_password.chars().count() < 8 {
         return Err("vault: master password must be at least 8 characters".to_string());
     }
-    let now = now_ms();
-    let payload = VaultPayload {
-        entries: vec![],
-        groups: vec![
-            Group {
-                id: ROOT_ID.into(),
-                parent_id: None,
-                name: "Root".into(),
-                icon: None,
-                color: None,
-                created_at: now,
-                updated_at: now,
-            },
-            Group {
-                id: TRASH_ID.into(),
-                parent_id: None,
-                name: "Trash".into(),
-                icon: None,
-                color: None,
-                created_at: now,
-                updated_at: now,
-            },
-            Group {
-                id: BROWSER_ID.into(),
-                parent_id: Some(ROOT_ID.into()),
-                name: "Browser".into(),
-                icon: None,
-                color: None,
-                created_at: now,
-                updated_at: now,
-            },
-        ],
-        tombstones: vec![],
-    };
     let kdf = fresh_params()?;
     let key = derive_key(master_password, &kdf)?;
     let sealed = seal_payload(&payload, &key, &kdf)?;
@@ -767,7 +758,7 @@ pub async fn vault_restore_snapshot(app: AppHandle) -> Result<(), String> {
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -947,12 +938,12 @@ pub async fn vault_entry_upsert(app: AppHandle, draft: EntryDraft) -> Result<Ent
     drain_save_event(&app);
     drain_auto_lock(&app);
     if let Ok(summary) = &result {
-        emit_changed(&app, std::slice::from_ref(&summary.id));
+        emit_changed(&app, std::slice::from_ref(&summary.id), "local");
     }
     result
 }
 
-fn vault_entry_upsert_inner(
+pub(crate) fn vault_entry_upsert_inner(
     state: &VaultState,
     dir: &Path,
     draft: EntryDraft,
@@ -1126,6 +1117,7 @@ fn vault_entry_upsert_inner(
             id.clone()
         }
     };
+    payload.device.sync.mark_dirty("entry", &id);
     drop(guard);
     commit(state, dir)?;
     let guard = state.access()?;
@@ -1155,7 +1147,7 @@ pub async fn vault_entry_move(
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -1197,6 +1189,7 @@ fn vault_entry_move_inner(
             .expect("validated above");
         entry.group_id = group_id.clone();
         entry.updated_at = stamp_next(now, entry.updated_at);
+        payload.device.sync.mark_dirty("entry", id);
     }
     drop(guard);
     commit(state, dir)
@@ -1214,7 +1207,7 @@ pub async fn vault_entry_trash(app: AppHandle, ids: Vec<String>) -> Result<(), S
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -1245,6 +1238,7 @@ fn vault_entry_trash_inner(state: &VaultState, dir: &Path, ids: Vec<String>) -> 
         entry.trashed_from = Some(entry.group_id.clone());
         entry.group_id = TRASH_ID.into();
         entry.updated_at = stamp_next(now, entry.updated_at);
+        payload.device.sync.mark_dirty("entry", id);
     }
     drop(guard);
     commit(state, dir)
@@ -1262,7 +1256,7 @@ pub async fn vault_entry_restore(app: AppHandle, ids: Vec<String>) -> Result<(),
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -1303,6 +1297,7 @@ fn vault_entry_restore_inner(
         entry.trashed_from = None;
         entry.group_id = target;
         entry.updated_at = stamp_next(now, entry.updated_at);
+        payload.device.sync.mark_dirty("entry", id);
     }
     drop(guard);
     commit(state, dir)
@@ -1320,7 +1315,7 @@ pub async fn vault_entry_delete(app: AppHandle, ids: Vec<String>) -> Result<(), 
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -1347,6 +1342,7 @@ fn vault_entry_delete_inner(
     }
     for id in &ids {
         payload.entries.retain(|e| &e.id != id);
+        payload.device.sync.mark_dirty("entry", id);
         payload.tombstones.push(Tombstone {
             id: id.clone(),
             kind: TombstoneKind::Entry,
@@ -1374,7 +1370,7 @@ pub async fn vault_entry_restore_version(
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, std::slice::from_ref(&emit_id));
+        emit_changed(&app, std::slice::from_ref(&emit_id), "local");
     }
     result
 }
@@ -1415,6 +1411,7 @@ fn vault_entry_restore_version_inner(
     entry.history.insert(0, replaced);
     entry.history.truncate(10);
     let summary = summary_of(entry);
+    payload.device.sync.mark_dirty("entry", id);
     drop(guard);
     commit(state, dir)?;
     Ok(summary)
@@ -1432,7 +1429,7 @@ pub async fn vault_group_upsert(app: AppHandle, group: GroupDraft) -> Result<Gro
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -1520,6 +1517,7 @@ fn vault_group_upsert_inner(
             group.clone()
         }
     };
+    payload.device.sync.mark_dirty("group", &group.id);
     drop(guard);
     commit(state, dir)?;
     Ok(group)
@@ -1537,7 +1535,7 @@ pub async fn vault_group_delete(app: AppHandle, id: String) -> Result<(), String
     drain_save_event(&app);
     drain_auto_lock(&app);
     if result.is_ok() {
-        emit_changed(&app, &[]);
+        emit_changed(&app, &[], "local");
     }
     result
 }
@@ -1576,6 +1574,7 @@ fn vault_group_delete_inner(state: &VaultState, dir: &Path, id: String) -> Resul
         ));
     }
     payload.groups.retain(|g| g.id != id);
+    payload.device.sync.mark_dirty("group", &id);
     payload.tombstones.push(Tombstone {
         id,
         kind: TombstoneKind::Group,
@@ -1640,6 +1639,23 @@ mod tests {
             icon: None,
             color: None,
         }
+    }
+
+    /// A local edit rides the same save as the dirty mark, so the sync engine
+    /// can find it after a restart.
+    #[test]
+    fn an_edit_marks_the_slot_dirty() {
+        let dir = TempDir::new("dirty");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let summary = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Site")).unwrap();
+        let guard = state.access().unwrap();
+        let payload = &guard.as_ref().unwrap().payload;
+        assert!(payload
+            .device
+            .sync
+            .dirty
+            .contains(&format!("entry:{}", summary.id)));
     }
 
     /// The full core flow: create -> mutate -> save -> reload -> lock ->

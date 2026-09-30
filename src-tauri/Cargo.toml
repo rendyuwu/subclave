@@ -76,6 +76,25 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "zero
 # zxcvbn for the strength meter. Default features off drops `derive_builder`;
 # the score and feedback APIs used in `strength.rs` do not need it.
 zxcvbn = { version = "3", default-features = false }
+# Sync providers. `rustls-no-provider`, not `rustls`: that feature pulls
+# aws-lc-rs, which needs NASM on Windows.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+# The TLS provider reqwest's `rustls-no-provider` feature deliberately does not
+# install, named directly so the process can install it (see
+# `ensure_crypto_provider` in `src-tauri/src/modules/sync/providers/mod.rs`).
+# `ring` is the provider the rest of the graph already builds rustls with, so
+# this adds no crate to the build.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Already in the tree through tauri, so taking it directly adds no crate to the
+# build. The sync engine's test fake locks and immediately unwraps, where a
+# poisoning error path is pure ceremony; `[dev-dependencies]` is not available
+# to this crate, so the dependency lives here. `SyncState` keeps `std::sync`:
+# its lock is held across an async boundary the fake's never is, and it reports
+# a poison rather than unwrapping one.
+parking_lot = "0.12"
+# The sync providers' async runtime surface: `spawn_blocking` for the KDF and
+# the vault writes, `sync` for the engine's own primitives.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # Base32 for TOTP secrets.
 data-encoding = "2"
 # URL parsing for TOTP otpauth URIs and entry host extraction.
