@@ -28,11 +28,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use zeroize::Zeroizing;
 
 use crate::modules::events;
+use crate::modules::prefs;
 use crate::modules::vault::file::{
-    load_vault, open_file, save_vault, seal_payload, OpenVault, VaultFile, VAULT_FILE_NAME,
+    load_vault, open_file, save_vault, seal_payload, VaultFile, VAULT_FILE_NAME,
 };
 use crate::modules::vault::kdf::{derive_key, fresh_params, Argon2Params};
-use crate::modules::vault::lock::{deadline_after, deadline_passed, DEFAULT_AUTO_LOCK_MINUTES};
+use crate::modules::vault::lock::{deadline_after, deadline_passed};
 use crate::modules::vault::model::{
     detail_of, normalize_tags, stamp_next, summary_of, version_changed_names, version_of, Entry,
     EntryDetail, EntryDraft, EntrySummary, EntryVersion, Group, GroupDraft, Tombstone,
@@ -41,13 +42,16 @@ use crate::modules::vault::model::{
 
 pub const LOCKED_ERR: &str = "vault: locked";
 
-/// Why the vault locked. The window-event reasons (minimize, tray) are added
-/// when the window events that trigger them exist.
+/// Why the vault locked. The minimize and tray reasons come from the window
+/// and tray event handlers; both emit only when the lock actually dropped an
+/// unlocked payload.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LockReason {
     Manual,
     Idle,
+    Minimize,
+    Tray,
 }
 
 /// Everything held while the vault is unlocked.
@@ -66,22 +70,26 @@ pub struct VaultState {
     /// Sealed bytes parked after a failed write. Ciphertext only, so the
     /// retry works while locked.
     pending: Mutex<Option<VaultFile>>,
-    /// Serializes write + pending updates, so a stale pending write can never
-    /// land after a newer one: a newer `perform_save` always overwrites
-    /// `pending`, and an older one cannot land after a newer write.
+    /// Serializes seal, write and pending updates, so a stale pending write can
+    /// never land after a newer one: the newest `perform_save_locked` always
+    /// overwrites `pending`, and an older write cannot land after a newer one
+    /// because the whole seal-then-write pair is one critical section.
     save_lock: Mutex<()>,
     /// Idle deadline in boot-clock ms; `u64::MAX` = never.
     deadline_ms: AtomicU64,
-    /// Set when `load_vault` had to fall back to the `.bak`: the primary is
-    /// broken and must never be silently overwritten. Clearing this flag is
-    /// the restore flow's job.
+    /// Set when the payload was OPENED from the `.bak` (the primary was
+    /// unreadable, or failed to open): the primary is broken and must never be
+    /// silently overwritten. A stale disk copy after a failed write is not
+    /// this flag; the next commit simply lands. Clearing this flag is the
+    /// restore flow's job.
     save_blocked: AtomicBool,
     /// Set by an automatic lock (the idle tick, or an expired deadline hit
     /// inside [`VaultState::access`]); drained by the next command shell to
     /// emit the event.
     auto_lock_event: Mutex<Option<LockReason>>,
-    /// The outcome of the last save attempt, recorded by [`perform_save`]
-    /// and drained by the shells into `subclave:vault-save-failed`. Both the
+    /// The outcome of the last save attempt, recorded by
+    /// [`perform_save_locked`] and drained by the shells into
+    /// `subclave:vault-save-failed`. Both the
     /// failure and the success are events: the banner shows the reason and
     /// clears on the next good write.
     save_event: Mutex<Option<SaveOutcome>>,
@@ -125,11 +133,10 @@ impl VaultState {
             }
             *guard = None;
             // Refresh before the guard is released: the next reader must not
-            // see the expired deadline.
-            self.deadline_ms.store(
-                deadline_after(DEFAULT_AUTO_LOCK_MINUTES, lock::boot_now_ms()),
-                Ordering::SeqCst,
-            );
+            // see the expired deadline. The payload is gone, so the next
+            // unlock or touch is what stores a real deadline.
+            self.deadline_ms
+                .store(deadline_after(0, lock::boot_now_ms()), Ordering::SeqCst);
             *self
                 .auto_lock_event
                 .lock()
@@ -141,18 +148,24 @@ impl VaultState {
 
     /// Wipe the payload and drop the key. Records nothing: the caller owns
     /// the event (`vault_lock` emits Manual directly; the tick's expiry goes
-    /// through `access`, which records Idle).
-    pub(crate) fn lock_inner(&self) {
+    /// through `access`, which records Idle). Returns `true` when an unlocked
+    /// payload was actually dropped, so the minimize and tray paths emit only
+    /// a real lock.
+    pub(crate) fn lock_inner(&self) -> bool {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = guard.is_some();
         if let Some(unlocked) = guard.as_mut() {
             unlocked.payload.wipe();
         }
         *guard = None;
+        dropped
     }
 
-    pub(crate) fn refresh_deadline(&self) {
+    /// Store the idle deadline from the current `autoLockMinutes` preference
+    /// (`0` = never).
+    pub(crate) fn refresh_deadline(&self, minutes: u64) {
         self.deadline_ms.store(
-            deadline_after(DEFAULT_AUTO_LOCK_MINUTES, lock::boot_now_ms()),
+            deadline_after(minutes, lock::boot_now_ms()),
             Ordering::SeqCst,
         );
     }
@@ -173,6 +186,29 @@ impl VaultState {
             .unwrap_or_else(|e| e.into_inner())
             .take()
     }
+
+    /// True while a failed write is parked. The quit flow asks before it lets
+    /// the process exit and lose those changes.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.lock_or_recover().is_some()
+    }
+
+    /// Drop the parked seal: a write that landed makes it stale, and a
+    /// confirmed quit loses it with the process either way.
+    pub(crate) fn drop_pending(&self) {
+        *self.pending.lock_or_recover() = None;
+    }
+
+    /// The refusal every mutation answers while the payload came from the
+    /// `.bak`. Checked BEFORE the payload is touched, not only at write time:
+    /// an edit that only ever lived in memory would be dropped by a quit that
+    /// never prompted, because no seal was ever parked for it.
+    pub(crate) fn ensure_writable(&self) -> Result<(), String> {
+        if self.save_blocked.load(Ordering::SeqCst) {
+            return Err("vault: restore the snapshot before saving".to_string());
+        }
+        Ok(())
+    }
 }
 
 // ---- Save machinery ----
@@ -190,30 +226,26 @@ impl VaultState {
 /// in-memory payload is already mutated, which is the contract the retry
 /// path relies on.
 fn commit(state: &VaultState, dir: &Path) -> Result<(), String> {
-    // save_lock is taken BEFORE inner so the seal and the write are one
-    // ordered unit: an older seal can never land after a newer one. Sealed
-    // first, then perform_save re-takes the lock with the fresh seal.
+    // The lock is held across the seal AND the write, so a commit is one
+    // ordered unit: two commits can never seal in one order and land in the
+    // other, and an older seal can never land after a newer one.
+    let _held = state.save_lock.lock_or_recover();
     let sealed = {
-        let _held = state.save_lock.lock_or_recover();
         let guard = state.access()?;
         let unlocked = guard.as_ref().ok_or_else(|| LOCKED_ERR.to_string())?;
         seal_payload(&unlocked.payload, &unlocked.key, &unlocked.kdf)?
     };
-    perform_save(state, dir, sealed)
+    perform_save_locked(state, dir, sealed)
 }
 
-/// Write `file` under save_lock. On success any parked seal is dropped (the
-/// disk now holds something at least as new); on failure this file is parked
-/// as the newest seal. Used by the retry and the shells that do not seal
-/// under the lock themselves.
-fn perform_save(state: &VaultState, dir: &Path, file: VaultFile) -> Result<(), String> {
-    let _held = state.save_lock.lock_or_recover();
-    if state.save_blocked.load(Ordering::SeqCst) {
-        return Err("vault: restore the snapshot before saving".to_string());
-    }
+/// Write `file` with `save_lock` already held. On success any parked seal is
+/// dropped (the disk now holds something at least as new); on failure this
+/// file is parked as the newest seal.
+fn perform_save_locked(state: &VaultState, dir: &Path, file: VaultFile) -> Result<(), String> {
+    state.ensure_writable()?;
     match save_vault(dir, &file) {
         Ok(()) => {
-            *state.pending.lock_or_recover() = None;
+            state.drop_pending();
             *state.save_event.lock_or_recover() = Some(SaveOutcome::Succeeded);
             Ok(())
         }
@@ -234,7 +266,7 @@ fn now_ms() -> u64 {
 
 /// The app data dir for a command. Tauri's resolver applies the `.dev`
 /// suffix from `tauri.dev.conf.json`.
-fn vault_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn vault_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|e| format!("vault: {e}"))
 }
 
@@ -283,6 +315,7 @@ pub(crate) fn resolve_field(
     }
     match field {
         "password" => Ok(entry.password.clone()),
+        "username" => Ok(entry.username.clone()),
         "totp" => {
             let uri = entry
                 .totp
@@ -326,7 +359,9 @@ pub(crate) fn drain_auto_lock(app: &AppHandle) {
     }
 }
 
-fn emit_locked(app: &AppHandle, reason: LockReason) {
+/// Emit the locked event. `pub(crate)` so the tray and the window handlers can
+/// reuse the same emission the command shells use.
+pub(crate) fn emit_locked(app: &AppHandle, reason: LockReason) {
     let _ = app.emit(
         events::VAULT_LOCKED,
         serde_json::json!({ "reason": reason }),
@@ -377,6 +412,14 @@ pub struct VaultStatus {
     pub exists: bool,
     pub locked: bool,
     pub save_pending: bool,
+    /// True when the payload was opened from the `.bak`. While true every
+    /// save is refused with "vault: restore the snapshot before saving".
+    pub save_blocked: bool,
+    /// Epoch ms mtime of the `.bak`, `None` when there is no `.bak`.
+    pub backup_at: Option<u64>,
+    /// Ms until the idle deadline, `None` while locked or when auto-lock is
+    /// off. Both numbers are boot-clock ms, so the subtraction is meaningful.
+    pub locks_in_ms: Option<u64>,
 }
 
 #[tauri::command]
@@ -393,6 +436,16 @@ pub async fn vault_status(app: AppHandle) -> Result<VaultStatus, String> {
     result
 }
 
+/// Epoch ms mtime of the `.bak`, `None` when it is absent or unreadable.
+fn bak_mtime_ms(dir: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(dir.join(format!("{VAULT_FILE_NAME}.bak")))
+        .ok()?
+        .modified()
+        .ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since_epoch.as_millis() as u64)
+}
+
 fn vault_status_inner(state: &VaultState, dir: &Path) -> Result<VaultStatus, String> {
     // Through access so an expired deadline locks (and wipes) before the
     // report; the expired call itself answers Err(locked), which is exactly
@@ -404,10 +457,19 @@ fn vault_status_inner(state: &VaultState, dir: &Path) -> Result<VaultStatus, Str
     };
     let exists =
         dir.join(VAULT_FILE_NAME).is_file() || dir.join(format!("{VAULT_FILE_NAME}.bak")).is_file();
+    let locks_in_ms = if locked {
+        None
+    } else {
+        let deadline = state.deadline_ms.load(Ordering::SeqCst);
+        (deadline != u64::MAX).then(|| deadline.saturating_sub(lock::boot_now_ms()))
+    };
     Ok(VaultStatus {
         exists,
         locked,
-        save_pending: state.pending.lock_or_recover().is_some(),
+        save_pending: state.has_pending(),
+        save_blocked: state.save_blocked.load(Ordering::SeqCst),
+        backup_at: bak_mtime_ms(dir),
+        locks_in_ms,
     })
 }
 
@@ -478,11 +540,11 @@ fn vault_create_inner(state: &VaultState, dir: &Path, master_password: &str) -> 
             return Err("vault: restore the snapshot before saving".to_string());
         }
         save_vault(dir, &sealed).map_err(|e| format!("vault: {e}"))?;
-        *state.pending.lock_or_recover() = None;
+        state.drop_pending();
     }
     // Refresh BEFORE installing: a concurrent access() must not see the
     // previous session's expired deadline while the new one is installed.
-    state.refresh_deadline();
+    state.refresh_deadline(prefs::read(dir).auto_lock_minutes);
     *state.inner.lock_or_recover() = Some(Unlocked { payload, key, kdf });
     Ok(())
 }
@@ -503,24 +565,40 @@ pub async fn vault_unlock(app: AppHandle, master_password: String) -> Result<(),
 
 fn vault_unlock_inner(state: &VaultState, dir: &Path, master_password: &str) -> Result<(), String> {
     let (file, from_bak) = load_vault(dir)?;
+    // A structurally broken primary already fell back to the `.bak`. When the
+    // primary parses but fails to OPEN (a GCM tag failure from bit rot or
+    // tampering, which `load_vault` cannot see without the key), retry the
+    // `.bak` before reporting: a good backup beside a rotted primary is
+    // recoverable, and the failure would otherwise be an opaque message. A
+    // wrong password fails on both files and keeps that same message.
+    let (opened, from_bak) = match open_file(&file, master_password) {
+        Ok(opened) => (opened, from_bak),
+        // `load_vault` already handed back the `.bak` (the primary was
+        // unreadable), so there is nothing else to try: re-opening the same
+        // file would only spend a second key derivation.
+        Err(primary_err) if from_bak => return Err(primary_err),
+        Err(primary_err) => match file::read_bak(dir) {
+            Some(bak) => match open_file(&bak, master_password) {
+                Ok(opened) => (opened, true),
+                Err(_) => return Err(primary_err),
+            },
+            None => return Err(primary_err),
+        },
+    };
     state.save_blocked.store(from_bak, Ordering::SeqCst);
-    let opened: OpenVault = open_file(&file, master_password)?;
-    // A parked seal is newer than the disk copy it failed to replace (the
-    // P0 fix clears it on every successful save, so it can only still exist
-    // if the write keeps failing). It is sealed under the same key and kdf
-    // this file just derived, so opening it shows the user their edits.
+    // A parked seal is newer than the disk copy it failed to replace (a
+    // successful save clears it, so it can only still exist while the write
+    // keeps failing). It is sealed under the same key and kdf this file just
+    // derived, so opening it shows the user their edits. A stale disk copy is
+    // not a broken primary, so this does not set save_blocked: the next
+    // commit simply lands.
     let payload = match state.pending.lock_or_recover().clone() {
         Some(pending) => open_file(&pending, master_password)
-            .map(|o| {
-                // The parked seal wins, and save_blocked says the disk
-                // copy is the broken one.
-                state.save_blocked.store(true, Ordering::SeqCst);
-                o.payload
-            })
+            .map(|o| o.payload)
             .unwrap_or_else(|_| opened.payload),
         None => opened.payload,
     };
-    state.refresh_deadline();
+    state.refresh_deadline(prefs::read(dir).auto_lock_minutes);
     *state.inner.lock_or_recover() = Some(Unlocked {
         payload,
         key: opened.key,
@@ -545,9 +623,10 @@ pub async fn vault_lock(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn vault_touch(app: AppHandle) -> Result<(), String> {
+    let dir = vault_dir(&app)?;
     let task_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        vault_touch_inner(&task_app.state::<VaultState>())
+        vault_touch_inner(&task_app.state::<VaultState>(), &dir)
     })
     .await
     .map_err(|e| format!("vault: task failed: {e}"))?;
@@ -556,11 +635,13 @@ pub async fn vault_touch(app: AppHandle) -> Result<(), String> {
     result
 }
 
-fn vault_touch_inner(state: &VaultState) -> Result<(), String> {
+fn vault_touch_inner(state: &VaultState, dir: &Path) -> Result<(), String> {
     // Through access so an expired deadline locks instead of extending. The
-    // guard is dropped immediately: touch only extends the deadline.
+    // guard is dropped immediately: touch only extends the deadline. Reading
+    // the preference here is also how a Settings change takes effect without
+    // waiting for the next unlock.
     drop(state.access()?);
-    state.refresh_deadline();
+    state.refresh_deadline(prefs::read(dir).auto_lock_minutes);
     Ok(())
 }
 
@@ -618,7 +699,7 @@ fn vault_change_master_inner(
         return Err("vault: restore the snapshot before saving".to_string());
     }
     save_vault(dir, &sealed).map_err(|e| format!("vault: {e}"))?;
-    *state.pending.lock_or_recover() = None;
+    state.drop_pending();
     // Only after the write lands: the disk opens with the new password from
     // this point, so the in-memory key must follow.
     {
@@ -651,20 +732,82 @@ pub async fn vault_retry_save(app: AppHandle) -> Result<(), String> {
 
 /// Also what the background tick calls every 10 s. Works while locked:
 /// `pending` holds ciphertext only. Success clears `pending`; failure leaves
-/// it, because it already holds the newest seal. The read, write and clear
-/// all happen under save_lock, so a commit racing in between cannot be
-/// overwritten by the retry or lost by the clear.
+/// it, because it already holds the newest seal.
+///
+/// The seal is COPIED out, not taken, and `save_lock` is held across the whole
+/// attempt: `pending` therefore never reads empty while a retry is in flight,
+/// which is what [`VaultState::has_pending`] needs to answer the quit prompt
+/// (a taken seal left a window where a close would exit and lose the write).
 pub(crate) fn vault_retry_save_inner(state: &VaultState, dir: &Path) -> Result<(), String> {
-    let file = {
-        let _held = state.save_lock.lock_or_recover();
-        state.pending.lock_or_recover().take()
-    };
-    if let Some(file) = file {
-        // perform_save re-parks it on failure, so the retry state is kept.
-        perform_save(state, dir, file)
-    } else {
-        Ok(())
+    let _held = state.save_lock.lock_or_recover();
+    // Bound in its own statement, not read inside the `match` scrutinee: a
+    // temporary guard there lives until the end of the match and
+    // `perform_save_locked` locks `pending` itself, which deadlocks.
+    let parked = state.pending.lock_or_recover().clone();
+    match parked {
+        // perform_save_locked re-parks it on failure, so the retry state is kept.
+        Some(file) => perform_save_locked(state, dir, file),
+        None => Ok(()),
     }
+}
+
+/// Recover a vault whose payload was opened from the `.bak`. The broken
+/// primary is moved to `subclave-vault.json.corrupt` so the commit that
+/// follows cannot overwrite something the user might still want, then the
+/// in-memory payload is sealed and written fresh.
+#[tauri::command]
+pub async fn vault_restore_snapshot(app: AppHandle) -> Result<(), String> {
+    let dir = vault_dir(&app)?;
+    let task_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        vault_restore_snapshot_inner(&task_app.state::<VaultState>(), &dir)
+    })
+    .await
+    .map_err(|e| format!("vault: task failed: {e}"))?;
+    drain_save_event(&app);
+    drain_auto_lock(&app);
+    if result.is_ok() {
+        emit_changed(&app, &[]);
+    }
+    result
+}
+
+fn vault_restore_snapshot_inner(state: &VaultState, dir: &Path) -> Result<(), String> {
+    // Held across the whole restore, so two clicks cannot interleave: without
+    // it the second call could pass the flag check before the first clears it
+    // and rename the freshly written good primary over the broken copy.
+    let _held = state.save_lock.lock_or_recover();
+    if !state.save_blocked.load(Ordering::SeqCst) {
+        return Err("vault: no snapshot to restore".to_string());
+    }
+    // Refuse before moving anything when locked: the seal below needs the
+    // in-memory payload and key, and the broken primary must not be moved
+    // aside for a restore that cannot run.
+    if state.access()?.is_none() {
+        return Err(LOCKED_ERR.to_string());
+    }
+    let primary = dir.join(VAULT_FILE_NAME);
+    if primary.exists() {
+        let corrupt = dir.join(format!("{VAULT_FILE_NAME}.corrupt"));
+        // The newest broken bytes are the ones worth keeping: `fs::rename`
+        // replaces the target, so drop the previous copy explicitly rather
+        // than pretending the first one survives.
+        if corrupt.exists() {
+            std::fs::remove_file(&corrupt).map_err(|e| format!("vault: {e}"))?;
+        }
+        std::fs::rename(&primary, &corrupt).map_err(|e| format!("vault: {e}"))?;
+    }
+    state.save_blocked.store(false, Ordering::SeqCst);
+    // Seals the payload already in memory with the held key and writes primary
+    // plus `.bak` fresh, which also clears any parked seal. On failure the
+    // seal is parked, the flag stays false, and the next retry lands (the
+    // broken file is already out of the way).
+    let sealed = {
+        let guard = state.access()?;
+        let unlocked = guard.as_ref().ok_or_else(|| LOCKED_ERR.to_string())?;
+        seal_payload(&unlocked.payload, &unlocked.key, &unlocked.kdf)?
+    };
+    perform_save_locked(state, dir, sealed)
 }
 
 #[derive(Serialize)]
@@ -695,6 +838,47 @@ fn vault_list_inner(state: &VaultState) -> Result<VaultList, String> {
         entries: unlocked.payload.entries.iter().map(summary_of).collect(),
         groups: unlocked.payload.groups.clone(),
     })
+}
+
+/// Ids of the entries whose title, username, notes, any tag or any URL
+/// contains `query` case-insensitively. Never the password. Trashed entries
+/// are included; the UI applies its own scope. An empty or whitespace-only
+/// query returns an empty list.
+#[tauri::command]
+pub async fn vault_search(app: AppHandle, query: String) -> Result<Vec<String>, String> {
+    let task_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        vault_search_inner(&task_app.state::<VaultState>(), &query)
+    })
+    .await
+    .map_err(|e| format!("vault: task failed: {e}"))?;
+    drain_save_event(&app);
+    drain_auto_lock(&app);
+    result
+}
+
+fn vault_search_inner(state: &VaultState, query: &str) -> Result<Vec<String>, String> {
+    let needle = query.trim().to_lowercase();
+    let guard = state.access()?;
+    let unlocked = guard.as_ref().ok_or_else(|| LOCKED_ERR.to_string())?;
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(unlocked
+        .payload
+        .entries
+        .iter()
+        .filter(|e| {
+            e.title.to_lowercase().contains(&needle)
+                || e.username.to_lowercase().contains(&needle)
+                || e.notes.to_lowercase().contains(&needle)
+                || e.tags.iter().any(|t| t.to_lowercase().contains(&needle))
+                || e.urls
+                    .iter()
+                    .any(|u| u.url.to_lowercase().contains(&needle))
+        })
+        .map(|e| e.id.clone())
+        .collect())
 }
 
 #[tauri::command]
@@ -773,6 +957,7 @@ fn vault_entry_upsert_inner(
     dir: &Path,
     draft: EntryDraft,
 ) -> Result<EntrySummary, String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -805,6 +990,11 @@ fn vault_entry_upsert_inner(
             // Create.
             if draft.group_id != ROOT_ID && !payload.groups.iter().any(|g| g.id == draft.group_id) {
                 return Err("vault: no such group".to_string());
+            }
+            // A create into Trash would have no `trashed_from` to restore to,
+            // so entry creation and trashing stay separate paths.
+            if draft.group_id == TRASH_ID {
+                return Err("vault: use trash instead".to_string());
             }
             let totp = match &update_totp {
                 Some(totp) => totp.clone(),
@@ -976,6 +1166,7 @@ fn vault_entry_move_inner(
     ids: Vec<String>,
     group_id: String,
 ) -> Result<(), String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -1029,6 +1220,7 @@ pub async fn vault_entry_trash(app: AppHandle, ids: Vec<String>) -> Result<(), S
 }
 
 fn vault_entry_trash_inner(state: &VaultState, dir: &Path, ids: Vec<String>) -> Result<(), String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -1080,6 +1272,7 @@ fn vault_entry_restore_inner(
     dir: &Path,
     ids: Vec<String>,
 ) -> Result<(), String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -1137,6 +1330,7 @@ fn vault_entry_delete_inner(
     dir: &Path,
     ids: Vec<String>,
 ) -> Result<(), String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -1191,6 +1385,7 @@ fn vault_entry_restore_version_inner(
     id: &str,
     updated_at: u64,
 ) -> Result<EntrySummary, String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -1247,6 +1442,7 @@ fn vault_group_upsert_inner(
     dir: &Path,
     draft: GroupDraft,
 ) -> Result<Group, String> {
+    state.ensure_writable()?;
     let mut guard = state.access()?;
     let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
     let payload = &mut unlocked.payload;
@@ -1347,6 +1543,7 @@ pub async fn vault_group_delete(app: AppHandle, id: String) -> Result<(), String
 }
 
 fn vault_group_delete_inner(state: &VaultState, dir: &Path, id: String) -> Result<(), String> {
+    state.ensure_writable()?;
     // The reserved groups are load-bearing: trash is the restore source,
     // browser is the sync-stable save-login target, root is the fallback
     // parent. Entries point at them by id, and M3 sync would propagate a
@@ -1391,6 +1588,8 @@ fn vault_group_delete_inner(state: &VaultState, dir: &Path, id: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
     /// A private directory under the system temp dir, removed on drop.
     struct TempDir(std::path::PathBuf);
@@ -1618,7 +1817,7 @@ mod tests {
             .store(1, std::sync::atomic::Ordering::SeqCst);
         // vault_touch locks instead of extending: it goes through access
         // first, so the expired deadline fires and the session is gone.
-        assert_eq!(vault_touch_inner(&state5).unwrap_err(), LOCKED_ERR);
+        assert_eq!(vault_touch_inner(&state5, &dir.0).unwrap_err(), LOCKED_ERR);
         {
             let guard = state5.inner.lock().unwrap();
             assert!(guard.is_none(), "the expired access must have locked");
@@ -1629,7 +1828,7 @@ mod tests {
             vault_entry_reveal_inner(&state5, "any", "password").unwrap_err(),
             LOCKED_ERR
         );
-        assert!(vault_touch_inner(&state5).is_ok());
+        assert!(vault_touch_inner(&state5, &dir.0).is_ok());
 
         // Retry path: a directory at the vault path makes the write fail,
         // pending holds the seal, the retry succeeds once it is gone.
@@ -1752,6 +1951,7 @@ mod tests {
             last_used_at: None,
         };
         assert_eq!(resolve_field(&entry, "password", false).unwrap(), "pw");
+        assert_eq!(resolve_field(&entry, "username", false).unwrap(), "u");
         // totp as code: six digits, from the current unix second. The
         // exact value is pinned by the RFC vector tests; here only the
         // path is proven.
@@ -1788,9 +1988,10 @@ mod tests {
     /// this is testable headless; the round trip itself needs a display.
     #[test]
     fn clip_copy_field_lock_path() {
+        let dir = TempDir::new("clip");
         let state = VaultState::default();
         assert_eq!(
-            crate::modules::clipboard::clip_copy_field_inner(&state, "any", "password")
+            crate::modules::clipboard::clip_copy_field_inner(&state, &dir.0, "any", "password")
                 .err()
                 .unwrap(),
             LOCKED_ERR
@@ -1956,8 +2157,394 @@ mod tests {
     #[test]
     fn manual_lock_records_no_auto_lock_flag() {
         let state = VaultState::default();
-        state.lock_inner();
+        assert!(!state.lock_inner(), "nothing was unlocked to drop");
         assert_eq!(state.take_auto_lock(), None);
         assert_eq!(state.take_auto_lock(), None, "the flag must not re-fire");
+    }
+
+    /// A structurally broken primary falls back to the `.bak`, the status
+    /// reports the block and the backup time, and the restore moves the broken
+    /// bytes aside and writes fresh.
+    #[test]
+    fn restore_snapshot_recovers_a_structurally_broken_primary() {
+        let dir = TempDir::new("restore");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let kept = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Keep me")).unwrap();
+
+        // Break the primary so load_vault falls back to the good .bak.
+        let primary = dir.0.join(file::VAULT_FILE_NAME);
+        let mut broken: file::VaultFile =
+            serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+        broken.ciphertext = "!".into();
+        let broken_bytes = file::vault_file_bytes(&broken).unwrap();
+        std::fs::write(&primary, &broken_bytes).unwrap();
+
+        let reopened = VaultState::default();
+        vault_unlock_inner(&reopened, &dir.0, "master-pw").unwrap();
+        let status = vault_status_inner(&reopened, &dir.0).unwrap();
+        assert!(status.save_blocked);
+        assert!(status.backup_at.is_some());
+        assert!(status.exists);
+        assert!(!status.locked);
+        assert!(!status.save_pending);
+
+        // Saving is refused until the snapshot is restored.
+        assert_eq!(
+            vault_entry_upsert_inner(&reopened, &dir.0, draft(None, "Nope")).unwrap_err(),
+            "vault: restore the snapshot before saving"
+        );
+
+        // A restore while locked refuses before moving anything.
+        let broken_before = std::fs::read(&primary).unwrap();
+        assert!(reopened.lock_inner());
+        assert_eq!(
+            vault_restore_snapshot_inner(&reopened, &dir.0).unwrap_err(),
+            LOCKED_ERR
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), broken_before);
+        vault_unlock_inner(&reopened, &dir.0, "master-pw").unwrap();
+
+        vault_restore_snapshot_inner(&reopened, &dir.0).unwrap();
+        assert!(!reopened.save_blocked.load(Ordering::SeqCst));
+        let corrupt = dir.0.join(format!("{VAULT_FILE_NAME}.corrupt"));
+        assert_eq!(std::fs::read(&corrupt).unwrap(), broken_bytes);
+        assert!(!vault_status_inner(&reopened, &dir.0).unwrap().save_blocked);
+
+        // The next commit lands, and both the restored and the new entry are
+        // on disk.
+        vault_entry_upsert_inner(&reopened, &dir.0, draft(None, "After restore")).unwrap();
+        let probe = VaultState::default();
+        vault_unlock_inner(&probe, &dir.0, "master-pw").unwrap();
+        let titles: Vec<String> = vault_list_inner(&probe)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.title)
+            .collect();
+        assert!(titles.contains(&"Keep me".to_string()));
+        assert!(titles.contains(&"After restore".to_string()));
+        assert!(kept.updated_at > 0);
+        // A restore with nothing blocked is a no-op error.
+        assert_eq!(
+            vault_restore_snapshot_inner(&probe, &dir.0).unwrap_err(),
+            "vault: no snapshot to restore"
+        );
+    }
+
+    /// A primary that parses and is structurally readable but whose GCM tag
+    /// fails (bit rot, tampering) is unopenable, so unlock retries the `.bak`;
+    /// with no `.bak` the same call keeps the one opaque message.
+    #[test]
+    fn unlock_falls_back_to_the_bak_when_the_primary_fails_to_open() {
+        let dir = TempDir::new("gcm");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+
+        // Valid base64 decoding to 32 bytes: the structural check passes and
+        // load_vault hands back the primary, so only the GCM open fails.
+        let primary = dir.0.join(file::VAULT_FILE_NAME);
+        let mut tampered: file::VaultFile =
+            serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+        tampered.ciphertext = B64.encode([0u8; 32]);
+        std::fs::write(&primary, file::vault_file_bytes(&tampered).unwrap()).unwrap();
+
+        let recovered = VaultState::default();
+        vault_unlock_inner(&recovered, &dir.0, "master-pw").unwrap();
+        assert!(recovered.save_blocked.load(Ordering::SeqCst));
+        assert!(vault_status_inner(&recovered, &dir.0).unwrap().save_blocked);
+
+        // Without the .bak there is nothing to fall back to.
+        std::fs::remove_file(dir.0.join(format!("{VAULT_FILE_NAME}.bak"))).unwrap();
+        let no_bak = VaultState::default();
+        assert_eq!(
+            vault_unlock_inner(&no_bak, &dir.0, "master-pw").unwrap_err(),
+            "vault: wrong master password, or the vault file is corrupt"
+        );
+    }
+
+    /// A parked seal over an intact primary is newer data, not a broken file:
+    /// unlock still takes the seal but leaves saving unblocked.
+    #[test]
+    fn a_parked_seal_does_not_block_saving() {
+        let dir = TempDir::new("parked");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+
+        // Park a seal by pointing the vault PRIMARY at a directory (the .bak
+        // keeps the pre-failure copy).
+        let primary = dir.0.join(file::VAULT_FILE_NAME);
+        let stash = dir.0.join("stash.json");
+        std::fs::rename(&primary, &stash).unwrap();
+        std::fs::create_dir_all(&primary).unwrap();
+        assert!(vault_entry_upsert_inner(&state, &dir.0, draft(None, "Parked")).is_err());
+        assert!(state.pending.lock_or_recover().is_some());
+        // Put the intact primary back: the disk copy is stale, not broken.
+        std::fs::remove_dir_all(&primary).unwrap();
+        std::fs::rename(&stash, &primary).unwrap();
+
+        // Re-unlock the same state so its parked seal takes part.
+        vault_unlock_inner(&state, &dir.0, "master-pw").unwrap();
+        assert!(!state.save_blocked.load(Ordering::SeqCst));
+        let status = vault_status_inner(&state, &dir.0).unwrap();
+        assert!(!status.save_blocked);
+        assert!(status.save_pending);
+        // The seal supplied the payload...
+        assert!(vault_list_inner(&state)
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.title == "Parked"));
+        // ...and the next commit simply lands.
+        vault_entry_upsert_inner(&state, &dir.0, draft(None, "Landed")).unwrap();
+        assert!(state.pending.lock_or_recover().is_none());
+    }
+
+    /// A create into Trash has no `trashed_from` to restore to, so it is
+    /// refused the same way an update that moves an entry there is.
+    #[test]
+    fn creating_into_trash_is_refused() {
+        let dir = TempDir::new("createtrash");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let mut d = draft(None, "Nope");
+        d.group_id = TRASH_ID.into();
+        assert_eq!(
+            vault_entry_upsert_inner(&state, &dir.0, d).unwrap_err(),
+            "vault: use trash instead"
+        );
+    }
+
+    /// The status fields: existence, lock state, a `.bak` mtime, and the
+    /// countdown, which follows the `autoLockMinutes` preference and is absent
+    /// while locked or when auto-lock is off.
+    #[test]
+    fn status_reports_backup_and_lock_fields() {
+        let dir = TempDir::new("status");
+        let state = VaultState::default();
+        let status = vault_status_inner(&state, &dir.0).unwrap();
+        assert!(!status.exists);
+        assert!(status.locked);
+        assert!(!status.save_pending);
+        assert!(!status.save_blocked);
+        assert!(status.backup_at.is_none());
+        assert!(status.locks_in_ms.is_none());
+
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let status = vault_status_inner(&state, &dir.0).unwrap();
+        assert!(status.exists);
+        assert!(!status.locked);
+        assert!(status.backup_at.is_some(), "create writes a .bak");
+        assert!(status.locks_in_ms.unwrap() > 0);
+
+        // Auto-lock off (0 = never) comes from the settings file.
+        std::fs::write(
+            dir.0.join(prefs::SETTINGS_FILE_NAME),
+            r#"{"autoLockMinutes":0}"#,
+        )
+        .unwrap();
+        vault_touch_inner(&state, &dir.0).unwrap();
+        let status = vault_status_inner(&state, &dir.0).unwrap();
+        assert!(status.locks_in_ms.is_none(), "0 minutes means never");
+
+        // Locked reports no countdown.
+        assert!(state.lock_inner());
+        let status = vault_status_inner(&state, &dir.0).unwrap();
+        assert!(status.locked);
+        assert!(status.locks_in_ms.is_none());
+    }
+
+    /// Search matches title, username, notes, tags and URLs, never the
+    /// password, and includes trashed entries.
+    #[test]
+    fn search_matches_every_field_but_the_password() {
+        let dir = TempDir::new("search");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+
+        let mut github = draft(None, "GitHub");
+        github.username = "octocat".into();
+        github.password = Some("SECRET-NEEDLE".into());
+        github.notes = "work account".into();
+        github.tags = vec!["dev".into()];
+        github.urls = vec![model::EntryUrl {
+            url: "https://github.com/login".into(),
+            match_mode: model::MatchMode::Domain,
+        }];
+        let github = vault_entry_upsert_inner(&state, &dir.0, github).unwrap();
+
+        let mut other = draft(None, "Mail");
+        other.notes = "personal".into();
+        let other = vault_entry_upsert_inner(&state, &dir.0, other).unwrap();
+
+        let hits = |q: &str| vault_search_inner(&state, q).unwrap();
+
+        assert_eq!(hits("github"), vec![github.id.clone()]);
+        assert_eq!(hits("OCTO"), vec![github.id.clone()]);
+        assert_eq!(hits("work account"), vec![github.id.clone()]);
+        assert_eq!(hits("dev"), vec![github.id.clone()]);
+        assert_eq!(hits("login"), vec![github.id.clone()]);
+        assert!(hits("SECRET-NEEDLE").is_empty(), "never the password");
+        assert!(hits("zzz").is_empty());
+        assert!(hits("   ").is_empty(), "a blank query matches nothing");
+
+        // Trashed entries are included; the UI applies its own scope.
+        vault_entry_trash_inner(&state, &dir.0, vec![other.id.clone()]).unwrap();
+        assert_eq!(hits("personal"), vec![other.id.clone()]);
+    }
+
+    /// A blocked save refuses BEFORE the payload is touched. An edit that only
+    /// ever lived in memory would be lost by a quit that never prompted for it,
+    /// because no seal was parked either.
+    #[test]
+    fn a_blocked_vault_refuses_a_mutation_before_it_lands() {
+        let dir = TempDir::new("blockedmut");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let kept = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Kept")).unwrap();
+        state.save_blocked.store(true, Ordering::SeqCst);
+
+        let mut edit = draft(Some(kept.id.clone()), "Renamed");
+        edit.password = Some("new-pw".into());
+        assert_eq!(
+            vault_entry_upsert_inner(&state, &dir.0, edit).unwrap_err(),
+            "vault: restore the snapshot before saving"
+        );
+        // Nothing changed in memory, so nothing can be lost.
+        let after = vault_entry_get_inner(&state, &kept.id).unwrap();
+        assert_eq!(after.title, "Kept");
+        assert_eq!(
+            vault_entry_reveal_inner(&state, &kept.id, "password").unwrap(),
+            "pw-1"
+        );
+
+        for refused in [
+            vault_entry_move_inner(&state, &dir.0, vec![kept.id.clone()], ROOT_ID.into()).err(),
+            vault_entry_trash_inner(&state, &dir.0, vec![kept.id.clone()]).err(),
+            vault_entry_delete_inner(&state, &dir.0, vec![kept.id.clone()]).err(),
+            vault_group_upsert_inner(
+                &state,
+                &dir.0,
+                group_draft(None, Some(ROOT_ID.into()), "Work"),
+            )
+            .err(),
+            vault_group_delete_inner(&state, &dir.0, BROWSER_ID.into()).err(),
+        ] {
+            assert_eq!(
+                refused.as_deref(),
+                Some("vault: restore the snapshot before saving")
+            );
+        }
+        assert_eq!(
+            vault_entry_restore_version_inner(&state, &dir.0, &kept.id, 1).unwrap_err(),
+            "vault: restore the snapshot before saving"
+        );
+    }
+
+    /// The retry must keep the parked seal while it is blocked. Taking it and
+    /// hitting the blocked early-return dropped it for good: the tick would
+    /// clear the very state the quit prompt asks about, and the retry never
+    /// landed once the snapshot was restored.
+    #[test]
+    fn a_blocked_retry_keeps_the_parked_seal() {
+        let dir = TempDir::new("blockedretry");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+
+        // Park a seal by pointing the primary at a directory.
+        let primary = dir.0.join(file::VAULT_FILE_NAME);
+        let stash = dir.0.join("stash.json");
+        std::fs::rename(&primary, &stash).unwrap();
+        std::fs::create_dir_all(&primary).unwrap();
+        assert!(vault_entry_upsert_inner(&state, &dir.0, draft(None, "Parked")).is_err());
+        assert!(state.has_pending());
+
+        // Block saving, then retry: the seal must survive the attempt.
+        state.save_blocked.store(true, Ordering::SeqCst);
+        assert!(vault_retry_save_inner(&state, &dir.0).is_err());
+        assert!(
+            state.has_pending(),
+            "a blocked retry must not consume the parked seal"
+        );
+
+        // Unblock and clear the path: the same seal still lands.
+        std::fs::remove_dir_all(&primary).unwrap();
+        std::fs::rename(&stash, &primary).unwrap();
+        state.save_blocked.store(false, Ordering::SeqCst);
+        vault_retry_save_inner(&state, &dir.0).unwrap();
+        assert!(!state.has_pending());
+        let probe = VaultState::default();
+        vault_unlock_inner(&probe, &dir.0, "master-pw").unwrap();
+        assert!(vault_list_inner(&probe)
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.title == "Parked"));
+    }
+
+    /// A second restore supersedes the first forensic copy instead of keeping
+    /// two, and a wrong password with a `.bak` present keeps the one opaque
+    /// message and leaves the block flag alone.
+    #[test]
+    fn restore_supersedes_the_corrupt_copy_and_a_wrong_password_stays_opaque() {
+        let dir = TempDir::new("restore2");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let primary = dir.0.join(file::VAULT_FILE_NAME);
+        let corrupt = dir.0.join(format!("{VAULT_FILE_NAME}.corrupt"));
+
+        // First break and restore: the corrupt copy is the old broken bytes.
+        std::fs::write(&corrupt, b"first").unwrap();
+        let mut broken: file::VaultFile =
+            serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+        broken.ciphertext = "!".into();
+        std::fs::write(&primary, file::vault_file_bytes(&broken).unwrap()).unwrap();
+        vault_unlock_inner(&state, &dir.0, "master-pw").unwrap();
+        assert!(state.save_blocked.load(Ordering::SeqCst));
+        vault_restore_snapshot_inner(&state, &dir.0).unwrap();
+        assert_eq!(
+            std::fs::read(&corrupt).unwrap(),
+            file::vault_file_bytes(&broken).unwrap()
+        );
+
+        // A wrong password against a readable primary with a `.bak` beside it
+        // still answers the one message and must not arm the block flag.
+        let wrong = VaultState::default();
+        assert_eq!(
+            vault_unlock_inner(&wrong, &dir.0, "not-the-password").unwrap_err(),
+            "vault: wrong master password, or the vault file is corrupt"
+        );
+        assert!(!wrong.save_blocked.load(Ordering::SeqCst));
+    }
+
+    /// A restore whose rename fails leaves the block flag set, so the broken
+    /// file is never overwritten by the write that would have followed.
+    #[test]
+    fn a_failed_restore_rename_keeps_the_block() {
+        let dir = TempDir::new("restorefail");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        let primary = dir.0.join(file::VAULT_FILE_NAME);
+        let mut broken: file::VaultFile =
+            serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+        broken.ciphertext = "!".into();
+        std::fs::write(&primary, file::vault_file_bytes(&broken).unwrap()).unwrap();
+        vault_unlock_inner(&state, &dir.0, "master-pw").unwrap();
+        assert!(state.save_blocked.load(Ordering::SeqCst));
+
+        // A directory where the `.corrupt` file belongs makes the rename fail.
+        let corrupt = dir.0.join(format!("{VAULT_FILE_NAME}.corrupt"));
+        std::fs::create_dir_all(&corrupt).unwrap();
+        assert!(vault_restore_snapshot_inner(&state, &dir.0).is_err());
+        assert!(
+            state.save_blocked.load(Ordering::SeqCst),
+            "a failed restore must keep the block"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            file::vault_file_bytes(&broken).unwrap()
+        );
+        std::fs::remove_dir_all(&corrupt).unwrap();
+        vault_restore_snapshot_inner(&state, &dir.0).unwrap();
     }
 }

@@ -2,9 +2,20 @@ import { IS_MAC, MOD_PROP } from "@/lib/platform";
 
 /** Keyboard shortcut catalog. */
 
-export type ShortcutId = "settings.open" | "commandPalette.open";
+export type ShortcutId =
+  | "settings.open"
+  | "commandPalette.open"
+  | "search.focus"
+  | "vault.lock"
+  | "entry.new"
+  | "entry.edit"
+  | "entry.trash"
+  | "entry.copyPassword"
+  | "entry.copyUsername"
+  | "entry.copyTotp"
+  | "entry.openUrl";
 
-export type ShortcutGroup = "General" | "Command Palette";
+export type ShortcutGroup = "General" | "Entries" | "Vault" | "Command Palette";
 
 export type KeyBinding = {
   key: string;
@@ -19,10 +30,40 @@ export type Shortcut = {
   label: string;
   group: ShortcutGroup;
   defaultBindings: KeyBinding[];
+  /**
+   * Extra guard evaluated after a binding matches and before the modal gate.
+   * Scopes a chord to its surface: the list-scoped entry chords must not fire
+   * from a text field or a tree row, where the same key means something else.
+   * A returned false skips this chord and lets the loop try the next one.
+   */
+  when?: (e: KeyboardEvent) => boolean;
   /** List in settings but disable recorder + reset. For component-hardcoded
    *  keys (e.g. textarea Enter) shown for documentation. */
   readOnly?: boolean;
 };
+
+/**
+ * True when the event target is a text-entry surface (input, textarea, select
+ * or a contenteditable host). Duck-typed, so the node-loaded verify scripts can
+ * pass a plain object rather than a real Element.
+ */
+export function isTextEntryTarget(target: EventTarget | null): boolean {
+  const el = target as { tagName?: unknown; isContentEditable?: unknown } | null;
+  if (!el) return false;
+  const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable === true;
+}
+
+/**
+ * True when the event target sits inside the entry list (`[data-vault-list]`).
+ * Duck-typed: only the `closest` method is assumed, so a node test can pass a
+ * stub without a DOM.
+ */
+export function isEntryListTarget(target: EventTarget | null): boolean {
+  const el = target as { closest?: (selector: string) => Element | null } | null;
+  if (!el || typeof el.closest !== "function") return false;
+  return el.closest("[data-vault-list]") !== null;
+}
 
 export const SHORTCUTS: Shortcut[] = [
   {
@@ -30,6 +71,66 @@ export const SHORTCUTS: Shortcut[] = [
     label: "Open settings",
     group: "General",
     defaultBindings: [{ [MOD_PROP]: true, key: "," }],
+  },
+  {
+    id: "search.focus",
+    label: "Focus search",
+    group: "General",
+    defaultBindings: [{ [MOD_PROP]: true, key: "f" }],
+  },
+  {
+    id: "vault.lock",
+    label: "Lock the vault",
+    group: "Vault",
+    defaultBindings: [{ [MOD_PROP]: true, key: "l" }],
+  },
+  {
+    id: "entry.new",
+    label: "New entry",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "n" }],
+  },
+  {
+    id: "entry.edit",
+    label: "Edit entry",
+    group: "Entries",
+    defaultBindings: [{ key: "Enter" }, { [MOD_PROP]: true, key: "e" }],
+    when: (e) => isEntryListTarget(e.target),
+  },
+  {
+    id: "entry.trash",
+    label: "Move to trash",
+    group: "Entries",
+    defaultBindings: [{ key: "Delete" }],
+    when: (e) => isEntryListTarget(e.target),
+  },
+  {
+    id: "entry.copyPassword",
+    label: "Copy password",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "c" }],
+    when: (e) => isEntryListTarget(e.target),
+  },
+  {
+    id: "entry.copyUsername",
+    label: "Copy username",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "b" }],
+    when: (e) => !isTextEntryTarget(e.target),
+  },
+  {
+    id: "entry.copyTotp",
+    label: "Copy TOTP",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "t" }],
+    when: (e) => !isTextEntryTarget(e.target),
+  },
+  {
+    id: "entry.openUrl",
+    label: "Open URL",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "u" }],
+    when: (e) => !isTextEntryTarget(e.target),
   },
   {
     // Opens the Command Palette — a searchable list of all commands. VS Code
@@ -41,7 +142,7 @@ export const SHORTCUTS: Shortcut[] = [
   },
 ];
 
-export const SHORTCUT_GROUPS: ShortcutGroup[] = ["General", "Command Palette"];
+export const SHORTCUT_GROUPS: ShortcutGroup[] = ["General", "Entries", "Vault", "Command Palette"];
 
 /**
  * Layout-independent key canonicalization. Uses `e.code` for letters/digits

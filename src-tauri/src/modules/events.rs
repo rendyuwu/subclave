@@ -13,3 +13,8 @@ pub const VAULT_LOCKED: &str = "subclave:vault-locked";
 pub const VAULT_CHANGED: &str = "subclave:vault-changed";
 /// Vault write failed, or `null` when a retry succeeded.
 pub const VAULT_SAVE_FAILED: &str = "subclave:vault-save-failed";
+
+/// Rust -> main webview: the app was asked to quit while a write is still
+/// pending. Payload: `null`. The webview owns the confirmation dialog and
+/// calls `quit_subclave` once the user decides.
+pub const QUIT_REQUESTED: &str = "subclave:quit-requested";

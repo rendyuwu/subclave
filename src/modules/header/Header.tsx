@@ -5,10 +5,18 @@ import { cn } from "@/lib/utils";
 import { TOOLBAR_HOVER } from "@/lib/toolbarButton";
 import { IS_MAC, USE_CUSTOM_WINDOW_CONTROLS } from "@/lib/platform";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { memo } from "react";
-import { Settings } from "lucide-react";
+import { memo, type ReactNode } from "react";
+import { Lock, Settings } from "lucide-react";
 
-type Props = { onOpenSettings: () => void };
+type Props = {
+  onOpenSettings: () => void;
+  /** Renders the lock button. A locked vault passes nothing, so the button
+   *  disappears rather than sitting there inert. */
+  onLock?: () => void;
+  /** Middle slot, between the app name and the trailing icon cluster. The
+   *  unlocked shell puts the search field here. */
+  children?: ReactNode;
+};
 
 /**
  * Manual window-drag fallback. Tauri's auto `data-tauri-drag-region` is flaky
@@ -38,7 +46,7 @@ function onHeaderMouseDown(e: React.MouseEvent<HTMLElement>) {
   }
 }
 
-function HeaderImpl({ onOpenSettings }: Props) {
+function HeaderImpl({ onOpenSettings, onLock, children }: Props) {
   const settingsButton = (
     <IconTooltip label="Settings">
       <Button
@@ -53,13 +61,27 @@ function HeaderImpl({ onOpenSettings }: Props) {
     </IconTooltip>
   );
 
+  const lockButton = (
+    <IconTooltip label="Lock">
+      <Button
+        variant="ghost"
+        size="icon"
+        className={cn("text-muted-foreground", TOOLBAR_HOVER, "size-7 shrink-0 rounded-md")}
+        onClick={onLock}
+        aria-label="Lock"
+      >
+        <Lock size={15} strokeWidth={1.75} />
+      </Button>
+    </IconTooltip>
+  );
+
   return (
     <div
       data-subclave-header
       className="border-border/60 bg-card flex shrink-0 flex-col border-b select-none"
     >
-      {/* One row: the app mark, the app name, the drag spacer, settings and the
-          window controls. */}
+      {/* One row: the app mark, the app name, the middle slot, the drag spacer,
+          the lock and settings buttons and the window controls. */}
       <div
         data-tauri-drag-region
         onMouseDown={onHeaderMouseDown}
@@ -74,8 +96,14 @@ function HeaderImpl({ onOpenSettings }: Props) {
         />
         <span className="text-sm font-semibold">Subclave</span>
 
-        {/* Drag spacer between the mark and the trailing icon cluster. */}
+        {children ? (
+          <div className="flex max-w-md min-w-0 flex-1 items-center">{children}</div>
+        ) : null}
+
+        {/* Drag spacer between the middle slot and the trailing icon cluster. */}
         <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
+
+        {onLock ? lockButton : null}
 
         {settingsButton}
 

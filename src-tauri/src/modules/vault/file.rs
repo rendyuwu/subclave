@@ -211,6 +211,14 @@ pub fn load_vault(dir: &Path) -> Result<(VaultFile, bool), String> {
     Err("vault: no readable vault file".to_string())
 }
 
+/// Read and parse the `.bak`, `None` when it is absent or does not parse.
+/// The unlock path retries with this when the primary parses but fails to
+/// open, which `load_vault` cannot see without the key.
+pub(crate) fn read_bak(dir: &Path) -> Option<VaultFile> {
+    let bytes = std::fs::read(dir.join(format!("{VAULT_FILE_NAME}.bak"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

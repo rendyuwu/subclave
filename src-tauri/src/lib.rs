@@ -278,6 +278,17 @@ async fn open_settings_window(app: tauri::AppHandle, tab: Option<String>) -> Res
     Ok(())
 }
 
+/// Leave the process after the user confirmed the quit prompt. The parked seal
+/// is dropped first: it would otherwise be retried by the save tick and the
+/// exit request would be vetoed, so the confirmation would come back forever.
+/// Anything unsaved is lost, which is exactly what "Quit anyway" agreed to.
+#[tauri::command]
+async fn quit_subclave(app: tauri::AppHandle) -> Result<(), String> {
+    app.state::<modules::vault::VaultState>().drop_pending();
+    app.exit(0);
+    Ok(())
+}
+
 /// Center a child window over the main window (so it follows the user across
 /// monitors instead of landing on the primary display). No-op if either
 /// window's geometry can't be read. Shared by the Settings and Debug windows.
@@ -495,6 +506,33 @@ fn has_nvidia_gpu() -> bool {
         )
 }
 
+/// The user's preferences, read at use time. A failed data-dir resolve falls
+/// back to the defaults rather than panicking inside a window-event handler.
+fn prefs_now(app: &tauri::AppHandle) -> modules::prefs::Prefs {
+    modules::vault::vault_dir(app)
+        .map(|dir| modules::prefs::read(&dir))
+        .unwrap_or_default()
+}
+
+/// Decide whether the process may exit now, shared by the window close, the
+/// tray Quit and `RunEvent::ExitRequested`.
+///
+/// true: nothing would be lost, the caller may exit. false: a write is still
+/// parked, the window is shown and focused, the webview is told to open its
+/// confirmation and it owns the exit from here.
+fn quit_or_confirm(app: &tauri::AppHandle) -> bool {
+    if !app.state::<modules::vault::VaultState>().has_pending() {
+        return true;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit(modules::events::QUIT_REQUESTED, ());
+    false
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -551,6 +589,13 @@ pub fn run() {
                 // is observable. Raise it back to the configured floor if the
                 // saved size predates a floor increase (see fn docs).
                 enforce_configured_min_size(app.config(), &window);
+            }
+            // System tray: Open, Lock, Quit. A host with no tray host logs and
+            // keeps running without one; a host missing the AppIndicator
+            // library aborts inside the toolkit instead, which is why the
+            // bundle depends on it.
+            if let Err(e) = modules::tray::build(app.handle()) {
+                log::error!("subclave: could not build the tray icon: {e}");
             }
             // macOS: the default app menu binds Cmd+W to "Close Window", and
             // that native accelerator fires before the webview's JS handler - so
@@ -619,6 +664,7 @@ pub fn run() {
             fs::file::fs_read_file,
             fs::file::fs_write_file,
             open_settings_window,
+            quit_subclave,
             modules::vault::vault_status,
             modules::vault::vault_create,
             modules::vault::vault_unlock,
@@ -626,7 +672,9 @@ pub fn run() {
             modules::vault::vault_touch,
             modules::vault::vault_change_master,
             modules::vault::vault_retry_save,
+            modules::vault::vault_restore_snapshot,
             modules::vault::vault_list,
+            modules::vault::vault_search,
             modules::vault::vault_entry_get,
             modules::vault::vault_entry_reveal,
             modules::vault::vault_entry_upsert,
@@ -639,6 +687,7 @@ pub fn run() {
             modules::vault::vault_group_delete,
             modules::clipboard::clip_copy_field,
             modules::totp::totp_code,
+            modules::totp::totp_preview,
             modules::generator::gen_password,
             modules::strength::gen_strength,
         ])
@@ -657,6 +706,27 @@ pub fn run() {
             let app = window.app_handle().clone();
             const CHILDREN: [&str; 1] = ["settings"];
             match event {
+                // Close-to-tray hides the window and keeps the app (and the
+                // browser extension's connection) alive. Otherwise the close
+                // really quits - but a still-parked write asks first, and the
+                // webview owns that dialog. `app.exit(0)` on the quit path
+                // rather than letting the OS close the window: macOS would
+                // otherwise keep running with no window at all.
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    // ALWAYS prevent the raw close, even on the quit path: the
+                    // exit request can still be vetoed (a mutation parks a seal
+                    // between the two calls), and by then the window is gone,
+                    // so the confirmation would go to nothing and the process
+                    // would linger windowless.
+                    api.prevent_close();
+                    if prefs_now(&app).close_to_tray {
+                        if let Some(main) = app.get_webview_window("main") {
+                            let _ = main.hide();
+                        }
+                    } else if quit_or_confirm(&app) {
+                        app.exit(0);
+                    }
+                }
                 // On Windows, minimize arrives as a Resized event (Tauri 2 has
                 // no Minimized variant). Sample the state and mirror it.
                 tauri::WindowEvent::Resized(_) => {
@@ -664,6 +734,15 @@ pub fn run() {
                         return;
                     };
                     let minimized = main.is_minimized().unwrap_or(false);
+                    // Locking on minimize drops the payload before the window
+                    // is hidden behind the tray; only an actually-unlocked
+                    // vault emits, so a second minimize is a no-op.
+                    if minimized
+                        && prefs_now(&app).lock_on_minimize
+                        && app.state::<modules::vault::VaultState>().lock_inner()
+                    {
+                        modules::vault::emit_locked(&app, modules::vault::LockReason::Minimize);
+                    }
                     for child in CHILDREN {
                         let Some(w) = app.get_webview_window(child) else {
                             continue;
@@ -703,12 +782,19 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| match event {
+            // A close or quit that still has a parked write gets the webview's
+            // confirmation instead of exiting; the exit is vetoed until the
+            // user decides.
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if !quit_or_confirm(app) {
+                    api.prevent_exit();
+                }
+            }
             // Clear the clipboard on quit, but only when it still holds a
             // copied secret: anything the user copied since must survive.
-            if let tauri::RunEvent::Exit = event {
-                modules::clipboard::clear_on_exit();
-            }
+            tauri::RunEvent::Exit => modules::clipboard::clear_on_exit(),
+            _ => {}
         });
 }
 

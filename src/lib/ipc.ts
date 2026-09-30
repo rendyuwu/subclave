@@ -20,10 +20,17 @@ export type FsReadResult =
 export const IPC_EVENTS = {
   /** Rust -> Settings webview: focus a settings tab (payload: tab id string). */
   SETTINGS_TAB: "subclave:settings-tab",
-  /** Vault locked (payload: `{ reason: "manual" | "idle" }`). */
+  /**
+   * Vault locked (payload: `{ reason: "manual" | "idle" | "minimize" | "tray" }`).
+   */
   VAULT_LOCKED: "subclave:vault-locked",
   /** Vault content changed (payload: `{ ids: string[], origin: "local" }`). */
   VAULT_CHANGED: "subclave:vault-changed",
   /** Vault write failed, or `null` when a retry succeeded. */
   VAULT_SAVE_FAILED: "subclave:vault-save-failed",
+  /**
+   * Rust -> main webview: a quit was requested while a save is still failing.
+   * The webview confirms, then calls `quit_subclave`. Payload: `null`.
+   */
+  QUIT_REQUESTED: "subclave:quit-requested",
 } as const;

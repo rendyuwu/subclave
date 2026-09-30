@@ -62,6 +62,10 @@ export function useGlobalShortcuts(handlers: ShortcutHandlers): void {
         const isMatch = bindings.some((b) => matchBinding(e, b));
         if (!isMatch) continue;
 
+        // Scoped chords: an entry-list chord must not fire from a text field or
+        // a tree row, where the same key means something else.
+        if (!(s.when?.(e) ?? true)) continue;
+
         // The modal the matched chord is allowed to act on, if any. Undefined
         // for every chord but one; `isTopModal` then decides whether that one
         // modal is the one the user is actually looking at.

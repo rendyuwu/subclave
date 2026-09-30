@@ -13,23 +13,21 @@
 //! Every function here is a synchronous round trip to whichever process owns
 //! the selection, so every one must run on a blocking thread.
 
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use crate::modules::lockext::LockExt as _;
-use crate::modules::vault::{resolve_field, VaultState};
+use crate::modules::prefs;
+use crate::modules::vault::{resolve_field, vault_dir, VaultState};
 
 // The initializer is fallible (no X display yet, a Wayland compositor
 // mid-restart), so this stays an Option inside the LazyLock: a failed init
 // must not poison every later call with the same error.
 static CLIPBOARD: LazyLock<Mutex<Option<arboard::Clipboard>>> =
     LazyLock::new(|| Mutex::new(arboard::Clipboard::new().ok()));
-
-/// How long a copied secret stays on the clipboard until the settings file
-/// carries `clipboardClearSeconds` (its writer is the Settings UI).
-pub(crate) const DEFAULT_CLIPBOARD_CLEAR_SECONDS: u64 = 30;
 
 /// The one handle for the app's lifetime.
 ///
@@ -117,10 +115,11 @@ pub async fn clip_copy_field(
     id: String,
     field: String,
 ) -> Result<ClearResult, String> {
+    let dir = vault_dir(&app)?;
     let task_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let state = task_app.state::<VaultState>();
-        clip_copy_field_inner(&state, &id, &field)
+        clip_copy_field_inner(&state, &dir, &id, &field)
     })
     .await
     .map_err(|e| format!("clipboard: task failed: {e}"))?;
@@ -130,6 +129,7 @@ pub async fn clip_copy_field(
 
 pub(crate) fn clip_copy_field_inner(
     state: &VaultState,
+    dir: &Path,
     id: &str,
     field: &str,
 ) -> Result<ClearResult, String> {
@@ -150,7 +150,7 @@ pub(crate) fn clip_copy_field_inner(
     };
     let value = resolve_field(&entry, field, true)?;
     write_text(&value)?;
-    let secs = DEFAULT_CLIPBOARD_CLEAR_SECONDS;
+    let secs = prefs::read(dir).clipboard_clear_seconds;
     if secs == 0 {
         return Ok(ClearResult { clears_at: None });
     }

@@ -17,10 +17,13 @@ import {
   useEffect,
   useState,
 } from "react";
-import { Info, Keyboard, Palette, Settings, X, type LucideIcon } from "lucide-react";
+import { Info, Keyboard, Palette, Settings, ShieldCheck, X, type LucideIcon } from "lucide-react";
 
 const GeneralSection = lazy(() =>
   import("./sections/GeneralSection").then((m) => ({ default: m.GeneralSection })),
+);
+const SecuritySection = lazy(() =>
+  import("./sections/SecuritySection").then((m) => ({ default: m.SecuritySection })),
 );
 const ThemeSection = lazy(() =>
   import("./sections/ThemeSection").then((m) => ({ default: m.ThemeSection })),
@@ -39,6 +42,7 @@ const TABS: {
   component: ComponentType;
 }[] = [
   { id: "general", label: "General", icon: Settings, component: GeneralSection },
+  { id: "security", label: "Security", icon: ShieldCheck, component: SecuritySection },
   { id: "theme", label: "Theme", icon: Palette, component: ThemeSection },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard, component: ShortcutsSection },
   { id: "about", label: "About", icon: Info, component: AboutSection },

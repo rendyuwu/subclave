@@ -9,7 +9,7 @@ import {
   type Shortcut,
   type ShortcutId,
 } from "@/modules/shortcuts/shortcuts";
-import { COMMAND_PALETTE_MODAL, runCommand } from "@/modules/shortcuts";
+import { COMMAND_PALETTE_MODAL, hasCommand, runCommand } from "@/modules/shortcuts";
 import { Kbd } from "@/components/ui/kbd";
 import { KEY_SEP } from "@/lib/platform";
 import { Search, X } from "lucide-react";
@@ -73,12 +73,15 @@ function CommandPaletteImpl({ open, onOpenChange }: Props) {
       // documentation-only key hints with no handler; commandPalette.open is
       // this palette itself.
       if (s.readOnly || s.id === "commandPalette.open") continue;
+      // Nothing owns this id right now (for example the vault workspace is
+      // unmounted while the vault is locked), so there is no command to list.
+      if (!hasCommand(s.id)) continue;
       const g = groups.get(s.group) ?? [];
       g.push(s);
       groups.set(s.group, g);
     }
     return groups;
-  }, []);
+  }, [open]);
 
   const bindingTokens = useCallback(
     (s: Shortcut): string[] => {

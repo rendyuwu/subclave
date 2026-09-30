@@ -4,6 +4,8 @@ pub mod events;
 pub mod fs;
 pub mod generator;
 pub mod lockext;
+pub mod prefs;
 pub mod strength;
 pub mod totp;
+pub mod tray;
 pub mod vault;
