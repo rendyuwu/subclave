@@ -1,7 +1,7 @@
 # Contributing
 
-Issues and PRs welcome. Code map: [ARCHITECTURE.md](ARCHITECTURE.md).
-Code rules and gotchas: [TERVIA.md](TERVIA.md), read it before a PR.
+Issues and PRs welcome. Code rules and gotchas: [SUBCLAVE.md](SUBCLAVE.md),
+read it before a PR.
 
 ## Setup
 
@@ -10,7 +10,7 @@ Rust stable, Node 20.19+ (`.nvmrc` pins 24, what CI uses), pnpm, and
 
 ```bash
 pnpm install
-pnpm tauri:dev   # own bundle id and data dir; never touches an installed Tervia
+pnpm tauri:dev   # own bundle id and data dir; never touches an installed Subclave
 ```
 
 ## Before a PR
@@ -35,14 +35,14 @@ installers for every OS on each PR.
 
 - Branch off `dev`, open the PR against `dev`. `main` only receives `dev`.
 - Prefixes: `feat/`, `fix/`, `chore/`, `docs/`, `perf/`.
-- PRs are squash-merged; the title is the commit, in [Conventional Commits](https://www.conventionalcommits.org/) form: `fix(sftp): keep the tree open after a rename`.
+- PRs are squash-merged; the title is the commit, in [Conventional Commits](https://www.conventionalcommits.org/) form: `fix(settings): keep the theme picker focused`.
 - One change per PR. Open an issue first for anything non-trivial.
 - Fill in the PR template.
 
 ## Scope
 
-- Yes: bug fixes, SSH, RDP, forwarding, SFTP, backup and sync, the local workspace they need.
-- No: telemetry, AI features, an extension API, an in-app browser, a default sync server, hardcoded credentials.
+- Yes: bug fixes, the vault, sync to your own storage, the browser extension.
+- No: telemetry, AI features, accounts or a Subclave server, autofill without a user action, hardcoded credentials.
 - Big dependency for a small win: no. Prefer nothing that adds a background thread, a poll loop or an unbounded buffer.
 
 ## Security

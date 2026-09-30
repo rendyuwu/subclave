@@ -1,8 +1,4 @@
-// `pub` so the `tervia-cli` workspace member's stub binary
-// (src-tauri/tervia-cli/src/main.rs) can reach `cli::help_text()` and the
-// version constants - keeps the help text single-sourced between the GUI
-// binary and the launcher.
-// Process-wide allocator (GUI + the `--pty-daemon` sidecar share this binary).
+// Process-wide allocator.
 // The default Windows system heap holds onto freed commit when a workload is
 // bursty and fragmented - which is exactly the host process's job of buffering
 // heavy PTY output (large base64 chunks) on its way to the webview. A single
@@ -48,7 +44,7 @@ pub fn purge_allocator() {
 /// thing it must never do is share a thread with anything that draws.
 fn spawn_allocator_purge_thread() {
     let _ = std::thread::Builder::new()
-        .name("tervia-alloc-purge".into())
+        .name("subclave-alloc-purge".into())
         .spawn(|| loop {
             std::thread::sleep(ALLOCATOR_PURGE_INTERVAL);
             purge_allocator();
@@ -57,15 +53,7 @@ fn spawn_allocator_purge_thread() {
 
 pub mod modules;
 
-/// Version string this crate was compiled against. Re-exposed so the
-/// `tervia-cli` launcher (which has its own `CARGO_PKG_VERSION` for the
-/// `tervia-cli` package) can print the GUI crate's version instead and
-/// stay in sync without a duplicate version constant.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-use modules::{
-    backup, cli, clipboard, format, fs, git, net, pty, pty_daemon, rdp, secrets, shell, ssh, sync,
-};
+use modules::fs;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_window_state::StateFlags;
 
@@ -198,8 +186,8 @@ fn apply_windows_frame_fixes(_window: &tauri::WebviewWindow) {}
 /// Disable WebView2 "browser accelerator keys" on the MAIN webview. By default
 /// WebView2 treats Ctrl+W (close window), Ctrl+N/T, Ctrl+P, Ctrl+R/F5, etc. as
 /// browser shortcuts and acts on them BEFORE web content can cancel them with
-/// `preventDefault` - so Ctrl+W closed the whole window (quitting the app)
-/// instead of running the app's own close-tab shortcut. Tervia is an app shell,
+/// `preventDefault` - so Ctrl+W quit the whole app instead of being left for the
+/// web content to handle. Subclave is an app shell,
 /// not a browser, so the app's keyboard handlers should own those combos. The
 /// in-app browser child webview is a separate webview and keeps its own defaults.
 #[cfg(target_os = "windows")]
@@ -340,76 +328,6 @@ fn enforce_configured_min_size(config: &tauri::Config, window: &tauri::WebviewWi
     }
 }
 
-/// Open (or reveal) an always-on-top floating window that hosts a single pane
-/// (a live terminal mirror or a file editor). Labeled `float-<leafId>` so each
-/// leaf reveals its own window instead of duplicating. Unlike Settings/Debug it
-/// is NOT owner-parented - it floats above other apps (YouTube-PiP style) and
-/// carries the leaf params in its URL for the float-window React app.
-#[tauri::command]
-async fn open_float_window(
-    app: tauri::AppHandle,
-    leaf_id: i64,
-    params: String,
-    title: String,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    let label = format!("float-{leaf_id}");
-    if let Some(window) = app.get_webview_window(&label) {
-        // Bring an existing float back to the front. `set_focus` alone often
-        // does nothing visible on Windows for a window that's already
-        // always-on-top (it's already topmost) or is subject to the foreground
-        // lock; re-asserting TOPMOST forces a z-order raise, and unminimize
-        // restores it from the taskbar. Order matters: restore, show, raise, focus.
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
-        return Ok(());
-    }
-
-    let url = format!("float.html?p={params}");
-    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
-        .title(title)
-        .inner_size(width, height)
-        .min_inner_size(320.0, 200.0)
-        .resizable(true)
-        .always_on_top(true)
-        .visible(false);
-
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true);
-
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let builder = builder.decorations(false).transparent(true);
-
-    let window = builder.build().map_err(|e| e.to_string())?;
-
-    // Authoritative "float closed / docked back" signal for the main window: the
-    // float's own BYE event can be lost when its webview is torn down mid-emit,
-    // so notify from Rust on the window's Destroyed event instead. The main
-    // window's floatHost matches the label back to the leaf and restores it.
-    {
-        let app_for_event = app.clone();
-        let label_for_event = label.clone();
-        window.on_window_event(move |event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                let _ = app_for_event.emit("tervia://float-destroyed", &label_for_event);
-            }
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let _ = window.set_decorations(false);
-    }
-    disable_windows_corner_rounding(&window);
-    recenter_over_main(&app, &window);
-    Ok(())
-}
-
 /// Open (or reveal) an owner-parented child window with our custom chrome.
 /// Returns `Ok(None)` when an existing window was revealed, `Ok(Some(window))`
 /// when a new one was built. Shared by the Settings and Debug windows.
@@ -494,13 +412,13 @@ fn configure_linux_rendering() {
     match wayland_dmabuf_fallback_reason() {
         Some(reason) => {
             eprintln!(
-                "tervia: Wayland session, {reason}; disabling WebKitGTK DMA-BUF renderer \
+                "subclave: Wayland session, {reason}; disabling WebKitGTK DMA-BUF renderer \
                  (override: WEBKIT_DISABLE_DMABUF_RENDERER=0)"
             );
             unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
         }
         None => eprintln!(
-            "tervia: Wayland session on a known-good compositor; keeping WebKitGTK DMA-BUF renderer \
+            "subclave: Wayland session on a known-good compositor; keeping WebKitGTK DMA-BUF renderer \
              (set WEBKIT_DISABLE_DMABUF_RENDERER=1 if the window stays blank)"
         ),
     }
@@ -541,48 +459,22 @@ fn has_nvidia_gpu() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // `tervia --version` / `tervia --help`: print and exit without GUI boot.
-    cli::handle_version_help_and_exit();
-
-    // `tervia --update` / `-u` has no headless path: the flag is captured by
-    // `cli::capture_startup` below, the GUI boots, and the frontend drains it
-    // through `cli_take_initial_update_request` to run the in-app updater.
-    // A second invocation while a window is up forwards `TRIGGER_UPDATE`
-    // instead (see the single-instance handler).
-
-    // `TerviaApp --pty-daemon`: run the sidecar PTY daemon forever and exit.
-    // Spawned detached by the GUI on first launch. Returns immediately when
-    // the flag is absent so normal startup proceeds. See `pty_daemon::mod`.
-    pty_daemon::handle_pty_daemon_command_and_exit();
-
-    // Resolve `tervia .` / `tervia <path>` against the launch cwd before any
-    // later code can shift the working directory.
-    cli::capture_startup();
-
     #[cfg(target_os = "linux")]
     configure_linux_rendering();
 
     let builder = tauri::Builder::default().plugin(tauri_plugin_process::init());
 
-    // Second-invocation forwarding: when `tervia <path>` runs while an instance
-    // is already up, the new process forwards its argv and exits. Desktop-only
-    // (the plugin does not build for android/ios). Skipped in debug builds so
-    // `pnpm tauri dev` can run alongside an installed release.
+    // Relaunching while an instance is already up reveals its window instead of
+    // starting a second process (the default file association for a packaged
+    // app is "run it", and a second empty window would be the wrong answer).
+    // Desktop-only (the plugin does not build for android/ios). Skipped in debug
+    // builds so `pnpm tauri dev` can run alongside an installed release.
     #[cfg(all(desktop, not(debug_assertions)))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-        let cwd_path = std::path::PathBuf::from(&cwd);
-        let update_requested = cli::update_requested_in(argv.iter().map(|s| s.as_str()));
-        let target = cli::parse(argv, &cwd_path);
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.unminimize();
             let _ = window.show();
             let _ = window.set_focus();
-            if let Some(t) = target {
-                let _ = window.emit(crate::modules::events::OPEN_CLI_TARGET, t);
-            }
-            if update_requested {
-                let _ = window.emit(crate::modules::events::TRIGGER_UPDATE, ());
-            }
         }
     }));
 
@@ -601,8 +493,8 @@ pub fn run() {
                 // taskbar minimize affordance (see fn docs).
                 apply_windows_frame_fixes(&window);
                 // Stop WebView2 from hijacking Ctrl+W/Ctrl+P/Ctrl+R/etc. as
-                // browser shortcuts so the app's own handlers run (Ctrl+W must
-                // close the active tab, not the whole window).
+                // browser shortcuts; as window-closing actions they would act
+                // on the whole window before web content could cancel them.
                 disable_browser_accelerator_keys(&window);
                 // A session saved while maximized may have been restored before
                 // the work-area clamp was installed, leaving it over the taskbar.
@@ -622,18 +514,17 @@ pub fn run() {
             }
             // macOS: the default app menu binds Cmd+W to "Close Window", and
             // that native accelerator fires before the webview's JS handler - so
-            // Cmd+W closed the whole window (quitting the app) instead of the
-            // active tab. Rebuild a standard menu that keeps the App/Edit/Window
-            // items (so copy/paste/quit and the system shortcuts still work) but
-            // OMITS Close Window, leaving Cmd+W for the app's own close-tab
-            // shortcut. Windows/Linux have no such menu accelerator (Windows is
+            // Cmd+W quit the whole app. Rebuild a standard menu that keeps the
+            // App/Edit/Window items (so copy/paste/quit and the system shortcuts
+            // still work) but OMITS Close Window, so the accelerator does not
+            // fire at all. Windows/Linux have no such menu accelerator (Windows is
             // handled by disable_browser_accelerator_keys; Linux's WebKitGTK does
             // not bind Cmd/Ctrl+W), so this is macOS-only.
             #[cfg(target_os = "macos")]
             {
                 use tauri::menu::{MenuBuilder, SubmenuBuilder};
                 let h = app.handle();
-                let app_menu = SubmenuBuilder::new(h, "Tervia")
+                let app_menu = SubmenuBuilder::new(h, "Subclave")
                     .about(None)
                     .separator()
                     .services()
@@ -664,10 +555,6 @@ pub fn run() {
                     .build()?;
                 h.set_menu(menu)?;
             }
-            // Heal a stale `~/.local/bin/tervia` shim after an update that moved
-            // the binary (macOS .app relocation, AppImage filename change).
-            // No-op on Windows; the NSIS hook handles upgrades there.
-            cli::refresh_shim_if_present();
             Ok(())
         })
         // Skip restoring VISIBLE; the frontend calls window.show() after first
@@ -688,126 +575,10 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(pty::PtyState::new())
-        .manage(shell::ShellState::default())
-        .manage(secrets::SecretsState::default())
-        .manage(ssh::SshState::default())
-        .manage(rdp::RdpState::default())
-        .manage(sync::engine::SyncState::default())
         .invoke_handler(tauri::generate_handler![
-            pty::pty_open,
-            pty::pty_attach,
-            pty::pty_write,
-            pty::pty_resize,
-            pty::pty_close,
-            pty::pty_list_sessions,
-            pty::pty_kill_all,
-            fs::tree::list_subdirs,
-            fs::tree::fs_read_dir,
             fs::file::fs_read_file,
-            fs::file::fs_read_file_portion,
-            fs::file::fs_canonicalize,
             fs::file::fs_write_file,
-            fs::mutate::fs_create_file,
-            fs::mutate::fs_create_dir,
-            fs::mutate::fs_rename,
-            fs::mutate::fs_copy,
-            fs::mutate::fs_delete,
-            fs::search::fs_search,
-            fs::grep::fs_grep,
-            fs::grep::fs_glob,
-            fs::grep::fs_grep_replace,
-            fs::grep::fs_replace_in_file,
-            git::commands::git_status,
-            git::commands::git_ignored,
-            git::commands::git_file_head,
-            git::commands::git_file_at,
-            git::commands::git_run,
-            git::commands::git_diff_full,
-            git::commands::git_log,
-            git::commands::git_commit_detail,
-            pty::path_probe::terminal_probe_path,
-            shell::shell_run_command,
-            shell::shell_session_open,
-            shell::shell_session_run,
-            shell::shell_session_close,
-            shell::shell_bg_spawn,
-            shell::shell_bg_spawn_direct,
-            shell::shell_bg_logs,
-            shell::shell_bg_kill,
-            shell::shell_bg_remove,
-            shell::shell_bg_list,
-            format::fmt_run_external,
             open_settings_window,
-            open_float_window,
-            cli::cli_initial_target,
-            cli::cli_classify_path,
-            cli::cli_take_initial_update_request,
-            cli::cli_install_path_shim,
-            secrets::secrets_get,
-            secrets::secrets_set,
-            secrets::secrets_delete,
-            secrets::secrets_get_all,
-            secrets::secrets_list,
-            secrets::secrets_copy,
-            backup::backup_seal_payload,
-            backup::backup_open_payload,
-            backup::backup_apply_secrets,
-            backup::backup_release,
-            clipboard::clipboard_read_text,
-            clipboard::clipboard_read_file_list,
-            clipboard::clipboard_write_text,
-            net::http_ping,
-            net::port_is_open,
-            net::http_stream,
-            net::http_abort,
-            ssh::ssh_open,
-            ssh::ssh_shell_open,
-            ssh::ssh_shell_write,
-            ssh::ssh_shell_resize,
-            ssh::ssh_shell_close,
-            ssh::ssh_resource_stream_start,
-            ssh::ssh_resource_stream_stop,
-            ssh::ssh_close,
-            ssh::ssh_confirm_host_key,
-            ssh::ssh_agent_keys,
-            ssh::ssh_key_inspect,
-            ssh::ssh_key_generate,
-            ssh::ssh_key_classify,
-            ssh::ssh_forward_open,
-            ssh::ssh_forward_close,
-            ssh::ssh_remote_forward_open,
-            ssh::ssh_remote_forward_close,
-            ssh::ssh_socks_open,
-            ssh::ssh_list_sessions,
-            ssh::ssh_attach,
-            ssh::ssh_git_status,
-            ssh::ssh_git,
-            ssh::sftp::ssh_sftp_home,
-            ssh::sftp::ssh_sftp_read_dir,
-            ssh::sftp::ssh_sftp_read_file,
-            ssh::sftp::ssh_sftp_write_file,
-            ssh::sftp::ssh_sftp_upload,
-            ssh::sftp::ssh_sftp_download,
-            ssh::sftp::ssh_sftp_create_file,
-            ssh::sftp::ssh_sftp_create_dir,
-            ssh::sftp::ssh_sftp_rename,
-            ssh::sftp::ssh_sftp_delete,
-            rdp::rdp_open,
-            rdp::rdp_input,
-            rdp::rdp_resize,
-            rdp::rdp_close,
-            rdp::rdp_list_sessions,
-            rdp::rdp_attach,
-            rdp::rdp_snapshot,
-            rdp::rdp_take_frame,
-            rdp::rdp_confirm_cert,
-            rdp::rdp_clipboard_focus,
-            sync::engine::sync_configure,
-            sync::engine::sync_disable,
-            sync::engine::sync_purge_secrets,
-            sync::engine::sync_pull,
-            sync::engine::sync_push,
         ])
         .on_window_event(|window, event| {
             // Mirror main-window minimize/restore onto the settings child.
@@ -864,35 +635,11 @@ pub fn run() {
                         }
                     }
                 }
-                // The sync scheduler's second trigger, after the debounce on a
-                // local edit. Emitted here rather than listened for on the
-                // frontend because a webview's own focus and the WINDOW's focus
-                // are different questions - a click on the header restores one
-                // and not the other.
-                //
-                // The `main` guard above is what keeps this to one webview, and
-                // that is load bearing rather than tidy: `fileKeyValueStore.ts`
-                // records that a contended write eventually gives up and writes
-                // over a stale baseline, losing another window's update, so two
-                // windows applying a pull at once would make that routine.
-                tauri::WindowEvent::Focused(true) => {
-                    let _ = window.emit(crate::modules::events::SYNC_FOCUSED, ());
-                }
                 _ => {}
             }
         })
-        // `build` + `run` rather than `run(context)` so the run loop can see
-        // `RunEvent::Opened` - macOS Launch Services' "Open With > Tervia" and
-        // drag-onto-Dock delivery. Every other platform routes the same open
-        // through argv (`cli::capture_startup`) or single-instance forwarding.
-        .build(tauri::generate_context!())
-        .expect("error while running tauri application")
-        .run(|_app, _event| {
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = &_event {
-                cli::handle_opened_urls(_app, urls);
-            }
-        });
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
 
 // Test module last: clippy's `items_after_test_module`.
@@ -941,7 +688,7 @@ mod allocator_tests {
         std::hint::black_box(&held);
     }
 
-    /// The regression guard for "Tervia gets heavy and then stops responding after
+    /// The regression guard for "Subclave gets heavy and then stops responding after
     /// a long session". Both halves are needed and they assert different things.
     ///
     /// Deliberately ONE test function rather than two: each phase reads the
@@ -998,37 +745,12 @@ mod ui_thread_guard {
     use std::path::Path;
 
     /// Sync `#[tauri::command]`s that are allowed to exist, each because it does
-    /// no blocking work: in-memory registry reads, an atomic flag, or a
-    /// fire-and-forget frame onto an already-open pipe.
+    /// no blocking work.
     ///
-    /// `pty_write` / `pty_resize` / `pty_close` are here ON PURPOSE and must stay
-    /// sync: they write one small frame and do not await the reply, and moving
-    /// them to `spawn_blocking` would let keystrokes transpose. See
-    /// `PtyClient::send_oneway`.
-    ///
-    /// `rdp_confirm_cert` is the exact analogue of `ssh_confirm_host_key`: it
-    /// takes a `std::sync::Mutex` over a small map, removes one entry and fires
-    /// a channel send that never blocks (the receiver is unbounded). The party
-    /// that *does* block is the TLS verifier on the RDP runtime, which is a
-    /// different thread entirely.
-    const ALLOWED_SYNC_COMMANDS: &[&str] = &[
-        "cli_classify_path",
-        "cli_initial_target",
-        "cli_install_path_shim",
-        "cli_take_initial_update_request",
-        "http_abort",
-        "pty_close",
-        "pty_resize",
-        "pty_write",
-        "rdp_confirm_cert",
-        "shell_bg_kill",
-        "shell_bg_list",
-        "shell_bg_logs",
-        "shell_bg_remove",
-        "shell_session_close",
-        "shell_session_open",
-        "ssh_confirm_host_key",
-    ];
+    /// Every remaining command is `async`, so the list is empty. A new sync
+    /// command needs an entry here with the reason it cannot block - adding one
+    /// should be a deliberate act, not a way around `spawn_blocking`.
+    const ALLOWED_SYNC_COMMANDS: &[&str] = &[];
 
     fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {

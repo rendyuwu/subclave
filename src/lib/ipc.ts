@@ -4,23 +4,10 @@
 // a hand-copied variant that dropped `image` previously caused real images to
 // be mishandled as "non-text" and skipped.
 
-/** Mirrors Rust `fs::file::ReadResult` (commands: fs_read_file, git_file_head, git_file_at). */
+/** Mirrors Rust `fs::file::ReadResult` (command: fs_read_file). */
 export type FsReadResult =
   | { kind: "text"; content: string; size: number }
   | { kind: "image"; dataUrl: string; mime: string; size: number }
-  | { kind: "binary"; size: number }
-  | { kind: "toolarge"; size: number; limit: number };
-
-/** Mirrors Rust `fs::file::ReadPortionResult` (command: fs_read_file_portion). No image variant. */
-export type FsReadPortionResult =
-  | {
-      kind: "text";
-      content: string;
-      size: number;
-      totalLines: number;
-      startLine: number;
-      endLine: number;
-    }
   | { kind: "binary"; size: number }
   | { kind: "toolarge"; size: number; limit: number };
 
@@ -32,18 +19,5 @@ export type FsReadPortionResult =
  */
 export const IPC_EVENTS = {
   /** Rust -> Settings webview: focus a settings tab (payload: tab id string). */
-  SETTINGS_TAB: "tervia:settings-tab",
-  /** Rust -> main window: open a path passed to the `tervia` CLI (single-instance forward). */
-  OPEN_CLI_TARGET: "tervia:open-cli-target",
-  /** Rust -> main window: the `tervia --update` shim asks the UI to start updating. */
-  TRIGGER_UPDATE: "tervia:trigger-update",
-  /**
-   * Rust -> main window: the window regained focus, which is when the sync
-   * scheduler may pull.
-   *
-   * A SIGNAL, not a command. The rate limit lives on this side beside the push
-   * debounce, because both measure the same thing and splitting them across the
-   * IPC boundary would put half the policy where the other half cannot see it.
-   */
-  SYNC_FOCUSED: "tervia:sync-focused",
+  SETTINGS_TAB: "subclave:settings-tab",
 } as const;

@@ -2,7 +2,7 @@
  * Self-check for the repository's comment-citation rule.
  * Run: `npx tsx scripts/citation-format-verify.ts`.
  *
- * `TERVIA.md` carries the rule: a comment may cite only
+ * `SUBCLAVE.md` carries the rule: a comment may cite only
  * what a reader holding nothing but the clone can open. A checked-in file, a
  * symbol, a path in the repo, an upstream project's public tracker named with
  * its project, or a pinned dependency's own source named with its crate. A LINE
@@ -181,17 +181,8 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
  * The directories the rule binds. Everything else is generated or vendored.
- *
- * `src-tauri/tervia-cli/src` is a SEPARATE CRATE and was outside the first three
- * for no better reason than that nobody had looked. It holds no citation today,
- * so widening cost nothing and found nothing, which is the point: a coverage gap
- * with no instances is still a gap, and this one sits in exactly the place a
- * citation into the main crate gets written and then rots, since the launcher's
- * whole job is explained by reference to the GUI binary it spawns. A directory
- * rather than the one file it currently holds, so a second file in that crate is
- * covered without anybody remembering to add it.
  */
-const ROOT_DIRS = ["scripts", "src", "src-tauri/src", "src-tauri/tervia-cli/src"];
+const ROOT_DIRS = ["scripts", "src", "src-tauri/src"];
 
 /**
  * Hand-written source that sits in no scanned directory.
@@ -231,30 +222,19 @@ function check(label: string, ok: boolean, detail?: unknown): void {
  *
  * Every version here is checked against `src-tauri/Cargo.lock` on every run, so
  * an entry cannot survive the bump that invalidates it. A crate that is NOT on
- * this list is not citable at all: `Cargo.lock` pins far more than ten
- * crates, and the ones listed are the ones whose internals this repository
- * actually reasons about.
+ * this list is not citable at all: `Cargo.lock` pins far more than two crates,
+ * and the ones listed are the ones whose internals this repository actually
+ * reasons about.
  *
  * DO NOT REBUILD THIS LIST FROM A VERSION SCAN. An earlier draft of it was
  * assembled by collecting the versions that appear in comments, and that method
- * is structurally blind to a crate cited WITHOUT one: `ironrdp-async` was named
- * in two comments with no version beside it, so a scan keyed on versions could
- * not see it and the list came out one entry short. The set is a statement about
- * which dependencies this code reasons about, not a summary of what the comments
+ * is structurally blind to a crate cited WITHOUT one: a crate named in two
+ * comments with no version beside it is invisible to a scan keyed on versions,
+ * and the list came out an entry short. The set is a statement about which
+ * dependencies this code reasons about, not a summary of what the comments
  * happen to say, and only the lockfile can confirm an entry.
  */
-const THIRD_PARTY_SOURCES = [
-  "arboard 3.6.1",
-  "ironrdp-async 0.9.0",
-  "ironrdp-cliprdr 0.6.0",
-  "ironrdp-cliprdr-format 0.2.0",
-  "ironrdp-connector 0.9.0",
-  "ironrdp-input 0.6.0",
-  "ironrdp-pdu 0.8.0",
-  "ironrdp-session 0.10.0",
-  "tauri 2.11.5",
-  "tauri-plugin-window-state 2.4.1",
-];
+const THIRD_PARTY_SOURCES = ["tauri 2.11.5", "tauri-plugin-window-state 2.4.1"];
 
 /**
  * The upstream projects whose public tracker a comment may cite by number IN
@@ -284,8 +264,8 @@ const sortedSet = (xs: string[]): boolean =>
 
 console.log("[allow-list] pinned, sorted, and still true of the lockfile");
 check(
-  "the third-party source allow-list is a sorted set of exactly 10 entries",
-  sortedSet(THIRD_PARTY_SOURCES) && THIRD_PARTY_SOURCES.length === 10,
+  "the third-party source allow-list is a sorted set of exactly 2 entries",
+  sortedSet(THIRD_PARTY_SOURCES) && THIRD_PARTY_SOURCES.length === 2,
   THIRD_PARTY_SOURCES,
 );
 check(
@@ -385,10 +365,10 @@ const BARE_TRACKER = /(?<![\w#])#[1-9]\d{0,4}(?![\dA-Fa-f])/g;
  * A backticked pinned crate opening a parenthesis, which is citation position.
  *
  * Scoped to `(` deliberately. Naming a dependency in prose is not citing it:
- * two comments legitimately read "after `tauri-plugin-window-state` has ..."
- * with no symbol in sight, and demanding a version there would redden ordinary
- * English. Every one of the 21 dependency citations in the tree opens a
- * parenthesis, so the parenthesis is what distinguishes the two.
+ * a comment legitimately reads "after `tauri-plugin-window-state` has ..." with
+ * no symbol in sight, and demanding a version there would redden ordinary
+ * English. The one dependency citation in the tree opens a parenthesis, so the
+ * parenthesis is what distinguishes the two.
  */
 const DEP_OPENER = new RegExp(
   `\\(\`(?:${THIRD_PARTY_SOURCES.map((e) => escapeRe(e.split(" ")[0])).join("|")})\``,
@@ -407,8 +387,8 @@ const DEP_OPENER = new RegExp(
  * line, the TypeScript one as much as the Rust one, so the half after the break
  * is not in the same string this pattern sees whichever language it is written
  * in. Inside a block comment the halves ARE in one string, and there the newline
- * plus continuation marker fails the gap. All 21 triples in the tree are in
- * `.rs` files, so the TypeScript half has no instance, and a reader who took the
+ * plus continuation marker fails the gap. The one triple in the tree is in a
+ * `.rs` file, so the TypeScript half has no instance, and a reader who took the
  * old wording for a Rust quirk would have written a wrapped triple in a `.ts`
  * comment and been just as invisible. Neither silently accepted nor silently
  * rejected, which was the choice to make: it is reported, with the crate named,
@@ -435,8 +415,8 @@ const DEP_WELL_FORMED = THIRD_PARTY_SOURCES.map((entry) => {
  * are silent, and it names no pinned crate, so `DEP_OPENER` is silent too. The
  * form would then be free to name a version and a symbol while crediting
  * nothing, which is precisely the unattributable citation the allow-list exists
- * to forbid. Measured over the tree: this matches the 21 real triples and
- * nothing else, and all 21 credit a pinned crate.
+ * to forbid. Measured over the tree: this matches the one real triple and
+ * nothing else, and that triple credits a pinned crate.
  */
 const DEP_SHAPE = /\([^()\n]{0,80}?\d+\.\d+\.\d+[ \t]*,[ \t]*`[^`\n]+`[^()\n]{0,12}\)/g;
 
@@ -445,13 +425,12 @@ const DEP_SHAPE = /\([^()\n]{0,80}?\d+\.\d+\.\d+[ \t]*,[ \t]*`[^`\n]+`[^()\n]{0,
  * ANYWHERE EARLIER IN THE SAME COMMENT, and not a character count.
  *
  * This was a 90-character window and that was a latent false positive with no
- * good fix. `webgl.ts` names `xterm.js` at the end of one line of a docblock and
- * carries `#4054` at the start of the next; an edit that pushed the project name
+ * good fix. A docblock names `xterm.js` at the end of one line and carries
+ * `#4054` at the start of the next; an edit that pushed the project name
  * past the count would have reddened a correct citation, and the only remedy
  * available to whoever hit it is widening the number, which weakens the
- * detector for every real case. `KNOWN-LIMITS.md` already records that exact
- * shape, a check that reddens on correct code being worse than no check,
- * because the first contributor to hit one weakens it.
+ * detector for every real case. A check that reddens on correct code is worse
+ * than no check, because the first contributor to hit one weakens it.
  *
  * The comment is the non-arbitrary bound, and it is the reader's bound too: a
  * reader meeting a bare number scans back for the nearest project name and
@@ -597,7 +576,7 @@ function notAFileSpelling(s: string): string | null {
  * covers only 3 of the 8 store files, so a pinned list would still be needed
  * beside it: two mechanisms for less coverage than one pattern.
  */
-const RUNTIME_STORE_FILE = /^tervia-[a-z0-9-]+\.json$/;
+const RUNTIME_STORE_FILE = /^subclave-[a-z0-9-]+\.json$/;
 
 /**
  * The config spellings a formatter accepts in a USER'S opened project.
@@ -618,17 +597,13 @@ const EXTERNAL_CONFIG_NAMES = [".prettierrc.js", ".prettierrc.yaml", "prettier.c
  * the pin survives every edit that moves the comment. A line-keyed exemption
  * list inside a check about rotting line numbers would be its own joke.
  *
- * All three are hypothetical file names in prose about how a name is handled,
- * not claims that a file exists: one is about which icon an extension would
- * render, the other two are members of a list of command spellings a matcher
- * must NOT match. There is no mechanical difference between these and a
- * citation, which is exactly why they are enumerated rather than pattern-matched.
+ * EMPTY IN THIS TREE, and that is a measurement rather than an oversight: no
+ * comment currently quotes a hypothetical file name as prose. There is no
+ * mechanical difference between such a name and a citation, which is why the
+ * class is enumerated rather than pattern-matched, and an entry here is a
+ * deliberate diff in this file rather than a side effect of somebody's comment.
  */
-const EXAMPLE_SPELLINGS = [
-  "src/modules/explorer/lib/constants.ts foo.ts",
-  "src/modules/terminal/lib/aiCliDetector.ts claude.ts",
-  "src/modules/terminal/lib/aiCliDetector.ts codex-wrapper.sh",
-];
+const EXAMPLE_SPELLINGS: string[] = [];
 
 /**
  * A file named in order to say that it is GONE, where the deletion is the
@@ -636,23 +611,21 @@ const EXAMPLE_SPELLINGS = [
  *
  * THE ONE PLACE THIS CHECK RECORDS A HUMAN JUDGEMENT INSTEAD OF APPLYING A RULE,
  * and the docblock's WHAT IT DOES NOT SEE section carries the argument. In
- * short: the citing comment explains that once these two modules were deleted, a
- * keychain account became unreachable from inside the app, so a purge that skips
- * strands a private key. The sentence is FALSE if the files still exist. The
+ * short: a comment may explain that a module was deleted, so a purge that skips
+ * it strands a secret. The sentence is FALSE if the file still exists, so the
  * dead name is load-bearing and removing it would leave the paragraph with no
  * subject.
  *
- * The same dead spelling was, at the same time, cited elsewhere in the present
- * tense as a live mechanism, and there it was simply wrong. Same text, opposite
- * verdicts, and the difference is tense and grammatical subject: a semantic
- * property no detector over a comment's text can read. Hence an entry rather
- * than a rule. Keyed on the citing file, so the exemption cannot travel to
- * another file that cites the same dead name as though it were alive.
+ * The same dead spelling cited in the present tense, as a live mechanism, is
+ * simply wrong. Same text, opposite verdicts, and the difference is tense and
+ * grammatical subject: a semantic property no detector over a comment's text can
+ * read. Hence an entry rather than a rule. Keyed on the citing file, so the
+ * exemption cannot travel to another file that cites the same dead name as
+ * though it were alive.
+ *
+ * EMPTY IN THIS TREE, for the same reason as the list above.
  */
-const DELIBERATELY_DEAD = [
-  "scripts/legacy-purge-verify.ts modules/rdp/connections.ts",
-  "scripts/legacy-purge-verify.ts modules/ssh/connections.ts",
-];
+const DELIBERATELY_DEAD: string[] = [];
 
 /** Is a spelling that resolved to nothing nevertheless permitted, and why? */
 function exemptDeadPath(citing: string, spelling: string): string | null {
@@ -683,12 +656,12 @@ function sharedDepth(a: string, b: string): number {
  *   - the alias form maps to the source root, per the compiler's own path
  *     mapping;
  *   - anything else is matched as a path suffix on a segment boundary, so
- *     `hosts/store.ts` finds the one file ending that way.
+ *     `settings/store.ts` finds the one file ending that way.
  *
  * A suffix tie is then broken by NEARNESS to the citing file, which is how a
- * human reads it: a bare store-file name in a comment inside the hosts module
- * means the hosts one, and every reader knows that without being told. This is a
- * ranking and it can pick the wrong file among several that exist, so it is
+ * human reads it: a bare `store.ts` in a comment inside the settings module
+ * means the settings one, and every reader knows that without being told. This
+ * is a ranking and it can pick the wrong file among several that exist, so it is
  * used ONLY to answer "does this name something", never to report which file
  * was meant. Measured: nearness resolves 29 of the 67 spellings that are
  * ambiguous by suffix alone, and every one it resolves sits in the same module
@@ -750,7 +723,7 @@ const BACKTICKED = /`([^`\n]+)`/g;
 console.log("\n[resolvability] the file universe, and every exemption still necessary");
 // A walk that found nothing, or only a handful, would make every resolution
 // fail and every citation look dead. Asserted before anything is resolved.
-check(`the checkout walk found files to resolve against`, REPO_FILES.length > 400, {
+check(`the checkout walk found files to resolve against`, REPO_FILES.length > 110, {
   files: REPO_FILES.length,
 });
 check(
@@ -763,13 +736,13 @@ check(
   EXTERNAL_CONFIG_NAMES,
 );
 check(
-  "the example-spelling list is a sorted set of exactly 3 entries",
-  sortedSet(EXAMPLE_SPELLINGS) && EXAMPLE_SPELLINGS.length === 3,
+  "the example-spelling list is a sorted set of exactly 0 entries",
+  sortedSet(EXAMPLE_SPELLINGS) && EXAMPLE_SPELLINGS.length === 0,
   EXAMPLE_SPELLINGS,
 );
 check(
-  "the deliberately-dead list is a sorted set of exactly 2 entries",
-  sortedSet(DELIBERATELY_DEAD) && DELIBERATELY_DEAD.length === 2,
+  "the deliberately-dead list is a sorted set of exactly 0 entries",
+  sortedSet(DELIBERATELY_DEAD) && DELIBERATELY_DEAD.length === 0,
   DELIBERATELY_DEAD,
 );
 // An exemption for a spelling somebody has since checked in is an exemption
@@ -909,7 +882,7 @@ for (const { label, ok } of commentScannerSelfTest()) check(label, ok);
 // ---------------------------------------------------------------------------
 
 /** The symbol every dependency control cites. Real, and reachable through the lockfile. */
-const SYM = "DecodedImage::apply_rgb16_bitmap";
+const SYM = "Builder::invoke_handler";
 
 /** A named citation in a comment. MUST be flagged. */
 const C_NAMED = "const a = 1; // mirrors the guard at foo.ts:12\n";
@@ -923,7 +896,8 @@ const C_NAMED_IN_STRING = 'const a = "mirrors the guard at foo.ts:12";\n';
  * which is the reason it is a control: a second instrument that agrees with the
  * first by construction proves nothing about what the first one missed.
  */
-const C_NAMED_OUTSIDE_BACKTICK = "const a = 1; // awaited before `hosts/store.ts`:954-961 runs\n";
+const C_NAMED_OUTSIDE_BACKTICK =
+  "const a = 1; // awaited before `src/lib/storeRecovery.ts`:12 runs\n";
 /** A bare span in parentheses, the other shape the inventory missed. MUST be flagged. */
 const C_BARE_SPAN = "const a = 1; // the direction is explained at (:112-114)\n";
 /**
@@ -935,21 +909,21 @@ const C_BARE_SPAN = "const a = 1; // the direction is explained at (:112-114)\n"
  */
 const C_DEP_WITH_LINE = "const a = 1; // (`tauri` 2.11.5, `src/ipc/channel.rs:39`)\n";
 /** The form the conversion lands on: crate, pinned version, symbol, no line. MUST NOT be flagged. */
-const C_DEP_SYMBOL = `const a = 1; // (\`ironrdp-session\` 0.10.0, \`${SYM}\`)\n`;
+const C_DEP_SYMBOL = `const a = 1; // (\`tauri\` 2.11.5, \`${SYM}\`)\n`;
 /** The same with the crate name removed, and no line to redden it instead. MUST be flagged. */
-const C_DEP_NO_CRATE = `const a = 1; // (0.10.0, \`${SYM}\`)\n`;
+const C_DEP_NO_CRATE = `const a = 1; // (2.11.5, \`${SYM}\`)\n`;
 /** The same with the crate named but no version. MUST be flagged. */
-const C_DEP_NO_VERSION = `const a = 1; // (\`ironrdp-session\`, \`${SYM}\`)\n`;
+const C_DEP_NO_VERSION = `const a = 1; // (\`tauri\`, \`${SYM}\`)\n`;
 /**
  * The same at a version this repository does not pin. MUST be flagged.
  *
- * 0.9.0 is a real pinned version in this repository, of three OTHER crates, so
- * this also proves the version is checked against its own crate rather than
- * against the set of versions in use.
+ * 2.4.1 is a real pinned version in this repository, of the OTHER crate on the
+ * allow-list, so this also proves the version is checked against its own crate
+ * rather than against the set of versions in use.
  */
-const C_DEP_BAD_VERSION = `const a = 1; // (\`ironrdp-session\` 0.9.0, \`${SYM}\`)\n`;
+const C_DEP_BAD_VERSION = `const a = 1; // (\`tauri\` 2.4.1, \`${SYM}\`)\n`;
 /** A triple wrapped across two comment lines. MUST be flagged as malformed. */
-const C_DEP_WRAPPED = `fn f() {} // (\`ironrdp-session\` 0.10.0,\n// \`${SYM}\`)\n`;
+const C_DEP_WRAPPED = `fn f() {} // (\`tauri\` 2.11.5,\n// \`${SYM}\`)\n`;
 /** A dependency named in prose, citing no symbol. MUST NOT be flagged. */
 const C_DEP_IN_PROSE =
   "const a = 1; // re-apply the floor after `tauri-plugin-window-state` has restored\n";
@@ -983,21 +957,21 @@ const C_DEAD_PATH = "const a = 1; // see `modules/ai/lib/httpProxy.ts` for the s
 /** The same spelling in a string literal. MUST NOT be flagged. */
 const C_DEAD_PATH_IN_STRING = 'const a = "see modules/ai/lib/httpProxy.ts";\n';
 /** A citation of a file that IS in the checkout. MUST NOT be flagged. */
-const C_LIVE_PATH = "const a = 1; // see `src/modules/vault/resolve.ts` for the SSH side\n";
+const C_LIVE_PATH = "const a = 1; // `src/lib/storeRecovery.ts` classifies the failure\n";
 /**
- * A bare file name resolved by the citing file's own module. MUST NOT be flagged.
+ * A bare file name resolved by the citing file's own directory. MUST NOT be flagged.
  *
- * That store-file name has six candidates in this tree, so a resolver ignoring
- * where the citation sits would call this ambiguous. Cited from inside the hosts
- * module it means the hosts one, which is how every reader takes it.
+ * Two files share that name in this tree, so a resolver ignoring where the
+ * citation sits would call this ambiguous. Cited from the settings window's own
+ * directory it means the settings one, which is how every reader takes it.
  */
-const C_NEAREST_PATH = "const a = 1; // the write queue in `store.ts` runs first\n";
+const C_NEAREST_PATH = "const a = 1; // the root is created in `main.tsx` first\n";
 /**
  * The identical spelling with nothing nearby to disambiguate it. MUST be
  * flagged as partial.
  *
- * The SAME text as the control above, from a citing path in another tree. That
- * is what makes the pair a test of the resolution rule rather than of the
+ * The SAME text as the control above, from a citing path in another directory.
+ * That is what makes the pair a test of the resolution rule rather than of the
  * spelling: one string, two answers, and only a resolver that reads the citing
  * file's directory can produce both.
  */
@@ -1095,8 +1069,8 @@ check(
 // The pair that tests the RULE and not the spelling: identical text, two
 // answers, decided only by where the citation sits.
 check(
-  "a bare `store.ts` cited from inside the hosts module is NOT flagged",
-  kindsOf("src/modules/hosts/jumps.ts", C_NEAREST_PATH) === "",
+  "a bare `main.tsx` cited from the settings directory is NOT flagged",
+  kindsOf("src/settings/SettingsApp.tsx", C_NEAREST_PATH) === "",
 );
 check(
   "the same spelling cited from a script, with nothing nearby, is flagged as partial",
@@ -1104,11 +1078,11 @@ check(
 );
 check(
   "a relative spelling resolves against the citing file's own directory",
-  kindsOf("src/modules/hosts/jumps.ts", C_RELATIVE_PATH) === "",
+  kindsOf("src/modules/settings/customTheme.ts", C_RELATIVE_PATH) === "",
 );
 check(
   "a relative spelling that names nothing there is flagged",
-  kindsOf("src/modules/hosts/jumps.ts", C_RELATIVE_DEAD) === "dead-path",
+  kindsOf("src/modules/settings/customTheme.ts", C_RELATIVE_DEAD) === "dead-path",
 );
 check(
   "import spellings quoted as examples of a class are NOT flagged",
@@ -1126,11 +1100,11 @@ check(
 console.log("\n[exemptions] each one fires, and none of them travels");
 check(
   "a runtime store-file name is exempt",
-  kindsOf("src/x.ts", "const a = 1; // written to `tervia-vault.json`\n") === "",
+  kindsOf("src/x.ts", "const a = 1; // written to `subclave-settings.json`\n") === "",
 );
 check(
   "the same stem at another extension is NOT exempt, so the pattern is not a prefix",
-  kindsOf("src/x.ts", "const a = 1; // written to `tervia-vault.ts`\n") === "dead-path",
+  kindsOf("src/x.ts", "const a = 1; // written to `subclave-settings.ts`\n") === "dead-path",
 );
 check(
   "an external tool's config name is exempt",
@@ -1139,21 +1113,6 @@ check(
 check(
   "this repository's own checked-in config resolves normally rather than by exemption",
   kindsOf("src/x.ts", "const a = 1; // reads `.prettierrc.json` first\n") === "",
-);
-// The escape hatch, and the control that matters most about it: the SAME dead
-// spelling from a DIFFERENT file must still redden, because the judgement being
-// recorded is about one sentence and not about the name.
-check(
-  "the deliberately-dead name is exempt in the file whose sentence is about its deletion",
-  kindsOf(
-    "scripts/legacy-purge-verify.ts",
-    "const a = 1; // once `modules/ssh/connections.ts` was deleted\n",
-  ) === "",
-);
-check(
-  "the identical spelling cited from any other file IS flagged",
-  kindsOf("src/x.ts", "const a = 1; // once `modules/ssh/connections.ts` was deleted\n") ===
-    "dead-path",
 );
 // An exemption must never be able to silence an AMBIGUITY, which is a finding
 // about a file that does exist. Proved by ordering: the runtime pattern is
@@ -1197,17 +1156,12 @@ check(
 // nearness prefer the citing file automatically, a full path does not.
 check(
   "a bare name that resolves to the citing file, while others share it, IS flagged",
-  kindsOf(
-    "src-tauri/tervia-cli/src/main.rs",
-    "// the subsystem is set in `main.rs`, not this one\n",
-  ) === "self-resolved",
+  kindsOf("src/settings/main.tsx", "// the entry point is `main.tsx`, not this one\n") ===
+    "self-resolved",
 );
 check(
   "the same claim with the path written out is NOT flagged",
-  kindsOf(
-    "src-tauri/tervia-cli/src/main.rs",
-    "// the subsystem is set in `src-tauri/src/main.rs`, not this one\n",
-  ) === "",
+  kindsOf("src/settings/main.tsx", "// the entry point is `src/main.tsx`, not this one\n") === "",
 );
 // And a bare name that resolves to the citing file when NOTHING else shares it
 // is a redundant self-reference rather than a misdirection, so it passes.
@@ -1365,8 +1319,8 @@ const C_DEP_FORM_TWICE = [
   "const a = 1;",
   "/*",
   " * nothing citable on this line",
-  ` * (\`ironrdp-session\`, \`${SYM}\`) is consulted first`,
-  ` * then (\`tauri\`, \`${SYM}\`) decides`,
+  ` * (\`tauri\`, \`${SYM}\`) is consulted first`,
+  ` * then (\`tauri-plugin-window-state\`, \`${SYM}\`) decides`,
   " */",
   "",
 ].join("\n");
@@ -1376,8 +1330,8 @@ const C_DEP_UNCREDITED_TWICE = [
   "const a = 1;",
   "/*",
   " * nothing citable on this line",
-  ` * (0.10.0, \`${SYM}\`) is consulted first`,
-  ` * then (0.9.0, \`${SYM}\`) decides`,
+  ` * (2.11.5, \`${SYM}\`) is consulted first`,
+  ` * then (2.4.1, \`${SYM}\`) decides`,
   " */",
   "",
 ].join("\n");
@@ -1397,16 +1351,15 @@ const C_DEAD_PATH_TWICE = [
  * Two bare names each resolving to the citing file while another shares it. MUST
  * report 4 and 5.
  *
- * A Rust block comment, because the one live instance this detector was built
- * for was in a Rust file, and because that puts the offset arithmetic in the
+ * A Rust block comment, because that puts the offset arithmetic in the
  * hand-written scanner rather than in the parse, which is a second code path.
  */
 const C_SELF_RESOLVED_TWICE = [
   "fn f() {}",
   "/*",
   " * nothing citable on this line",
-  " * the subsystem is set in `main.rs`, not this one",
-  " * and the manifest is read by `main.rs` too",
+  " * the child module is declared in `mod.rs`, not this one",
+  " * and the sibling is declared in `mod.rs` too",
   " */",
   "",
 ].join("\n");
@@ -1424,8 +1377,8 @@ const C_PARTIAL_PATH_TWICE = [
   "const a = 1;",
   "/*",
   " * nothing citable on this line",
-  " * the write queue in `store.ts` runs first",
-  " * and the reader in `store.ts` runs after it",
+  " * the root is created in `main.tsx` first",
+  " * and the providers are mounted in `main.tsx` too",
   " */",
   "",
 ].join("\n");
@@ -1477,7 +1430,7 @@ twoOnTwoLines("uncredited triples", "c.ts", C_DEP_UNCREDITED_TWICE, "dep-uncredi
 twoOnTwoLines("dead paths", "src/x.ts", C_DEAD_PATH_TWICE, "dead-path");
 twoOnTwoLines(
   "self-resolving bare names",
-  "src-tauri/tervia-cli/src/main.rs",
+  "src-tauri/src/modules/fs/mod.rs",
   C_SELF_RESOLVED_TWICE,
   "self-resolved",
 );
@@ -1539,7 +1492,7 @@ check(
 // would otherwise turn every assertion in this section green over empty lists.
 check(
   "the scan covers the whole hand-written tree",
-  SCAN_UNITS.reduce((n, u) => n + u.files.length, 0) > 400,
+  SCAN_UNITS.reduce((n, u) => n + u.files.length, 0) > 60,
   SCAN_UNITS.map((u) => `${u.label} ${u.files.length}`),
 );
 

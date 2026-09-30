@@ -41,8 +41,3 @@ export function slugify(name: string, fallback = ""): string {
       .replace(/^-+|-+$/g, "") || fallback
   );
 }
-
-/** Escapes user input so it matches as a literal substring, not a regex. */
-export function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}

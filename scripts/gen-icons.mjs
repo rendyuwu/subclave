@@ -2,7 +2,7 @@
 /**
  * Rasterise the whole icon set from the two SVG sources in src-tauri/icons/.
  *
- * Run after editing `tervia-mark.svg` or `tervia-mark-foreground.svg`:
+ * Run after editing `subclave-mark.svg` or `subclave-mark-foreground.svg`:
  *
  *   node scripts/gen-icons.mjs
  *
@@ -28,9 +28,9 @@ import { tmpdir } from "node:os";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ICONS = join(ROOT, "src-tauri", "icons");
-const MARK = join(ICONS, "tervia-mark.svg");
-const FOREGROUND = join(ICONS, "tervia-mark-foreground.svg");
-const STAGE = join(tmpdir(), "tervia-icons");
+const MARK = join(ICONS, "subclave-mark.svg");
+const FOREGROUND = join(ICONS, "subclave-mark-foreground.svg");
+const STAGE = join(tmpdir(), "subclave-icons");
 
 function run(cmd, args) {
   execFileSync(cmd, args, { stdio: ["ignore", "ignore", "inherit"] });
@@ -118,7 +118,7 @@ buildIcns(
 );
 
 // --- mobile ----------------------------------------------------------------
-// Tervia ships desktop only, but `tauri icon` writes these and a future
+// Subclave ships desktop only, but `tauri icon` writes these and a future
 // mobile target would expect them present rather than stale.
 const ANDROID = [
   ["mdpi", 48, 108],
@@ -157,7 +157,7 @@ const IOS = [
 for (const [name, size] of IOS) render(MARK, size, join(ICONS, "ios", `AppIcon-${name}.png`));
 
 // --- repo-level logo -------------------------------------------------------
-render(MARK, 750, join(ROOT, "tervia.png"));
+render(MARK, 750, join(ROOT, "subclave.png"));
 
 rmSync(STAGE, { recursive: true, force: true });
-console.log("gen-icons: wrote the icon set from tervia-mark.svg");
+console.log("gen-icons: wrote the icon set from subclave-mark.svg");

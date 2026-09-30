@@ -2,9 +2,9 @@ import { type ThemeColors } from "@/modules/settings/customTheme";
 
 /**
  * Every editable APP-CHROME theme color, grouped for the tabbed color editor in
- * ThemeSection. The terminal's ANSI 16 are NOT here — the terminal is themed
- * independently under Settings -> Terminal (see `modules/settings/
- * terminalPalette.ts`). Order within a group is the display order.
+ * ThemeSection. The ANSI 16 are NOT hand-edited here — they ship with each
+ * preset (and carry the entry colours other surfaces read). Order within a
+ * group is the display order.
  */
 export const COLOR_FIELDS: { key: keyof ThemeColors; label: string; group: string }[] = [
   { key: "background", label: "Background", group: "Base" },

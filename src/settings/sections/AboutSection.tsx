@@ -14,11 +14,10 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { useEffect, useRef, useState } from "react";
 import { SectionHeader } from "../components/SectionHeader";
 import { SettingsCard } from "../components/SettingsCard";
-import { Download, Globe, RefreshCw } from "lucide-react";
+import { Download, RefreshCw } from "lucide-react";
 
-const REPO_URL = "https://github.com/rendyuwu/tervia";
-const UPSTREAM_URL = "https://github.com/IlhamriSKY/TEDI";
-const SITE_URL = "https://tervia.rendy.dev";
+const REPO_URL = "https://github.com/rendyuwu/subclave";
+const UPSTREAM_URL = "https://github.com/rendyuwu/tervia";
 
 const PLATFORM_LABEL: Record<string, string> = {
   macos: "macOS",
@@ -53,7 +52,7 @@ type CheckState =
 
 export function AboutSection() {
   const [version, setVersion] = useState("");
-  const [name, setName] = useState("Tervia");
+  const [name, setName] = useState("Subclave");
   const [build] = useState(initialBuildLabel);
   const [checkState, setCheckState] = useState<CheckState>({ kind: "idle" });
   // Held in a ref, not state. The Update handle is non-serialisable and bound
@@ -91,7 +90,7 @@ export function AboutSection() {
         <img src="/icon.png" alt="" className="size-12" draggable={false} />
         <div className="flex min-w-0 flex-col">
           <span className="text-[15px] font-semibold tracking-tight">{name}</span>
-          <span className="text-muted-foreground text-[11px]">Terminal Director</span>
+          <span className="text-muted-foreground text-[11px]">A local-first password manager.</span>
           <span className="text-muted-foreground mt-1 font-mono text-[11px]">
             v{version || "-"}
           </span>
@@ -100,7 +99,7 @@ export function AboutSection() {
 
       <SettingsCard
         title="Build details"
-        description="Platform, bundle id, license, website, and source repositories."
+        description="Platform, bundle id, license, and source repositories."
       >
         <dl className="grid grid-cols-[110px_1fr] gap-y-2.5 text-[12px]">
           <dt className="text-muted-foreground">Build</dt>
@@ -109,22 +108,10 @@ export function AboutSection() {
           </dd>
 
           <dt className="text-muted-foreground">Bundle ID</dt>
-          <dd className="font-mono text-[11.5px]">dev.rendy.tervia</dd>
+          <dd className="font-mono text-[11.5px]">dev.rendy.subclave</dd>
 
           <dt className="text-muted-foreground">License</dt>
           <dd>Apache 2.0</dd>
-
-          <dt className="text-muted-foreground">Website</dt>
-          <dd>
-            <button
-              type="button"
-              onClick={() => void openUrl(SITE_URL)}
-              className="hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md text-[12px] underline-offset-2 hover:underline"
-            >
-              <Globe size={12} strokeWidth={1.75} />
-              tervia.rendy.dev
-            </button>
-          </dd>
 
           <dt className="text-muted-foreground">Source code</dt>
           <dd>
@@ -134,7 +121,7 @@ export function AboutSection() {
               className="hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md text-[12px] underline-offset-2 hover:underline"
             >
               <BrandIcon brand="github" size={12} />
-              rendyuwu/tervia
+              rendyuwu/subclave
             </button>
           </dd>
 
@@ -146,7 +133,7 @@ export function AboutSection() {
               className="hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md text-[12px] underline-offset-2 hover:underline"
             >
               <BrandIcon brand="github" size={12} />
-              IlhamriSKY/TEDI
+              rendyuwu/tervia
             </button>
           </dd>
         </dl>
@@ -295,7 +282,7 @@ function updaterMessage(state: CheckState): string {
     case "downloading":
       return `Downloading v${state.version}…`;
     case "ready":
-      return `v${state.version} is installed. Restart Tervia to apply.`;
+      return `v${state.version} is installed. Restart Subclave to apply.`;
     case "manual-available":
       return `v${state.version} is available - install manually via your package manager.`;
     case "uptodate":

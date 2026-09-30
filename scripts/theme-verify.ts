@@ -2,23 +2,22 @@
  * Self-check for the theme system.
  * Run: `npx tsx scripts/theme-verify.ts`.
  *
- * The failure this exists for is silent and was real: `--tervia-icon-done` was
+ * The failure this exists for is silent and was real: `--subclave-icon-done` was
  * added to globals.css with a hard-coded blue and no `ThemeColors` key, so the
  * "finished" badge stayed blue under EVERY preset and no error was raised
  * anywhere. Any themable colour var must be reachable from a theme, and any
  * theme key must be editable in Settings, or it silently stops being a theme.
  *
  * Checks:
- *   - every `--tervia-*` COLOUR var declared in globals.css is written by either
- *     the app theme (COLOR_VAR_MAP) or the terminal palette,
- *   - every `--tervia-*` var a theme WRITES is read by some CSS/component, so a
+ *   - every `--subclave-*` COLOUR var declared in globals.css is written by the
+ *     app theme (COLOR_VAR_MAP),
+ *   - every `--subclave-*` var a theme WRITES is read by some CSS/component, so a
  *     colour picker in Settings can never be a knob that moves nothing
  *     (the button token was exactly that until the neutral button started
  *     reading it),
- *   - every non-ANSI key is editable in the Settings colour editor
- *     (ANSI 16 live under Settings > Terminal instead),
- *   - preset names and their derived terminal-preset slugs are unique
- *     (a duplicate slug would silently shadow another terminal preset).
+ *   - every non-ANSI key is editable in the Settings colour editor (the ANSI 16
+ *     have no settings surface yet),
+ *   - preset names are unique.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -26,7 +25,6 @@ import { dirname, join } from "node:path";
 
 import { THEME_PRESETS } from "../src/modules/settings/themePresets";
 import { COLOR_FIELDS } from "../src/settings/sections/theme/colorFields";
-import { slugify } from "../src/lib/utils";
 import {
   contrastRatio,
   ensureVisibleButtonFace,
@@ -49,7 +47,6 @@ function check(name: string, ok: boolean, detail?: unknown): void {
 
 const css = read("src/styles/globals.css");
 const customThemeSrc = read("src/modules/settings/customTheme.ts");
-const terminalSrc = read("src/modules/settings/terminalPalette.ts");
 
 // COLOR_VAR_MAP is source-scanned rather than imported: customTheme.ts touches
 // `document` at module scope through its Tauri imports, and this only needs the
@@ -58,44 +55,34 @@ const mapBody = /const COLOR_VAR_MAP[\s\S]*?\n};/.exec(customThemeSrc)?.[0] ?? "
 const appVars = new Set([...mapBody.matchAll(/"(--[a-z0-9-]+)"/g)].map((m) => m[1]));
 check("COLOR_VAR_MAP parsed", appVars.size > 30, appVars.size);
 
-const termVars = new Set(
-  [...terminalSrc.matchAll(/"(--tervia-term-[a-z0-9-]+)"/g)].map((m) => m[1]),
-);
-check("terminal palette vars parsed", termVars.size === 20, termVars.size);
-
 // Vars that are NOT colours a theme should own: layout/typography knobs and
 // values derived at runtime from other tokens.
 const NON_THEMABLE = new Set([
-  "--tervia-app-opacity",
-  "--tervia-canvas-bg", // written by applyCustomTheme from `background`
-  "--tervia-editor-font-size",
-  "--tervia-mono-font",
-  "--tervia-glass-surface",
-  "--tervia-glass-header",
-  "--tervia-glass-menu",
-  // Follow the EDITOR theme, not the app theme (see modules/editor/lib/diffColors.ts).
-  "--tervia-editor-diff-added",
-  "--tervia-editor-diff-removed",
-  // Derived in globals.css from --tervia-button-face, so it tracks whatever the
+  "--subclave-app-opacity",
+  "--subclave-canvas-bg", // written by applyCustomTheme from `background`
+  "--subclave-glass-surface",
+  "--subclave-glass-header",
+  "--subclave-glass-menu",
+  // Derived in globals.css from --subclave-button-face, so it tracks whatever the
   // theme sets without needing a knob of its own. Giving it one would let a
   // theme pick a hover that is darker than the rest state on a dark theme.
-  "--tervia-button-face-hover",
+  "--subclave-button-face-hover",
 ]);
 
-const declared = new Set([...css.matchAll(/^\s*(--tervia-[a-z0-9-]+)\s*:/gm)].map((m) => m[1]));
-check("globals.css vars parsed", declared.size > 40, declared.size);
+const declared = new Set([...css.matchAll(/^\s*(--subclave-[a-z0-9-]+)\s*:/gm)].map((m) => m[1]));
+check("globals.css vars parsed", declared.size > 30, declared.size);
 
 for (const v of declared) {
   if (NON_THEMABLE.has(v)) continue;
-  check(`${v} is themable`, appVars.has(v) || termVars.has(v));
+  check(`${v} is themable`, appVars.has(v));
 }
 
 // The reverse direction, and the other half of the same bug: a theme token that
 // nothing reads is a dead knob - the Settings colour picker changes it and the
-// UI never moves. `--tervia-button-face`'s predecessor was exactly that.
+// UI never moves. `--subclave-button-face`'s predecessor was exactly that.
 const sources = collectSources(join(root, "src"));
 for (const v of appVars) {
-  if (!v.startsWith("--tervia-")) continue;
+  if (!v.startsWith("--subclave-")) continue;
   check(
     `${v} is read by something`,
     sources.some((s) => s.body.includes(v)),
@@ -128,7 +115,7 @@ const rawHits = sources.flatMap((s) =>
 );
 check("no raw Tailwind hues in components", rawHits.length === 0, rawHits.slice(0, 8));
 
-// Editable in Settings > Theme, except the ANSI 16 (Settings > Terminal).
+// Editable in Settings > Theme, except the ANSI 16, which no surface edits yet.
 const editable = new Set(COLOR_FIELDS.map((f) => f.key));
 const sample = THEME_PRESETS[0].dark;
 for (const key of Object.keys(sample)) {
@@ -136,11 +123,9 @@ for (const key of Object.keys(sample)) {
   check(`${key} is editable in Settings`, editable.has(key as keyof typeof sample));
 }
 
-// Presets: unique names, and unique slugs (TERMINAL_PRESETS keys off the slug).
+// Presets: unique names.
 const names = THEME_PRESETS.map((p) => p.name);
 check("preset names are unique", new Set(names).size === names.length, names);
-const slugs = names.map((n) => slugify(n, "preset"));
-check("terminal preset slugs are unique", new Set(slugs).size === slugs.length, slugs);
 
 // Both variants of every preset carry every key with a non-empty value:
 // a preset is spread from a base, so a typo'd key name would leave the base

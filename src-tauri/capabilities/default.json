@@ -4,9 +4,7 @@
   "description": "Capability for the main window",
   "windows": [
     "main",
-    "settings",
-    "debug",
-    "float-*"
+    "settings"
   ],
   "permissions": [
     "core:default",

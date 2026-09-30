@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Enforces the module import discipline documented in TERVIA.md and CONTRIBUTING.md:
+// Enforces the module import discipline documented in SUBCLAVE.md and CONTRIBUTING.md:
 //
 //   "Imports: always @/..., never relative across modules."
 //

@@ -17,31 +17,16 @@ import {
   useEffect,
   useState,
 } from "react";
-import {
-  Code,
-  Info,
-  Keyboard,
-  Palette,
-  RefreshCw,
-  Settings,
-  X,
-  type LucideIcon,
-} from "lucide-react";
+import { Info, Keyboard, Palette, Settings, X, type LucideIcon } from "lucide-react";
 
 const GeneralSection = lazy(() =>
   import("./sections/GeneralSection").then((m) => ({ default: m.GeneralSection })),
-);
-const CodeEditorSection = lazy(() =>
-  import("./sections/CodeEditorSection").then((m) => ({ default: m.CodeEditorSection })),
 );
 const ThemeSection = lazy(() =>
   import("./sections/ThemeSection").then((m) => ({ default: m.ThemeSection })),
 );
 const ShortcutsSection = lazy(() =>
   import("./sections/ShortcutsSection").then((m) => ({ default: m.ShortcutsSection })),
-);
-const SyncSection = lazy(() =>
-  import("./sections/SyncSection").then((m) => ({ default: m.SyncSection })),
 );
 const AboutSection = lazy(() =>
   import("./sections/AboutSection").then((m) => ({ default: m.AboutSection })),
@@ -54,10 +39,8 @@ const TABS: {
   component: ComponentType;
 }[] = [
   { id: "general", label: "General", icon: Settings, component: GeneralSection },
-  { id: "code-editor", label: "Code Editor", icon: Code, component: CodeEditorSection },
   { id: "theme", label: "Theme", icon: Palette, component: ThemeSection },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard, component: ShortcutsSection },
-  { id: "sync", label: "Sync", icon: RefreshCw, component: SyncSection },
   { id: "about", label: "About", icon: Info, component: AboutSection },
 ];
 

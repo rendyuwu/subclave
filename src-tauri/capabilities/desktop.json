@@ -7,9 +7,7 @@
   ],
   "windows": [
     "main",
-    "settings",
-    "debug",
-    "float-*"
+    "settings"
   ],
   "permissions": [
     "autostart:default",

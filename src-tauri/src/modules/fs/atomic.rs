@@ -32,28 +32,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 /// Atomically replace `path` with `bytes`.
 ///
-/// Stages into `<dir>/.<filename>.tervia.tmp`, fsyncs it, then renames over
+/// Stages into `<dir>/.<filename>.subclave.tmp`, fsyncs it, then renames over
 /// `path`. Removes the temp on any failure. Returns the underlying
 /// [`io::Error`] so callers can map it to their own error type.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_staged(path, bytes, |tmp| fs::File::create(tmp))
-}
-
-/// Unix-only [`atomic_write`] variant that creates the staging temp with the
-/// given permission `mode` BEFORE any bytes are written, so the contents are
-/// never briefly world-readable. Used for the Linux secrets file (mode
-/// `0o600`) where the plaintext must never touch disk with loose perms.
-#[cfg(unix)]
-pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    write_staged(path, bytes, move |tmp| {
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(tmp)
-    })
 }
 
 /// One lock per TARGET FILE, held across the whole stage-fsync-rename sequence.
@@ -65,25 +48,21 @@ pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 /// second fails with `os error 2` - a write that reports failure while the file
 /// on disk is fine, which is far more confusing than a torn file. Serializing
 /// per target makes the shared name safe; a unique name per write would too, but
-/// it would leave one orphan temp per crash instead of one per target, and the
-/// secrets file's temp is plaintext at mode 0600 on Linux. A rotated secret
-/// surviving indefinitely in a file nothing ever overwrites is the worse trade.
+/// it would leave one orphan temp per crash instead of one per target, and a
+/// stray `.<name>.subclave.tmp` surviving beside its target indefinitely is the
+/// worse trade.
 ///
-/// PER PATH rather than one global lock: `fs_write_file` saves editor buffers
-/// through here and a large save must not hold up a store commit.
+/// PER PATH rather than one global lock: a large `fs_write_file` save must not
+/// hold up a store commit on a different file.
 ///
 /// Only in-process concurrency is covered, which is all there is: `lib.rs`
 /// registers `tauri-plugin-single-instance`, so a second launch forwards its
 /// argv and exits rather than becoming a second writer.
 ///
-/// Five call sites reach this, and four of them could already race:
-/// `secrets.rs`'s `write_store` (the reported failure - `deleteHost` fans out one
-/// delete per account); `fs/file.rs`'s `fs_write_file`, `fs/grep.rs`'s two
-/// replace commands and `ssh/sftp.rs`'s `ssh_sftp_download` with `overwrite`
-/// (Tauri commands, so two invocations naming one file overlap); and
-/// `pty/shell_init.rs`'s `write_if_changed`, whose own comment is about two
-/// shells starting at once. `secrets.rs` also serializes one level up, because
-/// its cache and its file have to move together.
+/// The one caller left, `fs_write_file`, is a Tauri command, so two
+/// invocations naming one file can overlap - and over a shared staging temp the
+/// loser of the rename race gets `os error 2` rather than a torn file. Any
+/// future caller that stages through this helper needs the same lock.
 static TARGET_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -145,7 +124,7 @@ fn target_lock(path: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
-/// Stage `bytes` into `<dir>/.<filename>.tervia.tmp` (opened via `open_tmp`),
+/// Stage `bytes` into `<dir>/.<filename>.subclave.tmp` (opened via `open_tmp`),
 /// fsync, then rename over `path`. Removes the temp on any failure.
 ///
 /// Serialized per target by [`TARGET_LOCKS`], because that temp name is shared by
@@ -164,7 +143,7 @@ where
     // Temp lives beside the target so `rename` stays on one filesystem.
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(file_name);
-    tmp_name.push(".tervia.tmp");
+    tmp_name.push(".subclave.tmp");
     let tmp = parent.join(tmp_name);
 
     // Taken BEFORE the temp is opened and held past the rename, so no other
@@ -209,7 +188,7 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "tervia-atomic-{tag}-{}-{:?}",
+                "subclave-atomic-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id(),
             ));
@@ -271,7 +250,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).expect("read"), b"{}");
         // Named after the target, so a leftover would be picked up - and shared -
         // by the next write to the same path.
-        assert!(!dir.0.join(".hosts.json.tervia.tmp").exists());
+        assert!(!dir.0.join(".hosts.json.subclave.tmp").exists());
     }
 
     #[test]

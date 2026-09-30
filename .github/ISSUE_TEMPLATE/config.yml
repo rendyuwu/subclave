@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions & ideas
-    url: https://github.com/rendyuwu/tervia/discussions
+    url: https://github.com/rendyuwu/subclave/discussions
     about: For general questions, usage help, and open-ended ideas, please start a Discussion instead of an issue.
   - name: Security vulnerabilities
-    url: https://github.com/rendyuwu/tervia/blob/main/SECURITY.md
+    url: https://github.com/rendyuwu/subclave/blob/main/SECURITY.md
     about: Do NOT open a public issue for security problems. Please follow the disclosure process in SECURITY.md.
-  - name: Upstream (TEDI) issues
-    url: https://github.com/IlhamriSKY/TEDI/issues
-    about: Tervia forked TEDI at v0.4.22 and inherits its SSH stack. If a bug reproduces there too, consider reporting it upstream as well - it benefits both projects.
+  - name: Upstream (Tervia) issues
+    url: https://github.com/rendyuwu/tervia/issues
+    about: Subclave is derived from Tervia v0.1.3. A shell bug that also reproduces in Tervia belongs in both trackers.

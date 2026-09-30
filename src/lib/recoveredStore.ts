@@ -17,15 +17,14 @@ import {
 // touched at all (the store caches what it read, so a read that came back empty
 // has already lost), force the load while the file is known good, then snapshot
 // what it loaded from - and snapshot again after every save, because at first
-// load there is no file to copy. `modules/vault`, `modules/hosts`,
-// `modules/forwards`, `modules/workspaces` and the CLI-agents store differ only
-// in a file name, a load key and an event name - so they take this rather than
-// five copies of the same thirty-five lines.
+// load there is no file to copy. The stores built on it differ only in a file
+// name, a load key and an event name - so they take this rather than a copy of
+// the same thirty-five lines each.
 //
 // The default store is `./fileKeyValueStore`, not `tauri-plugin-store`: the
-// plugin cannot make a two-key commit one write, and `deleteGroup` in
-// `modules/hosts/store.ts` is a genuine two-key commit. See that module for what
-// the whole-file port buys and what it deliberately drops.
+// plugin cannot make a two-key commit one write, and a store that removes a
+// record together with the pointers to it IS a two-key commit. See that module
+// for what the whole-file port buys and what it deliberately drops.
 //
 // The serialised write queue is here for the same reason and not a smaller one: it
 // exists to stop two read-modify-writes against ONE store file from losing an
@@ -96,10 +95,9 @@ export type RecoveredStoreIo = {
    *  file with no `.bak` at all.
    *
    *  Every `set` since the last commit lands in ONE atomic file replacement, so
-   *  a multi-key write is all-or-nothing. `deleteGroup` in
-   *  `modules/hosts/store.ts` is why that is worth stating: it drops a group and
-   *  clears `groupId` on its members together, and half of that pair is a
-   *  dangling reference. */
+   *  a multi-key write is all-or-nothing. That is worth stating because a write
+   *  that drops a record and clears the pointers to it together has a dangling
+   *  reference as its torn half. */
   commit(): Promise<void>;
   /**
    * Serialise one read-modify-write against this store.
@@ -127,9 +125,9 @@ export type RecoveredStoreIo = {
    * different audiences and only one of them may consume the notice: the UI
    * tells the user once, and a store layer deciding whether it is safe to write
    * a default over the file must be able to ask the same question without
-   * racing that toast away. `modules/workspaces/store.ts` is the caller - it
-   * seeds a workspace when the list comes back empty, and doing that over a file
-   * that was merely unreadable is how saved workspaces get blanked.
+   * racing that toast away. A store layer that seeds a default when its list
+   * comes back empty is the caller: doing that over a file that was merely
+   * unreadable is how saved records get blanked.
    */
   fileState(): Promise<{ found: StoreFileState; recovered: boolean }>;
   /**
@@ -281,9 +279,8 @@ export function createRecoveredStore(
    * passes, not one. The machinery is reachable through the public port - two
    * `commit()` calls not awaited, which the `[settle]` group does exercise - so
    * it is a real guard rather than dead code, but a comment that prices a burst
-   * as one pass is describing a path nothing in `src/` takes. `modules/workspaces`
-   * gets the burst saving people expect here, and gets it from its own `persist`
-   * coalescer instead.
+   * as one pass is describing a path nothing in `src/` takes: no caller here
+   * batches commits, so a burst costs one pass per commit.
    *
    * A failure goes into the notice slot, deduplicated. The startup pass is NOT
    * enough to make that redundant: on a fresh profile it has no primary to copy,

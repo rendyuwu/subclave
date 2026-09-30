@@ -1,6 +1,6 @@
 <!--
 PR title should follow Conventional Commits - it becomes the squash commit message.
-Examples: feat(terminal): add split panes / fix(explorer): close button alignment
+Examples: feat(vault): add entry history / fix(settings): theme picker focus
 -->
 
 ## What

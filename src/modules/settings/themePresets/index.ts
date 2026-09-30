@@ -2,9 +2,7 @@
  * Built-in theme presets, one file per family.
  *
  * A preset covers BOTH domains it can reach: the app chrome tokens and the
- * ANSI 16, since `terminalPalette.ts` derives a terminal preset from every
- * entry's DARK variant (keyed by `slugify(name)`, so names must stay unique).
- * The editor is a third domain and is picked separately.
+ * ANSI 16 entry colours, so names must stay unique.
  *
  * Adding one: copy the closest family file, adjust, export it here. Every field
  * is required - `scripts/theme-verify.ts` fails on a preset that misses one.

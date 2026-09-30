@@ -1,4 +1,3 @@
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -97,31 +96,9 @@ fn fs_read_file_inner(path: String) -> Result<ReadResult, String> {
     Ok(classify_bytes(&p, bytes))
 }
 
-/// Resolve a path to its real, symlink-free absolute form (frontend
-/// forward-slash form). Used by the AI read tools so the secret deny-list
-/// sees through an innocuously-named symlink (e.g. `notes.txt` ->
-/// `~/.ssh/id_rsa`) to the actual target before deciding whether to allow the
-/// read. Errors (e.g. the path does not exist) are propagated so the caller
-/// can fall back to checking the literal path string.
-#[tauri::command]
-pub async fn fs_canonicalize(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || fs_canonicalize_inner(path))
-        .await
-        .map_err(|e| format!("fs_canonicalize join error: {e}"))?
-}
-
-fn fs_canonicalize_inner(path: String) -> Result<String, String> {
-    let p = PathBuf::from(&path);
-    let canon = std::fs::canonicalize(&p).map_err(|e| {
-        log::debug!("fs_canonicalize({}) failed: {e}", p.display());
-        e.to_string()
-    })?;
-    Ok(super::to_canon(&canon))
-}
-
 /// Classify a byte buffer into a `ReadResult`. `path` only drives
-/// extension-based MIME hints (SVG, AVIF); callers reading a git blob can
-/// pass the repo-relative path. Size is `bytes.len()`.
+/// extension-based MIME hints (SVG, AVIF); a caller with no real path can pass
+/// a bare filename. Size is `bytes.len()`.
 pub(crate) fn classify_bytes(path: &Path, bytes: Vec<u8>) -> ReadResult {
     let size = bytes.len() as u64;
 
@@ -199,128 +176,6 @@ fn urlencode_svg(s: &str) -> String {
     out
 }
 
-/// Result of a partial (offset/limit) file read. Only the requested line
-/// range crosses the IPC boundary so the AI tool avoids multi-MB payloads.
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ReadPortionResult {
-    Text {
-        content: String,
-        size: u64,
-        #[serde(rename = "totalLines")]
-        total_lines: usize,
-        #[serde(rename = "startLine")]
-        start_line: usize,
-        #[serde(rename = "endLine")]
-        end_line: usize,
-    },
-    Binary {
-        size: u64,
-    },
-    TooLarge {
-        size: u64,
-        limit: u64,
-    },
-}
-
-/// Read a line range from a text file. Streamed through `BufReader` so only
-/// the requested `[offset, offset+limit)` range is allocated as `String`s;
-/// the rest is scanned byte-by-byte to count newlines.
-#[tauri::command]
-pub async fn fs_read_file_portion(
-    path: String,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Result<ReadPortionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || fs_read_file_portion_inner(path, offset, limit))
-        .await
-        .map_err(|e| format!("fs_read_file_portion join error: {e}"))?
-}
-
-fn fs_read_file_portion_inner(
-    path: String,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Result<ReadPortionResult, String> {
-    let p = PathBuf::from(&path);
-    let meta = std::fs::metadata(&p).map_err(|e| {
-        log::debug!("fs_read_file_portion stat({}) failed: {e}", p.display());
-        e.to_string()
-    })?;
-
-    let size = meta.len();
-    if size > MAX_READ_BYTES {
-        return Ok(ReadPortionResult::TooLarge {
-            size,
-            limit: MAX_READ_BYTES,
-        });
-    }
-
-    let file = std::fs::File::open(&p).map_err(|e| {
-        log::debug!("fs_read_file_portion open({}) failed: {e}", p.display());
-        e.to_string()
-    })?;
-
-    let mut reader = BufReader::new(file);
-
-    // Binary sniff: peek at the first chunk without consuming from the buffer.
-    {
-        let buf = reader.fill_buf().map_err(|e| {
-            log::debug!("fs_read_file_portion fill_buf({}) failed: {e}", p.display());
-            e.to_string()
-        })?;
-        let sniff_len = buf.len().min(BINARY_SNIFF_BYTES);
-        if buf[..sniff_len].contains(&0) {
-            return Ok(ReadPortionResult::Binary { size });
-        }
-    }
-
-    let start = offset.unwrap_or(0);
-    // Hard cap so a misbehaving caller cannot ask for `usize::MAX` lines and
-    // overflow `start + lim` below (panic in debug, wrap in release).
-    const MAX_LINE_LIMIT: usize = 10_000;
-    let lim = limit.unwrap_or(2000).min(MAX_LINE_LIMIT);
-    let end = start.saturating_add(lim);
-
-    // Stream lines: skip `start`, collect up to `lim`, then count the rest.
-    let mut line_buf = String::new();
-    let mut total_lines: usize = 0;
-    let mut collected: Vec<String> = Vec::with_capacity(lim.min(2048));
-
-    loop {
-        line_buf.clear();
-        let bytes_read = reader.read_line(&mut line_buf).map_err(|e| {
-            log::debug!(
-                "fs_read_file_portion read_line({}) failed: {e}",
-                p.display()
-            );
-            e.to_string()
-        })?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        if total_lines >= start && total_lines < end {
-            // Strip trailing \r\n so output matches
-            // `full_content.split("\n").slice(...)` on the frontend.
-            let trimmed = line_buf.trim_end_matches(['\r', '\n']);
-            collected.push(trimmed.to_string());
-        }
-        total_lines += 1;
-    }
-
-    let end_line = (start + collected.len()).min(total_lines);
-    let content = collected.join("\n");
-
-    Ok(ReadPortionResult::Text {
-        content,
-        size,
-        total_lines,
-        start_line: start,
-        end_line,
-    })
-}
-
 /// Atomic write: stage into a sibling temp file, then rename over the target.
 /// Prevents a partial write from leaving a half-saved file on crash/power loss.
 #[tauri::command]
@@ -355,7 +210,7 @@ mod tests {
     /// and leave every store inert, with nothing else in the suite noticing.
     #[test]
     fn missing_file_error_carries_the_os_error_suffix() {
-        let dir = std::env::temp_dir().join("tervia-fs-read-missing-test");
+        let dir = std::env::temp_dir().join("subclave-fs-read-missing-test");
         let missing = dir.join("no-such-file.json");
         let _ = std::fs::remove_dir_all(&dir);
 

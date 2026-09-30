@@ -12,11 +12,11 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { isSecondaryWindow } from "@/lib/platform";
 import { APP_OPACITY_DEFAULT, clampOpacity } from "./store";
 
-const FAST_PATH_KEY = "tervia-app-opacity-shadow";
+const FAST_PATH_KEY = "subclave-app-opacity-shadow";
 // Transient live-drag channel: the settings slider broadcasts each step so the
 // main window fades in real time WITHOUT touching the stored value (which the
 // slider is bound to — writing it mid-drag makes the thumb fight the drag).
-const PREVIEW_EVENT = "tervia://app-opacity-preview";
+const PREVIEW_EVENT = "subclave://app-opacity-preview";
 // At/above this the canvas is effectively opaque, so the glass layer is off.
 const GLASS_EPSILON = 0.999;
 
@@ -35,23 +35,20 @@ function writeShadow(value: number): void {
 }
 
 /**
- * Apply whole-app opacity to the main window: set `--tervia-app-opacity` and
- * toggle `data-tervia-glass`, which globals.css uses to fade the canvas +
+ * Apply whole-app opacity to the main window: set `--subclave-app-opacity` and
+ * toggle `data-subclave-glass`, which globals.css uses to fade the canvas +
  * surfaces. Settings window opts out so its controls stay readable.
  */
 /**
- * CSS-only apply: set the var + glass attr + nudge the terminal canvases. No
- * persistence. Settings window opts out so its controls stay solid/readable.
+ * CSS-only apply: set the var + glass attr. No persistence. Settings window
+ * opts out so its controls stay solid/readable.
  */
 function applyOpacityCss(value: number): void {
   if (isSecondaryWindow()) return;
   const root = document.documentElement;
-  root.style.setProperty("--tervia-app-opacity", String(value));
-  if (value < GLASS_EPSILON) root.dataset.terviaGlass = "on";
-  else delete root.dataset.terviaGlass;
-  // Surfaces follow the CSS var instantly; nudge the terminal canvases too
-  // (their rgba background is JS-rendered). Listener is rAF-throttled.
-  window.dispatchEvent(new Event("tervia:canvas-opacity"));
+  root.style.setProperty("--subclave-app-opacity", String(value));
+  if (value < GLASS_EPSILON) root.dataset.subclaveGlass = "on";
+  else delete root.dataset.subclaveGlass;
 }
 
 export function applyAppOpacity(opacity: number): void {

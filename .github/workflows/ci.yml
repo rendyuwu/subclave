@@ -123,35 +123,26 @@ jobs:
         working-directory: src-tauri
         run: cargo check --all-targets --locked
 
-      # --workspace so this also lints tervia-cli (the Windows console-launcher
-      # stub in tervia-cli/), not just the GUI package. Plain `cargo clippy`
-      # would silently skip it: `default-members = ["."]` in Cargo.toml scopes
-      # unqualified invocations to the GUI package alone, on purpose, so the
-      # bundler's own `cargo build` stays fast.
       - name: cargo clippy
         working-directory: src-tauri
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Runs the backend unit tests, including pubkey_constant_decodes which
-      # guards the embedded updater pubkey. The network-hitting live updater test
-      # is #[ignore]d, so the default run stays offline and fast. Deliberately no
-      # count here: it drifted (27 -> 41 -> 43) every time tests were added.
+      # Runs the backend unit tests: the allocator purge behaviour, the window
+      # min-size correction, the atomic-write and file-classification helpers,
+      # and `no_new_sync_tauri_commands`, which guards that every registered
+      # Tauri command is async. Deliberately no count here: it drifted
+      # (27 -> 41 -> 43) every time tests were added.
       #
       # This job is Linux-only. The macOS and Windows `cfg` branches are first
       # compiled by the bundle matrix below, which is the reason that matrix runs
       # on pull requests at all rather than only at tag time.
-      #
-      # --workspace for the same reason as cargo clippy above: without it,
-      # tervia-cli's tests (none today, but the binary itself still needs to
-      # build) are silently excluded.
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --workspace --locked
 
   # Produces the installers a reviewer downloads to smoke-test a branch, so that
-  # verifying SSH / port forwarding / SFTP / backup export never requires a local
-  # release build. Artifacts land under the run's "Artifacts" section as
-  # `tervia-<platform>.zip`.
+  # checking a change never requires a local release build. Artifacts land under
+  # the run's "Artifacts" section as `subclave-<platform>.zip`.
   bundle:
     name: bundle (${{ matrix.id }})
     needs: [frontend, rust]
@@ -212,17 +203,6 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # Same step release.yml runs, and for the same reason: the NSIS hook in
-      # `installer.nsh` `File`s `src-tauri/target/release/tervia.exe` into the
-      # install dir beside the GUI binary, and tauri-action only builds the
-      # binary named by `default-run`. Without this the Windows installer build
-      # fails outright, so the PR bundle would not match the released one.
-      - name: Build tervia console launcher (Windows only)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        working-directory: src-tauri
-        run: cargo build --release -p tervia-cli
-
       # REQUIRED — do not "simplify" this step away. With
       # `createUpdaterArtifacts: true` and a pubkey set, a bundle build with no
       # signing key is a hard failure ("A public key has been found, but no
@@ -279,7 +259,7 @@ jobs:
       - name: Upload bundles
         uses: actions/upload-artifact@v7
         with:
-          name: tervia-${{ matrix.id }}
+          name: subclave-${{ matrix.id }}
           path: |
             ${{ matrix.bundle-root }}/appimage/*.AppImage
             ${{ matrix.bundle-root }}/appimage/*.AppImage.sig

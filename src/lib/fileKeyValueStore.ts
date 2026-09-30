@@ -9,9 +9,9 @@ import { storeFilePaths, type StoreFileIo, type StoreFileRead } from "./storeRec
 // up after. Reading and writing the WHOLE map through `fs_write_file` (which is
 // `atomic::atomic_write`: stage into a sibling temp, `sync_all`, rename over the
 // target) makes any number of `set`s followed by one `save()` a single atomic
-// replacement. `deleteGroup` in `modules/hosts/store.ts` is the call site that
-// needs it: it removes a group and clears `groupId` on its members in one
-// `persist`, which the plugin could tear in half.
+// replacement. The call sites that need it are the ones that remove a record
+// and clear the pointers to it in one write - a commit the plugin could tear in
+// half.
 //
 // What is deliberately absent: autosave, debounce, and retry. `set` touches
 // nothing but memory, and `save()` is the only thing that reaches disk, so there
@@ -27,8 +27,8 @@ import { storeFilePaths, type StoreFileIo, type StoreFileRead } from "./storeRec
 // holds what this session has `set` and NOT yet saved, and it survives an
 // invalidation, because a change event is news about the file and says nothing
 // about a commit this window is halfway through assembling. One map cost both
-// halves of the guarantee: an event between the two `set`s of `deleteGroup`
-// dropped the first one on the floor and wrote half the pair, and an event
+// halves of the guarantee: an event between the two `set`s of one multi-key
+// update dropped the first one on the floor and wrote half the pair, and an event
 // during `save()`'s own path resolution left `JSON.stringify` reading an emptied
 // cache - so the commit wrote `{}`, and the snapshot after it copied `{}` over
 // the last good `.bak`.
@@ -94,8 +94,8 @@ export function createFileKeyValueStore(fileName: string, files: StoreFileIo): F
    * Kept apart from the cache and NOT dropped by `invalidate`, so a commit being
    * assembled cannot be half-thrown-away by another window's news. It is also
    * what makes the "a failed `persist` is not rolled back because the record is
-   * still in this session's view" reasoning in `modules/hosts/store.ts` and
-   * `modules/vault/store.ts` actually true.
+   * still in this session's view" reasoning at the store call sites actually
+   * true.
    */
   let pending: Record<string, unknown> = {};
   let loaded = false;
@@ -103,7 +103,6 @@ export function createFileKeyValueStore(fileName: string, files: StoreFileIo): F
    *  underneath it does not install what it found. */
   let generation = 0;
   /** The read in flight, shared: a store layer that lists two keys at once
-   *  (`Promise.all([listGroups(), listHosts()])` in `modules/hosts/store.ts`)
    *  costs one file read rather than two. */
   let inFlight: Promise<void> | null = null;
   /**

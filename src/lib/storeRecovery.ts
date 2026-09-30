@@ -21,11 +21,10 @@ import type { FsReadResult } from "./ipc";
 // to copy. It needs no new Rust: `fs_read_file` and `fs_write_file` already exist,
 // and the latter goes through the app's own atomic temp-plus-rename path.
 //
-// WHICH FILES. All six of the app's store files go through
-// `createRecoveredStore` and therefore through here: hosts, vault, forwards,
-// workspaces, the CLI agents and settings. Each one gets a corruption check
-// before its first read, a `.bak` snapshot after every commit, and a whole-file
-// atomic write.
+// WHICH FILES. The app's store files go through `createRecoveredStore` and
+// therefore through here; settings is the only one left. It gets a corruption
+// check before its first read, a `.bak` snapshot after every commit, and a
+// whole-file atomic write.
 //
 // EVERY function here is total: it reports a filesystem it could not work with
 // instead of rejecting. A caller that caches the promise of this work - which is
@@ -73,10 +72,9 @@ export type StoreFileState =
  * error: a file that is THERE and would not open (a lock during an update
  * handoff, a sharing violation, EACCES, a descriptor limit) must not be treated
  * as a first run. Everything downstream writes over a first run - the recovery
- * pass would restore a snapshot, the store layer would come up empty and save
- * that emptiness, and `modules/workspaces/store.ts` would persist a seeded
- * default. `missing` therefore means "the OS said there is no such file", never
- * "the read did not work out".
+ * pass would restore a snapshot, and a store layer would come up empty and save
+ * that emptiness over a seeded default. `missing` therefore means "the OS said
+ * there is no such file", never "the read did not work out".
  */
 export type StoreFileRead =
   | { kind: "text"; content: string }
@@ -99,14 +97,13 @@ export type StoreFileIo = {
   /**
    * Write `content` over `path`, creating or replacing it.
    *
-   * A write rather than a copy, on purpose. `fs_copy` refuses an existing target
-   * (in `src-tauri/src/modules/fs/mutate.rs`), so copying meant unlinking
-   * first - and a delete that fails (an antivirus or indexer holding the
-   * handle on Windows, a read-only data directory) turned "the good snapshot
-   * is sitting right there" into an `already exists` error. Both callers here
-   * have already READ and validated the bytes they want in place, so
-   * `fs_write_file` does the whole job in one command, through the app's
-   * atomic temp-plus-rename path.
+   * A write rather than a copy, on purpose: both callers here have already READ
+   * and validated the bytes they want in place, so `fs_write_file` does the
+   * whole job in one command, through the app's atomic temp-plus-rename path.
+   * A copy-based port would instead need the old file removed first, and a
+   * delete that fails (an antivirus or indexer holding the handle on Windows, a
+   * read-only data directory) would turn "the good snapshot is sitting right
+   * there" into an error.
    */
   write(path: string, content: string): Promise<void>;
 };

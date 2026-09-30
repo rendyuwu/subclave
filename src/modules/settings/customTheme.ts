@@ -131,15 +131,14 @@ type ThemeBackground = {
   /** When false, the background image is not painted. */
   enabled: boolean;
   /**
-   * Original path or URL of the image, kept for display in the UI
-   * ("Background: /Users/.../wall.png" or "https://..."). Loading uses
-   * `dataUrl`.
+   * Original path of the image on disk, kept for display in the UI
+   * ("Source: /Users/.../wall.png"). Loading uses `dataUrl`.
    */
   path: string;
   /**
-   * Image source as a CSS-valid URL. Either a `data:image/...;base64,...`
-   * blob (from the file picker) or an `http(s)://` URL (from the URL
-   * import). Empty string when no wallpaper is set.
+   * Image source as a CSS-valid `data:image/...;base64,...` URL, produced by
+   * `fs_read_file` from the picked local file. Empty string when no wallpaper
+   * is set.
    */
   dataUrl: string;
   /** Gaussian blur on the wallpaper (0..40 px). */
@@ -172,11 +171,11 @@ export type CustomTheme = {
 const THEME_FILE_VERSION = 1;
 
 type ThemeFileV1 = {
-  $schema?: "tervia-theme";
+  $schema?: "subclave-theme";
   version: typeof THEME_FILE_VERSION;
 } & CustomTheme;
 
-const BG_ELEMENT_ID = "tervia-bg-layer";
+const BG_ELEMENT_ID = "subclave-bg-layer";
 
 /**
  * Mapping of `ThemeColors` keys to the CSS variables they drive.
@@ -201,48 +200,48 @@ const COLOR_VAR_MAP: Record<keyof ThemeColors, readonly string[]> = {
   destructive: ["--destructive"],
   border: ["--border"],
   input: ["--input"],
-  buttonFace: ["--tervia-button-face"],
-  buttonFaceForeground: ["--tervia-button-face-foreground"],
+  buttonFace: ["--subclave-button-face"],
+  buttonFaceForeground: ["--subclave-button-face-foreground"],
   ring: ["--ring", "--sidebar-ring"],
   sidebar: ["--sidebar"],
   sidebarForeground: ["--sidebar-foreground"],
   sidebarBorder: ["--sidebar-border"],
   sidebarAccent: ["--sidebar-accent"],
   sidebarAccentForeground: ["--sidebar-accent-foreground"],
-  iconWorking: ["--tervia-icon-working"],
-  iconIdle: ["--tervia-icon-idle"],
-  iconBlocked: ["--tervia-icon-blocked"],
-  iconDone: ["--tervia-icon-done"],
-  iconBranch: ["--tervia-icon-branch"],
-  diffAdded: ["--tervia-diff-added"],
-  diffRemoved: ["--tervia-diff-removed"],
-  info: ["--tervia-info"],
-  tabAccentTerminal: ["--tervia-tab-terminal"],
-  tabAccentSsh: ["--tervia-tab-ssh"],
-  tabAccentEditor: ["--tervia-tab-editor"],
-  tabAccentPreview: ["--tervia-tab-browser"],
-  tabAccentAiDiff: ["--tervia-tab-ai-diff"],
-  tabAccentGitDiff: ["--tervia-tab-git-diff"],
-  resizeHandle: ["--tervia-resize-handle"],
-  ansiBlack: ["--tervia-ansi-black"],
-  ansiRed: ["--tervia-ansi-red"],
-  ansiGreen: ["--tervia-ansi-green"],
-  ansiYellow: ["--tervia-ansi-yellow"],
-  ansiBlue: ["--tervia-ansi-blue"],
-  ansiMagenta: ["--tervia-ansi-magenta"],
-  ansiCyan: ["--tervia-ansi-cyan"],
-  ansiWhite: ["--tervia-ansi-white"],
-  ansiBrightBlack: ["--tervia-ansi-bright-black"],
-  ansiBrightRed: ["--tervia-ansi-bright-red"],
-  ansiBrightGreen: ["--tervia-ansi-bright-green"],
-  ansiBrightYellow: ["--tervia-ansi-bright-yellow"],
-  ansiBrightBlue: ["--tervia-ansi-bright-blue"],
-  ansiBrightMagenta: ["--tervia-ansi-bright-magenta"],
-  ansiBrightCyan: ["--tervia-ansi-bright-cyan"],
-  ansiBrightWhite: ["--tervia-ansi-bright-white"],
+  iconWorking: ["--subclave-icon-working"],
+  iconIdle: ["--subclave-icon-idle"],
+  iconBlocked: ["--subclave-icon-blocked"],
+  iconDone: ["--subclave-icon-done"],
+  iconBranch: ["--subclave-icon-branch"],
+  diffAdded: ["--subclave-diff-added"],
+  diffRemoved: ["--subclave-diff-removed"],
+  info: ["--subclave-info"],
+  tabAccentTerminal: ["--subclave-tab-terminal"],
+  tabAccentSsh: ["--subclave-tab-ssh"],
+  tabAccentEditor: ["--subclave-tab-editor"],
+  tabAccentPreview: ["--subclave-tab-browser"],
+  tabAccentAiDiff: ["--subclave-tab-ai-diff"],
+  tabAccentGitDiff: ["--subclave-tab-git-diff"],
+  resizeHandle: ["--subclave-resize-handle"],
+  ansiBlack: ["--subclave-ansi-black"],
+  ansiRed: ["--subclave-ansi-red"],
+  ansiGreen: ["--subclave-ansi-green"],
+  ansiYellow: ["--subclave-ansi-yellow"],
+  ansiBlue: ["--subclave-ansi-blue"],
+  ansiMagenta: ["--subclave-ansi-magenta"],
+  ansiCyan: ["--subclave-ansi-cyan"],
+  ansiWhite: ["--subclave-ansi-white"],
+  ansiBrightBlack: ["--subclave-ansi-bright-black"],
+  ansiBrightRed: ["--subclave-ansi-bright-red"],
+  ansiBrightGreen: ["--subclave-ansi-bright-green"],
+  ansiBrightYellow: ["--subclave-ansi-bright-yellow"],
+  ansiBrightBlue: ["--subclave-ansi-bright-blue"],
+  ansiBrightMagenta: ["--subclave-ansi-bright-magenta"],
+  ansiBrightCyan: ["--subclave-ansi-bright-cyan"],
+  ansiBrightWhite: ["--subclave-ansi-bright-white"],
 };
 
-const FAST_PATH_KEY = "tervia-custom-theme-shadow";
+const FAST_PATH_KEY = "subclave-custom-theme-shadow";
 
 function readShadow(): CustomTheme | null {
   if (typeof window === "undefined") return null;
@@ -267,15 +266,11 @@ function writeShadow(theme: CustomTheme | null): void {
       window.localStorage.removeItem(FAST_PATH_KEY);
       return;
     }
-    // Strip multi-MB `data:` blobs from the localStorage shadow. Idle
-    // memory stays low (the shadow is read on every boot of the same
-    // webview) and `applyCustomTheme` will re-add the dataUrl from the
-    // settings store payload once it resolves. URL dataUrls stay
-    // since they are tiny (~100 bytes) and let the wallpaper paint on
-    // first frame without waiting for the async store load.
-    const slim = theme.background.dataUrl.startsWith("data:")
-      ? { ...theme, background: { ...theme.background, dataUrl: "" } }
-      : theme;
+    // Strip the `data:` blob from the localStorage shadow. Idle memory stays
+    // low (the shadow is read on every boot of the same webview) and
+    // `applyCustomTheme` will re-add the dataUrl from the settings store
+    // payload once it resolves.
+    const slim = { ...theme, background: { ...theme.background, dataUrl: "" } };
     window.localStorage.setItem(FAST_PATH_KEY, JSON.stringify(slim));
   } catch {
     /* ignore */
@@ -309,70 +304,20 @@ function clearCssVars(): void {
     for (const v of vars) root.style.removeProperty(v);
   }
   // Clean up the canvas base colour; the globals.css default takes over.
-  root.style.removeProperty("--tervia-canvas-bg");
+  root.style.removeProperty("--subclave-canvas-bg");
 }
 
 // Wallpaper is intentionally main-window only (isSecondaryWindow): the utility
 // windows have their own roots and we don't want a busy image behind their
 // controls. Colors still apply so their UI stays in palette.
-const BG_MEDIA_ATTR = "data-tervia-bg-media";
-const BG_DARKEN_ATTR = "data-tervia-bg-darken";
-
-type BgKind = "image" | "video" | "youtube";
-
-/** Classify a background source so a video/YouTube renders in-app (a `<video>`
- *  / embed `<iframe>`) instead of a static image. Rendering video inside the
- *  webview is the only way it survives transparency: a video on the *desktop*
- *  behind a transparent window goes black (Windows Multi-Plane Overlay). */
-function detectBgKind(src: string): BgKind {
-  const s = src.trim();
-  if (/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)/i.test(s)) return "youtube";
-  if (/^data:video\//i.test(s) || /\.(mp4|webm|ogg|ogv|mov|m4v)(?:[?#]|$)/i.test(s)) return "video";
-  return "image";
-}
-
-/** Build a looping, muted, chrome-free YouTube embed URL for a wallpaper. */
-function youtubeEmbedUrl(src: string): string | null {
-  const m = src.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{6,})/i);
-  if (!m) return null;
-  const id = m[1];
-  const params = new URLSearchParams({
-    autoplay: "1",
-    mute: "1",
-    controls: "0",
-    loop: "1",
-    playlist: id,
-    modestbranding: "1",
-    playsinline: "1",
-    rel: "0",
-    iv_load_policy: "3",
-  });
-  return `https://www.youtube.com/embed/${id}?${params.toString()}`;
-}
-
-/** Darken overlay on top of the media so light text stays readable. */
-function setDarkenOverlay(el: HTMLElement, darken: number): void {
-  let overlay = el.querySelector<HTMLElement>(`[${BG_DARKEN_ATTR}]`);
-  if (darken <= 0) {
-    overlay?.remove();
-    return;
-  }
-  if (!overlay) {
-    overlay = document.createElement("div");
-    overlay.setAttribute(BG_DARKEN_ATTR, "");
-    overlay.style.cssText = "position:absolute;inset:0;pointer-events:none;";
-    el.appendChild(overlay);
-  }
-  overlay.style.background = `rgba(0,0,0,${darken})`;
-}
-
 /**
- * Paint (or clear) the wallpaper layer behind the app. Supports a static
- * image, a looping video (`.mp4`/`.webm`/...), or a YouTube URL (embedded,
- * muted, looping). Independent of the colour theme: it shows whenever a source
- * is set, regardless of `customThemeEnabled`. Transparency itself is the single
- * "App opacity" control; the translucent surfaces reveal this layer (or the
- * desktop when none is set). Settings window opts out.
+ * Paint (or clear) the wallpaper layer behind the app. A static image only:
+ * the CSP blocks remote images, media and frames, and the source is a local
+ * file read as a `data:` URL by `fs_read_file`. Independent of the colour
+ * theme: it shows whenever a source is set, regardless of
+ * `customThemeEnabled`. Transparency itself is the single "App opacity"
+ * control; the translucent surfaces reveal this layer (or the desktop when
+ * none is set). Settings window opts out.
  */
 export function applyBackground(bg: ThemeBackground): void {
   if (typeof document === "undefined") return;
@@ -387,27 +332,22 @@ export function applyBackground(bg: ThemeBackground): void {
   if (!el) return;
 
   // Opacity of the whole image layer: lets the desktop behind the (transparent)
-  // window show THROUGH the wallpaper. Applied to the layer so it covers the
-  // image, the darken overlay, and any video/iframe child uniformly.
+  // window show THROUGH the wallpaper.
   el.style.opacity = String(Math.max(0, Math.min(1, bg.opacity ?? 1)));
-
-  const clearMedia = () => el.querySelectorAll(`[${BG_MEDIA_ATTR}]`).forEach((n) => n.remove());
 
   if (!bg.enabled || !bg.dataUrl) {
     el.style.backgroundImage = "";
     el.style.filter = "";
-    clearMedia();
-    setDarkenOverlay(el, 0);
     if (bg.enabled && !bg.dataUrl) {
       // Wallpaper is configured but its data: blob hasn't been restored yet:
       // the localStorage fast-path shadow strips data: URLs (see writeShadow),
       // so the first frame after a reload has no image. Paint the theme canvas
       // colour as a placeholder so glass surfaces fade toward the THEME
       // background instead of the bare desktop bleeding through, until the
-      // async store load re-applies the real image. `--tervia-canvas-bg` is set
+      // async store load re-applies the real image. `--subclave-canvas-bg` is set
       // synchronously on :root before this runs in the fast path.
       el.style.display = "block";
-      el.style.backgroundColor = "var(--tervia-canvas-bg)";
+      el.style.backgroundColor = "var(--subclave-canvas-bg)";
     } else {
       el.style.display = "none";
       el.style.backgroundColor = "";
@@ -420,69 +360,11 @@ export function applyBackground(bg: ThemeBackground): void {
   el.style.backgroundColor = "";
   const blur = bg.blur > 0 ? `blur(${Math.max(0, Math.min(40, bg.blur))}px)` : "";
   const darken = Math.max(0, Math.min(1, bg.darken ?? 0));
-  const kind = detectBgKind(bg.dataUrl);
-
-  if (kind === "image") {
-    clearMedia();
-    const safeUrl = bg.dataUrl.replace(/"/g, '\\"');
-    const overlay =
-      darken > 0 ? `linear-gradient(rgba(0,0,0,${darken}), rgba(0,0,0,${darken})), ` : "";
-    el.style.backgroundImage = `${overlay}url("${safeUrl}")`;
-    el.style.filter = blur;
-    return;
-  }
-
-  // Video / YouTube render inside the webview so they survive transparency.
-  el.style.backgroundImage = "";
-  el.style.filter = "";
-  const src = kind === "video" ? bg.dataUrl : (youtubeEmbedUrl(bg.dataUrl) ?? "");
-  if (!src) {
-    clearMedia();
-    el.style.display = "none";
-    return;
-  }
-
-  // Reuse the element when the source is unchanged so playback doesn't restart
-  // on every theme re-apply (mode flip, opacity commit, etc.).
-  let media = el.querySelector<HTMLElement>(`[${BG_MEDIA_ATTR}]`);
-  if (!media || media.dataset.kind !== kind || media.getAttribute("data-src") !== src) {
-    media?.remove();
-    if (kind === "video") {
-      const v = document.createElement("video");
-      v.autoplay = true;
-      v.loop = true;
-      v.muted = true;
-      v.setAttribute("muted", "");
-      v.setAttribute("playsinline", "");
-      v.src = src;
-      v.style.cssText =
-        "position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;";
-      v.dataset.kind = "video";
-      v.setAttribute("data-src", src);
-      v.setAttribute(BG_MEDIA_ATTR, "");
-      el.prepend(v);
-      void v.play?.().catch(() => {});
-      media = v;
-    } else {
-      const f = document.createElement("iframe");
-      f.src = src;
-      f.setAttribute("allow", "autoplay; encrypted-media; picture-in-picture");
-      f.setAttribute("frameborder", "0");
-      // A 16:9 iframe can't `object-fit`; oversize + centre so it covers the
-      // viewport without letterbox bars (overflow clipped by the layer).
-      f.style.cssText =
-        "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);" +
-        "width:max(100vw,calc(100vh*16/9));height:max(100vh,calc(100vw*9/16));" +
-        "border:0;pointer-events:none;";
-      f.dataset.kind = "youtube";
-      f.setAttribute("data-src", src);
-      f.setAttribute(BG_MEDIA_ATTR, "");
-      el.prepend(f);
-      media = f;
-    }
-  }
-  media.style.filter = blur;
-  setDarkenOverlay(el, darken);
+  const safeUrl = bg.dataUrl.replace(/"/g, '\\"');
+  const overlay =
+    darken > 0 ? `linear-gradient(rgba(0,0,0,${darken}), rgba(0,0,0,${darken})), ` : "";
+  el.style.backgroundImage = `${overlay}url("${safeUrl}")`;
+  el.style.filter = blur;
 }
 
 /**
@@ -499,7 +381,7 @@ export function applyBackground(bg: ThemeBackground): void {
  * already has it cached. No store write happens while dragging; the committed
  * value persists on release via the normal `customTheme` path.
  */
-const WALLPAPER_PREVIEW_EVENT = "tervia://wallpaper-preview";
+const WALLPAPER_PREVIEW_EVENT = "subclave://wallpaper-preview";
 
 export type WallpaperPreview = {
   blur: number;
@@ -545,7 +427,7 @@ export function applyCustomTheme(theme: CustomTheme | null): void {
   // Canvas base colour the glass tint mixes against (editor/terminal rgba +
   // the panel tints). Removed by clearCssVars when the custom theme turns off,
   // so the base palette default in globals.css takes over.
-  root.style.setProperty("--tervia-canvas-bg", colors.background);
+  root.style.setProperty("--subclave-canvas-bg", colors.background);
   writeShadow(theme);
 }
 
@@ -576,8 +458,8 @@ export function applyCustomThemeFastPath(): void {
   };
   const normalized = normalizeCustomTheme(cached, defaults);
   applyCustomTheme(normalized);
-  // Paint the wallpaper on first frame too (URL images survive the slim
-  // shadow; local data: URLs are restored after the async store load).
+  // Paint the wallpaper on first frame too; a local data: URL is restored
+  // after the async store load.
   applyBackground(normalized.background);
 }
 
@@ -746,7 +628,10 @@ export function normalizeCustomTheme(loaded: unknown, defaults: CustomTheme): Cu
     background: {
       enabled: typeof bg.enabled === "boolean" ? bg.enabled : defaults.background.enabled,
       path: typeof bg.path === "string" ? bg.path : defaults.background.path,
-      dataUrl: typeof bg.dataUrl === "string" ? bg.dataUrl : defaults.background.dataUrl,
+      // Only an inline `data:` image is a supported wallpaper: the CSP allows no
+      // remote URL, and an imported `.subclave` can name one, which would leave
+      // an enabled-but-empty wallpaper.
+      dataUrl: typeof bg.dataUrl === "string" && bg.dataUrl.startsWith("data:") ? bg.dataUrl : "",
       blur: clampRange(bg.blur, 0, 40, defaults.background.blur),
       darken: clamp01(bg.darken, defaults.background.darken),
       opacity: clamp01(bg.opacity, defaults.background.opacity),
@@ -767,14 +652,14 @@ function clampRange(value: unknown, min: number, max: number, fallback: number):
 }
 
 /**
- * Validate an imported `.tervia` payload. Throws with a user-readable message
+ * Validate an imported `.subclave` payload. Throws with a user-readable message
  * when the structure is bad. Lenient with missing/extra keys: fills in
  * defaults from the supplied `fallback` for any field that's absent.
  */
 export function parseThemeFile(raw: unknown, fallback: CustomTheme): CustomTheme {
   if (!raw || typeof raw !== "object") throw new Error("Theme file is not a JSON object");
   // Delegate variant + legacy-`colors` + bg field plumbing to the shared
-  // normalizer so .tervia parsing stays in lock-step with the runtime store
+  // normalizer so .subclave parsing stays in lock-step with the runtime store
   // hydration path. Only override `name` (defaults to "Custom" when blank).
   const merged = normalizeCustomTheme(raw, fallback);
   const obj = raw as Record<string, unknown>;
@@ -790,10 +675,10 @@ function filterStrings(obj: Partial<ThemeColors>): Partial<ThemeColors> {
   return out;
 }
 
-/** Serialise a theme for `.tervia` export. */
+/** Serialise a theme for `.subclave` export. */
 export function serializeThemeFile(theme: CustomTheme): string {
   const payload: ThemeFileV1 = {
-    $schema: "tervia-theme",
+    $schema: "subclave-theme",
     version: THEME_FILE_VERSION,
     ...theme,
   };

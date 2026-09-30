@@ -38,43 +38,13 @@ const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 /**
  * Registered, with no `invoke` call site in `src/`. Each is strippable from a
  * release build by `removeUnusedCommands`, and each is accepted because nothing
- * in `src/` calls it: the shell command surface has no consuming frontend module
- * at all (`src/modules/` has no shell or tasks module), and the rest are broader
- * backends the frontend reaches through a narrower sibling.
+ * in `src/` calls it on purpose.
  *
  * This list is a ledger, not a suppression. Adding a name to it is the record
- * that a command ships with no caller on purpose. Removing a caller for a name
+ * that a command ships with no caller deliberately. Removing a caller for a name
  * NOT on it reddens check 2, which is the point.
  */
-const UNINVOKED = new Set([
-  // The shell surface: registered, implemented, and not wired to any UI.
-  // `format.rs` records why the formatter path deliberately does not route
-  // through `shell_run_command` (formatters need raw stdin piping).
-  "shell_run_command",
-  "shell_session_open",
-  "shell_session_run",
-  "shell_session_close",
-  "shell_bg_spawn",
-  "shell_bg_spawn_direct",
-  "shell_bg_logs",
-  "shell_bg_kill",
-  "shell_bg_remove",
-  "shell_bg_list",
-  // Wider backends with a narrower sibling the frontend actually calls:
-  // `fs_read_file` over `fs_read_file_portion`, `fs_grep` over `fs_glob`,
-  // `secrets_get_all` over `secrets_get`, `port_is_open` over `http_ping`
-  // (a TCP connect, because a self-signed vhost cert fails an HTTPS probe).
-  "fs_read_file_portion",
-  "fs_canonicalize",
-  "fs_copy",
-  "fs_glob",
-  "secrets_get",
-  "http_ping",
-  "http_stream",
-  "http_abort",
-  "ssh_list_sessions",
-  "ssh_attach",
-]);
+const UNINVOKED = new Set<string>([]);
 
 /**
  * `invoke` call sites whose command name is not a literal at the call. Each is
@@ -82,12 +52,7 @@ const UNINVOKED = new Set([
  * unregistered command behind a variable. The set is pinned: a new dynamic call
  * site reddens rather than silently escaping check 1.
  */
-const DYNAMIC_SITES: { file: string; candidates: string[] }[] = [
-  {
-    file: "src/modules/explorer/lib/useFileTree.ts",
-    candidates: ["fs_create_dir", "fs_create_file"],
-  },
-];
+const DYNAMIC_SITES: { file: string; candidates: string[] }[] = [];
 
 let failed = 0;
 function assert(cond: boolean, msg: string): void {
@@ -117,7 +82,7 @@ const registered = new Set(
 
 console.log(`1. the handler list parses (${registered.size} commands)`);
 {
-  assert(registered.size > 80, `parsed ${registered.size} registered commands`);
+  assert(registered.size > 0, `parsed ${registered.size} registered commands`);
   // A duplicated entry compiles and makes the second one dead, so the count and
   // the set agreeing is itself a check.
   const entryCount = (handlerBlock[1].match(/,/g) ?? []).length;
@@ -127,7 +92,7 @@ console.log(`1. the handler list parses (${registered.size} commands)`);
   // segment. If either shape stopped parsing, the set would be quietly short
   // and check 4 would report the missing names as orphans instead.
   assert(registered.has("open_settings_window"), "a bare entry parses to its own name");
-  assert(registered.has("ssh_sftp_home"), "a nested path parses to its last segment");
+  assert(registered.has("fs_read_file"), "a nested path parses to its last segment");
 }
 
 // --- every invoke call site in src/ -----------------------------------------

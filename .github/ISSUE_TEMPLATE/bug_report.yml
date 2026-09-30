@@ -7,14 +7,14 @@ body:
       value: |
         Thanks for taking the time to report a bug. Please fill in the fields below - it makes triage much faster.
 
-        For **security issues**, do NOT open an issue. See [SECURITY.md](https://github.com/rendyuwu/tervia/blob/main/SECURITY.md).
+        For **security issues**, do NOT open an issue. See [SECURITY.md](https://github.com/rendyuwu/subclave/blob/main/SECURITY.md).
 
   - type: input
     id: version
     attributes:
-      label: Tervia version
+      label: Subclave version
       description: From Settings → About, or the title bar.
-      placeholder: "0.3.15"
+      placeholder: "0.1.0"
     validations:
       required: true
 
@@ -59,7 +59,7 @@ body:
       label: Steps to reproduce
       description: Numbered list of exact steps. The more specific, the faster we can help.
       placeholder: |
-        1. Open Tervia
+        1. Open Subclave
         2. Click ...
         3. ...
     validations:

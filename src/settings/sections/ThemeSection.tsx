@@ -32,12 +32,11 @@ import { SettingRow } from "../components/SettingRow";
 import { ColorSwatch } from "./theme/ColorPicker";
 import { CompactSliderRow } from "./theme/Sliders";
 import { COLOR_FIELDS, GROUPS, type Group } from "./theme/colorFields";
-import { TerminalThemePanel } from "./TerminalThemePanel";
 import { PalettePreview } from "./theme/PalettePreview";
 import { SettingsAccordion } from "../components/SettingsAccordion";
 import { UploadButton } from "../components/UploadButton";
 import type { FsReadResult } from "@/lib/ipc";
-import { BookmarkPlus, Download, ExternalLink, Image, Trash2, X } from "lucide-react";
+import { BookmarkPlus, Download, Image, Trash2, X } from "lucide-react";
 
 type ReadResult = FsReadResult;
 
@@ -206,31 +205,13 @@ export function ThemeSection() {
     updateBackground({ enabled: false, path: "", dataUrl: "" });
   };
 
-  // Quick-import wallpaper from a remote URL. We accept the URL as-is for
-  // the dataUrl field (the CSS background-image: url() works with both
-  // http(s) and data: URIs). Saves a roundtrip + base64 inflation that
-  // would bloat the prefs store.
-  const [bgUrlDraft, setBgUrlDraft] = useState("");
-  const onImportBackgroundUrl = () => {
-    setBgError(null);
-    const url = bgUrlDraft.trim();
-    if (!url) return;
-    if (!/^https?:\/\//i.test(url) && !url.startsWith("data:")) {
-      setBgError("Image URL must start with http://, https://, or data:.");
-      return;
-    }
-    updateBackground({ enabled: true, path: url, dataUrl: url });
-    ensureWallpaperVisible();
-    setBgUrlDraft("");
-  };
-
   const onImportFromDialog = async () => {
     setImportError(null);
     setImportStatus(null);
     try {
       const selected = await openFileDialog({
         multiple: false,
-        filters: [{ name: "Tervia theme", extensions: ["tervia", "json"] }],
+        filters: [{ name: "Subclave theme", extensions: ["subclave", "json"] }],
       });
       const path = typeof selected === "string" ? selected : null;
       if (!path) return;
@@ -251,22 +232,18 @@ export function ThemeSection() {
   const onExport = async () => {
     try {
       const target = await saveFileDialog({
-        defaultPath: `${slugify(theme.name, "theme")}.tervia`,
-        filters: [{ name: "Tervia theme", extensions: ["tervia"] }],
+        defaultPath: `${slugify(theme.name, "theme")}.subclave`,
+        filters: [{ name: "Subclave theme", extensions: ["subclave"] }],
       });
       if (!target) return;
-      // Keep HTTP(S) URLs in the export so recipients reuse the same
-      // wallpaper. Drop inline `data:` blobs because they are typically
-      // multi-MB base64 and bloat the theme file with non-portable bytes. When
-      // stripping a local data: image, also blank `path` (it holds the
-      // exporter's absolute OS file path - a privacy leak) and turn the layer
-      // off so the recipient doesn't get an enabled-but-empty wallpaper.
-      const isDataUri = theme.background.dataUrl.startsWith("data:");
+      // Drop inline `data:` blobs because they are typically multi-MB base64
+      // and bloat the theme file with non-portable bytes. Also blank `path`
+      // (it holds the exporter's absolute OS file path - a privacy leak) and
+      // turn the layer off so the recipient doesn't get an enabled-but-empty
+      // wallpaper.
       const slim: CustomTheme = {
         ...theme,
-        background: isDataUri
-          ? { ...theme.background, enabled: false, path: "", dataUrl: "" }
-          : theme.background,
+        background: { ...theme.background, enabled: false, path: "", dataUrl: "" },
       };
       const json = serializeThemeFile(slim);
       await invoke<void>("fs_write_file", { path: target, content: json });
@@ -294,7 +271,7 @@ export function ThemeSection() {
 
       <SettingRow
         title="Enable custom theme"
-        description="When off, Tervia uses the default palette tinted by your main color."
+        description="When off, Subclave uses the default palette tinted by your main color."
       >
         <Switch checked={enabled} onCheckedChange={(v) => void setCustomThemeEnabled(v)} />
       </SettingRow>
@@ -494,10 +471,6 @@ export function ThemeSection() {
         </div>
       </SettingsAccordion>
 
-      <SettingsAccordion title="Terminal">
-        <TerminalThemePanel />
-      </SettingsAccordion>
-
       <SettingsAccordion title="Background &amp; wallpaper">
         <div className="flex flex-col gap-2">
           {/* One opacity control for the whole app. 0% = fully see-through
@@ -523,48 +496,22 @@ export function ThemeSection() {
             />
             <span className="text-muted-foreground text-[10.5px]">
               0% = fully transparent (shows the image below, or your desktop). Applies to
-              everything: editor, terminal, SSH, diff, panels, menus, and extensions.
+              everything: the header, the panes, the status bar, panels and menus.
             </span>
           </div>
-          {/* Unified source row: ONE input that accepts either a local file
-           *  (via Browse) or a remote URL. Only one source is active at a
-           *  time - picking a file replaces the URL; pasting a URL replaces
-           *  the file. The Switch flips the layer on/off without losing the
-           *  underlying source. */}
+          {/* Wallpaper source: a local image, picked through the file dialog and
+           *  read as a `data:` URL by `fs_read_file`. The Switch flips the layer
+           *  on/off without losing the underlying source. */}
           <div className="border-border/60 bg-card flex flex-col gap-2 rounded-lg border px-3 py-2.5">
             <div className="flex items-center gap-2">
               <Input
-                value={bgUrlDraft}
-                onChange={(e) => setBgUrlDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    onImportBackgroundUrl();
-                  }
-                }}
-                placeholder="Paste an image, video (.mp4/.webm), or YouTube URL, or Browse for a local image"
+                readOnly
+                value={theme.background.path}
+                placeholder="Browse for a local image"
                 spellCheck={false}
-                autoCapitalize="off"
-                autoCorrect="off"
                 className="h-8 flex-1 font-mono text-[11px]"
                 aria-label="Wallpaper source"
               />
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <UploadButton
-                    icon={ExternalLink}
-                    disabled={!bgUrlDraft.trim()}
-                    onClick={onImportBackgroundUrl}
-                    aria-label="Use URL"
-                  >
-                    Use URL
-                  </UploadButton>
-                </TooltipTrigger>
-                <TooltipContent side="top">
-                  Load the URL above as the wallpaper. URLs are fetched on demand (not stored as
-                  base64).
-                </TooltipContent>
-              </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <UploadButton icon={Image} onClick={() => void onPickBackground()}>
@@ -603,7 +550,7 @@ export function ThemeSection() {
               />
             </div>
             {/* Current source line - a faint indicator so the user can tell
-             *  whether the wallpaper came from a file or a URL. */}
+             *  which image is the wallpaper. */}
             {theme.background.dataUrl ? (
               <div className="text-muted-foreground truncate text-[10.5px]">
                 {theme.background.path.startsWith("data:")
@@ -628,10 +575,10 @@ export function ThemeSection() {
                 onPreview={(n) =>
                   // Live-preview on the main window's real wallpaper layer
                   // (kind-aware via applyBackground). The old code poked
-                  // `#tervia-bg-layer` directly, but that element doesn't exist in
-                  // the Settings webview, so the preview was a no-op. We send only
-                  // the numbers; the main window merges them onto the wallpaper it
-                  // already holds (no image blob over IPC).
+                  // `#subclave-bg-layer` directly, but that element doesn't exist
+                  // in the Settings webview, so the preview was a no-op. We send
+                  // only the numbers; the main window merges them onto the
+                  // wallpaper it already holds (no image blob over IPC).
                   previewWallpaper({
                     blur: n,
                     darken: theme.background.darken ?? 0,
@@ -684,7 +631,7 @@ export function ThemeSection() {
       <SettingsAccordion title="Import / Export">
         <div className="flex flex-col gap-2">
           <SettingRow
-            title=".tervia theme file"
+            title=".subclave theme file"
             description="Share themes with teammates. Files contain all colors plus background settings (image data is excluded from the export)."
           >
             <div className="flex items-center gap-2">

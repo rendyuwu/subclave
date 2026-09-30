@@ -1,14 +1,9 @@
 import { IS_LINUX } from "@/lib/platform";
-import { IPC_EVENTS } from "@/lib/ipc";
-import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export const GITHUB_REPO = "rendyuwu/tervia";
-export const GITHUB_LATEST_RELEASE = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+export const GITHUB_REPO = "rendyuwu/subclave";
 
 export interface ManualUpdateInfo {
   version: string;
@@ -45,58 +40,28 @@ export type UpdaterState =
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
-function parseVersion(v: string): number[] {
-  return v
-    .replace(/^v/, "")
-    .split("-")[0]
-    .split(".")
-    .map((p) => Number.parseInt(p, 10) || 0);
-}
-
-export function isNewerVersion(remote: string, current: string): boolean {
-  const a = parseVersion(remote);
-  const b = parseVersion(current);
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const x = a[i] ?? 0;
-    const y = b[i] ?? 0;
-    if (x !== y) return x > y;
-  }
-  return false;
-}
-
-/** Linux manual update flow. Bundler can't apply deb/rpm in-place, so we
- *  surface the latest GitHub release. Returns null when on the latest. */
+/** Linux manual update flow. The bundler can't apply deb/rpm in-place, so we
+ *  surface the latest release the updater plugin reports, and the user installs
+ *  it through their package manager. Returns null when on the latest.
+ *
+ *  The check goes through the updater plugin (Rust), never a webview `fetch`:
+ *  the CSP allows only IPC, so the check runs in the Rust updater plugin. */
 export async function fetchLinuxRelease(): Promise<ManualUpdateInfo | null> {
-  const [current, res] = await Promise.all([
-    getVersion(),
-    fetch(GITHUB_LATEST_RELEASE, {
-      headers: { Accept: "application/vnd.github+json" },
-    }),
-  ]);
-  if (!res.ok) {
-    throw new Error(`GitHub API ${res.status}`);
-  }
-  const data = (await res.json()) as {
-    tag_name: string;
-    body?: string;
-    html_url: string;
+  const update = await check();
+  if (!update) return null;
+  const info: ManualUpdateInfo = {
+    version: update.version,
+    currentVersion: update.currentVersion,
+    notes: update.body ?? null,
+    releaseUrl: `https://github.com/${GITHUB_REPO}/releases/tag/v${update.version}`,
   };
-  const remote = data.tag_name.replace(/^v/, "");
-  if (!isNewerVersion(remote, current)) return null;
-  return {
-    version: remote,
-    currentVersion: current,
-    notes: data.body ?? null,
-    releaseUrl: data.html_url,
-  };
+  await update.close();
+  return info;
 }
 
 export function useUpdater() {
   const [state, setState] = useState<UpdaterState>({ kind: "idle" });
   const updateRef = useRef<Update | null>(null);
-  // Bumped on every `tervia --update` request. UpdaterPill watches this.
-  const [forceOpenSeq, setForceOpenSeq] = useState(0);
 
   const reset = useCallback(() => {
     updateRef.current = null;
@@ -106,8 +71,8 @@ export function useUpdater() {
   // `silent` checks are the unattended background sweeps (first-run + 6h
   // interval). When GitHub is unreachable (offline at launch, proxy, DNS) they
   // must NOT light up the red "Update check failed" pill - a failed reachability
-  // probe is not news the user asked for. Only explicit checks (`tervia --update`,
-  // the trigger event, the dialog's Retry button) surface the error.
+  // probe is not news the user asked for. Only explicit checks (the dialog's
+  // Retry button) surface the error.
   //
   // Silent sweeps also stay invisible mid-flight: they skip the "checking"
   // panel and, on failure, leave the current state untouched. So an error the
@@ -200,9 +165,7 @@ export function useUpdater() {
   const stateKindRef = useRef(state.kind);
   stateKindRef.current = state.kind;
 
-  // First check 8s after mount so it doesn't compete with PTY spawns and AI
-  // hydration. One-shot. Skip if we've already moved out of idle (cli drain
-  // or trigger event fired first).
+  // First check 8s after mount so it doesn't compete with first paint. One-shot.
   useEffect(() => {
     const first = window.setTimeout(() => {
       if (stateKindRef.current === "idle") {
@@ -210,30 +173,6 @@ export function useUpdater() {
       }
     }, 8_000);
     return () => window.clearTimeout(first);
-  }, [checkForUpdate]);
-
-  // `tervia --update`: drain startup flag once and re-fire on single-instance forwards.
-  // Both paths force the dialog and skip the 8s delay.
-  const updateFlagDrainedRef = useRef(false);
-  useEffect(() => {
-    if (updateFlagDrainedRef.current) return;
-    updateFlagDrainedRef.current = true;
-    void invoke<boolean>("cli_take_initial_update_request").then((requested) => {
-      if (requested) {
-        setForceOpenSeq((n) => n + 1);
-        void checkForUpdate();
-      }
-    });
-  }, [checkForUpdate]);
-
-  useEffect(() => {
-    const unlistenP = listen<unknown>(IPC_EVENTS.TRIGGER_UPDATE, () => {
-      setForceOpenSeq((n) => n + 1);
-      void checkForUpdate();
-    });
-    return () => {
-      void unlistenP.then((fn) => fn());
-    };
   }, [checkForUpdate]);
 
   useEffect(() => {
@@ -252,7 +191,6 @@ export function useUpdater() {
     downloadAndInstall,
     relaunchApp,
     reset,
-    forceOpenSeq,
   };
 }
 
