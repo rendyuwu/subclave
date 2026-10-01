@@ -1,7 +1,7 @@
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEffect, useRef, useState } from "react";
-import { clamp01, HEX6_RE, hexToHsv, hsvToHex, type Hsv } from "./colorMath";
+import { clamp01, HEX6_RE, hexToHsv, hsvToHex, type Hsv } from "@/lib/color";
 
 /**
  * Saturation/brightness square. Drag (or click) anywhere inside to set S (x

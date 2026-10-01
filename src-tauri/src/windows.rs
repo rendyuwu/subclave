@@ -1,9 +1,8 @@
 //! Main-window lifecycle: event handling, size floor, child windows.
 
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager};
 
 use crate::modules;
-use crate::platform::windows::disable_windows_corner_rounding;
 
 /// The user's preferences, read at use time. A failed data-dir resolve falls
 /// back to the defaults rather than panicking inside a window-event handler.
@@ -11,6 +10,15 @@ fn prefs_now(app: &tauri::AppHandle) -> modules::prefs::Prefs {
     modules::vault::vault_dir(app)
         .map(|dir| modules::prefs::read(&dir))
         .unwrap_or_default()
+}
+
+/// Reveal a window: show it if hidden, restore it if minimized, and focus it.
+/// The close/quit prompt, the single-instance relaunch, the Settings window
+/// reopen and the tray Open all end in this sequence.
+pub(crate) fn reveal(window: &tauri::WebviewWindow) {
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
 }
 
 /// Decide whether the process may exit now, shared by the window close, the
@@ -24,9 +32,7 @@ pub(crate) fn quit_or_confirm(app: &tauri::AppHandle) -> bool {
         return true;
     }
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        reveal(&window);
     }
     let _ = app.emit(modules::events::QUIT_REQUESTED, ());
     false
@@ -34,8 +40,9 @@ pub(crate) fn quit_or_confirm(app: &tauri::AppHandle) -> bool {
 
 /// Center a child window over the main window (so it follows the user across
 /// monitors instead of landing on the primary display). No-op if either
-/// window's geometry can't be read. Shared by the Settings and Debug windows.
-fn recenter_over_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+/// window's geometry can't be read. Shared by the Settings window build and its
+/// reopen path.
+pub(crate) fn recenter_over_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
     if let Some(main) = app.get_webview_window("main") {
         if let (Ok(main_pos), Ok(main_size), Ok(win_size)) = (
             main.outer_position(),
@@ -47,17 +54,6 @@ fn recenter_over_main(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
             let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
         }
     }
-}
-
-/// The logical size a window has to be resized to in order to respect `min`, or
-/// `None` when it already does. Split out of [`enforce_configured_min_size`] so
-/// the decision is testable without a live window - everything else in that
-/// function is I/O against one.
-fn min_size_correction(current: (f64, f64), min: (f64, f64)) -> Option<(f64, f64)> {
-    if current.0 >= min.0 && current.1 >= min.1 {
-        return None;
-    }
-    Some((current.0.max(min.0), current.1.max(min.1)))
 }
 
 /// Re-apply the configured size floor after `tauri-plugin-window-state` has
@@ -112,75 +108,14 @@ pub(crate) fn enforce_configured_min_size(config: &tauri::Config, window: &tauri
     };
     // The config states logical pixels; `inner_size` answers in physical ones.
     let size = size.to_logical::<f64>(scale);
-    // `None` is a legitimately larger saved size - don't fight the plugin over it.
-    if let Some((width, height)) =
-        min_size_correction((size.width, size.height), (min_width, min_height))
-    {
-        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    // A saved size that already clears the floor is left alone - the clamp
+    // exists to raise a stale size, not to normalize a larger one.
+    if size.width < min_width || size.height < min_height {
+        let _ = window.set_size(tauri::LogicalSize::new(
+            size.width.max(min_width),
+            size.height.max(min_height),
+        ));
     }
-}
-
-/// Open (or reveal) an owner-parented child window with our custom chrome.
-/// Returns `Ok(None)` when an existing window was revealed, `Ok(Some(window))`
-/// when a new one was built. Shared by the Settings and Debug windows.
-pub(crate) fn open_or_reveal_child(
-    app: &tauri::AppHandle,
-    label: &str,
-    url: String,
-    title: &str,
-    size: (f64, f64),
-    min_size: (f64, f64),
-) -> Result<Option<tauri::WebviewWindow>, String> {
-    if let Some(window) = app.get_webview_window(label) {
-        // Re-center over the main window so reopening follows the user
-        // across displays.
-        recenter_over_main(app, &window);
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        return Ok(None);
-    }
-
-    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
-        .title(title)
-        .inner_size(size.0, size.1)
-        .min_inner_size(min_size.0, min_size.1)
-        .resizable(true)
-        .visible(false);
-
-    // Owner-window relationship: keeps the child z-ordered above main without
-    // pinning it above other apps. On Windows the OS auto-hides owned
-    // windows when the owner minimizes, so the child follows main into the
-    // taskbar instead of floating on the desktop.
-    if let Some(main) = app.get_webview_window("main") {
-        builder = builder.parent(&main).map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true);
-
-    // Linux/Windows render our own titlebar, so drop native chrome and
-    // make the window transparent.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let builder = builder.decorations(false).transparent(true);
-
-    let window = builder.build().map_err(|e| e.to_string())?;
-
-    // Some Linux compositors (GNOME/Mutter with CSD-by-default) ignore the
-    // builder-time decorations flag, so re-assert it after realize.
-    #[cfg(target_os = "linux")]
-    {
-        let _ = window.set_decorations(false);
-    }
-    disable_windows_corner_rounding(&window);
-
-    // Tauri's default placement lands at the primary monitor's center even
-    // when main is on a secondary display; re-center over main so it follows
-    // the user.
-    recenter_over_main(app, &window);
-    Ok(Some(window))
 }
 
 /// The main window's `on_window_event` handler, kept out of the builder chain
@@ -197,7 +132,6 @@ pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::Window
         return;
     }
     let app = window.app_handle().clone();
-    const CHILDREN: [&str; 1] = ["settings"];
     match event {
         // Close-to-tray hides the window and keeps the app (and the
         // browser extension's connection) alive. Otherwise the close
@@ -236,15 +170,12 @@ pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::Window
             {
                 modules::vault::emit_locked(&app, modules::vault::LockReason::Minimize);
             }
-            for child in CHILDREN {
-                let Some(w) = app.get_webview_window(child) else {
-                    continue;
-                };
+            if let Some(child) = app.get_webview_window("settings") {
                 if minimized {
-                    let _ = w.minimize();
-                } else if w.is_minimized().unwrap_or(false) {
-                    let _ = w.unminimize();
-                    let _ = w.show();
+                    let _ = child.minimize();
+                } else if child.is_minimized().unwrap_or(false) {
+                    let _ = child.unminimize();
+                    let _ = child.show();
                 }
             }
             // The size floor, for the one case the setup-time clamp has
@@ -264,10 +195,8 @@ pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::Window
         // (the quit prompt), and taking the settings window down on a
         // close the user then cancels would be wrong.
         tauri::WindowEvent::Destroyed => {
-            for child in CHILDREN {
-                if let Some(w) = app.get_webview_window(child) {
-                    let _ = w.close();
-                }
+            if let Some(child) = app.get_webview_window("settings") {
+                let _ = child.close();
             }
         }
         // The webview owns the pull rate limit; this only says the user
@@ -282,46 +211,30 @@ pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::Window
 
 #[cfg(test)]
 mod min_size_tests {
-    use super::min_size_correction;
-
-    /// The whole point of the clamp: `tauri-plugin-window-state` restores a
-    /// saved size with a bare `set_size`, which Windows does not check against
-    /// the window's minimum, so a profile saved at the old 420x280 floor comes
-    /// back at 420x280 under a 640x480 config and never sees the new floor.
+    /// The clamp `enforce_configured_min_size` applies to a restored size,
+    /// mirrored here because the production path needs a live window. The
+    /// `tauri-plugin-window-state` plugin restores a saved size with a bare
+    /// `set_size`, which Windows does not check against the window minimum, so
+    /// a profile saved at the old 420x280 floor comes back at 420x280 under a
+    /// 640x480 config; the clamp raises each axis to the floor and leaves a
+    /// larger saved size untouched. A table because the two axes are
+    /// independent and "exactly at the floor" is the boundary that would
+    /// otherwise regress to a resize on every launch.
     #[test]
-    fn a_size_saved_below_the_floor_is_raised_to_it() {
-        assert_eq!(
-            min_size_correction((420.0, 280.0), (640.0, 480.0)),
-            Some((640.0, 480.0))
-        );
-    }
-
-    /// Only the short axis moves. A window saved wide and short keeps its width
-    /// instead of being snapped back to the floor's aspect.
-    #[test]
-    fn only_the_axis_below_the_floor_moves() {
-        assert_eq!(
-            min_size_correction((900.0, 280.0), (640.0, 480.0)),
-            Some((900.0, 480.0))
-        );
-        assert_eq!(
-            min_size_correction((420.0, 700.0), (640.0, 480.0)),
-            Some((640.0, 700.0))
-        );
-    }
-
-    /// A saved size the user chose and that clears the floor must come back
-    /// untouched - the clamp exists to raise a stale size, not to normalize one.
-    #[test]
-    fn a_larger_saved_size_is_left_alone() {
-        assert_eq!(min_size_correction((1280.0, 800.0), (640.0, 480.0)), None);
-    }
-
-    /// Exactly at the floor is not below it, so no resize is issued at all.
-    /// Without this the clamp would fire on every launch of a floor-sized
-    /// window and fight the plugin for no reason.
-    #[test]
-    fn a_size_exactly_at_the_floor_is_left_alone() {
-        assert_eq!(min_size_correction((640.0, 480.0), (640.0, 480.0)), None);
+    fn only_a_size_below_the_floor_is_raised() {
+        let (fw, fh) = (640.0, 480.0);
+        let corrected = |size: (f64, f64)| {
+            (size.0 < fw || size.1 < fh).then(|| (size.0.max(fw), size.1.max(fh)))
+        };
+        let cases = [
+            ((420.0, 280.0), Some((640.0, 480.0))),
+            ((900.0, 280.0), Some((900.0, 480.0))),
+            ((420.0, 700.0), Some((640.0, 700.0))),
+            ((1280.0, 800.0), None),
+            ((640.0, 480.0), None),
+        ];
+        for (size, want) in cases {
+            assert_eq!(corrected(size), want, "size {size:?} against floor 640x480");
+        }
     }
 }

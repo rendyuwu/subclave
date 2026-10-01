@@ -38,18 +38,15 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   `disable_browser_accelerator_keys` so WebView2 does not eat Ctrl+W / Ctrl+R.
 - **Docs and prose**: no em-dashes (commas, colons, or parentheses instead).
   No emoji in docs, code, or commits.
-- **Comments cite only what a clone can reach**: a file `git ls-files` returns,
-  a symbol, an upstream project's public tracker named by project, or a pinned
-  dependency's own source (crate, version, symbol, never a line number). Never
-  cite this project's own planning docs, issue numbers, section numbers, `/tmp`
-  paths, dates, or commit hashes.
-  One carve-out: a comment may name a file that is gone when the deletion
-  itself is the sentence's subject, in the past tense ("once X was deleted, Y
-  became unreachable").
 - **Cite a symbol, not a line**: a line number goes stale the moment another
-  commit touches that file. `scripts/citation-format-verify.ts` fails on a
-  `file:line` inside a comment in `src/`, `src-tauri/src/`, or `scripts/`, and
-  on a backticked path that resolves to no file in the tree.
+  commit touches that file, and a path no clone can open is just as useless.
+  Comments cite only what a reader holding the clone can reach: a file in the
+  tree, or a symbol. `scripts/citation-format-verify.ts` fails on a `file:line`
+  or a bare `:line` inside a comment in `src/`, `src-tauri/src/`, or `scripts/`,
+  and on a backticked path that resolves to no file in the tree. One carve-out:
+  a comment may name a file that is gone when the deletion itself is the
+  sentence's subject, in the past tense ("once X was deleted, Y became
+  unreachable").
 
 ## Area rules
 

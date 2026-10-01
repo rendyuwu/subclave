@@ -232,47 +232,64 @@ pub async fn vault_entry_move(
     result
 }
 
+/// The shared skeleton of the four bulk entry ops: refuse while the vault is
+/// unwritable, take the payload, read the clock, run `f`, then commit. Each
+/// op's `f` validates every id before mutating any of them, so a refusal
+/// leaves no half-applied edits behind in memory, and marks each entry it
+/// mutates dirty.
+fn mutate_entries(
+    state: &VaultState,
+    dir: &Path,
+    ids: &[String],
+    f: impl FnOnce(&mut model::VaultPayload, &[String], u64) -> Result<(), String>,
+) -> Result<(), String> {
+    state.ensure_writable()?;
+    let mut guard = state.access()?;
+    let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
+    let payload = &mut unlocked.payload;
+    let now = now_ms();
+    f(payload, ids, now)?;
+    drop(guard);
+    commit(state, dir)
+}
+
 pub(crate) fn vault_entry_move_inner(
     state: &VaultState,
     dir: &Path,
     ids: Vec<String>,
     group_id: String,
 ) -> Result<(), String> {
-    state.ensure_writable()?;
-    let mut guard = state.access()?;
-    let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
-    let payload = &mut unlocked.payload;
-    if group_id != ROOT_ID && !payload.groups.iter().any(|g| g.id == group_id) {
-        return Err("vault: no such group".to_string());
-    }
-    if group_id == TRASH_ID {
-        return Err("vault: use trash instead".to_string());
-    }
-    // Validate every id BEFORE mutating, so a refusal leaves no half-applied
-    // edits behind in memory.
-    for id in &ids {
-        let entry = payload
-            .entries
-            .iter()
-            .find(|e| &e.id == id)
-            .ok_or_else(|| "vault: no such entry".to_string())?;
-        if entry.group_id == TRASH_ID {
-            return Err("vault: restore from Trash first".to_string());
+    mutate_entries(state, dir, &ids, |payload, ids, now| {
+        if group_id != ROOT_ID && !payload.groups.iter().any(|g| g.id == group_id) {
+            return Err("vault: no such group".to_string());
         }
-    }
-    let now = now_ms();
-    for id in &ids {
-        let entry = payload
-            .entries
-            .iter_mut()
-            .find(|e| &e.id == id)
-            .expect("validated above");
-        entry.group_id = group_id.clone();
-        entry.updated_at = stamp_next(now, entry.updated_at);
-        payload.device.sync.mark_dirty("entry", id);
-    }
-    drop(guard);
-    commit(state, dir)
+        if group_id == TRASH_ID {
+            return Err("vault: use trash instead".to_string());
+        }
+        // Validate every id BEFORE mutating, so a refusal leaves no
+        // half-applied edits behind in memory.
+        for id in ids {
+            let entry = payload
+                .entries
+                .iter()
+                .find(|e| &e.id == id)
+                .ok_or_else(|| "vault: no such entry".to_string())?;
+            if entry.group_id == TRASH_ID {
+                return Err("vault: restore from Trash first".to_string());
+            }
+        }
+        for id in ids {
+            let entry = payload
+                .entries
+                .iter_mut()
+                .find(|e| &e.id == id)
+                .expect("validated above");
+            entry.group_id = group_id.clone();
+            entry.updated_at = stamp_next(now, entry.updated_at);
+            payload.device.sync.mark_dirty("entry", id);
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -290,35 +307,31 @@ pub(crate) fn vault_entry_trash_inner(
     dir: &Path,
     ids: Vec<String>,
 ) -> Result<(), String> {
-    state.ensure_writable()?;
-    let mut guard = state.access()?;
-    let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
-    let payload = &mut unlocked.payload;
-    // Validate every id BEFORE mutating.
-    for id in &ids {
-        payload
-            .entries
-            .iter()
-            .find(|e| &e.id == id)
-            .ok_or_else(|| "vault: no such entry".to_string())?;
-    }
-    let now = now_ms();
-    for id in &ids {
-        let entry = payload
-            .entries
-            .iter_mut()
-            .find(|e| &e.id == id)
-            .expect("validated above");
-        if entry.group_id == TRASH_ID {
-            continue;
+    mutate_entries(state, dir, &ids, |payload, ids, now| {
+        // Validate every id BEFORE mutating.
+        for id in ids {
+            payload
+                .entries
+                .iter()
+                .find(|e| &e.id == id)
+                .ok_or_else(|| "vault: no such entry".to_string())?;
         }
-        entry.trashed_from = Some(entry.group_id.clone());
-        entry.group_id = TRASH_ID.into();
-        entry.updated_at = stamp_next(now, entry.updated_at);
-        payload.device.sync.mark_dirty("entry", id);
-    }
-    drop(guard);
-    commit(state, dir)
+        for id in ids {
+            let entry = payload
+                .entries
+                .iter_mut()
+                .find(|e| &e.id == id)
+                .expect("validated above");
+            if entry.group_id == TRASH_ID {
+                continue;
+            }
+            entry.trashed_from = Some(entry.group_id.clone());
+            entry.group_id = TRASH_ID.into();
+            entry.updated_at = stamp_next(now, entry.updated_at);
+            payload.device.sync.mark_dirty("entry", id);
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -339,41 +352,37 @@ pub(crate) fn vault_entry_restore_inner(
     dir: &Path,
     ids: Vec<String>,
 ) -> Result<(), String> {
-    state.ensure_writable()?;
-    let mut guard = state.access()?;
-    let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
-    let payload = &mut unlocked.payload;
-    // Validate every id BEFORE mutating; only entries in Trash restore.
-    for id in &ids {
-        let entry = payload
-            .entries
-            .iter()
-            .find(|e| &e.id == id)
-            .ok_or_else(|| "vault: no such entry".to_string())?;
-        if entry.group_id != TRASH_ID {
-            return Err("vault: only entries in Trash can be restored".to_string());
+    mutate_entries(state, dir, &ids, |payload, ids, now| {
+        // Validate every id BEFORE mutating; only entries in Trash restore.
+        for id in ids {
+            let entry = payload
+                .entries
+                .iter()
+                .find(|e| &e.id == id)
+                .ok_or_else(|| "vault: no such entry".to_string())?;
+            if entry.group_id != TRASH_ID {
+                return Err("vault: only entries in Trash can be restored".to_string());
+            }
         }
-    }
-    let now = now_ms();
-    for id in &ids {
-        let entry = payload
-            .entries
-            .iter_mut()
-            .find(|e| &e.id == id)
-            .expect("validated above");
-        // Back to trashed_from when that group still exists, else root.
-        let target = entry
-            .trashed_from
-            .clone()
-            .filter(|g| payload.groups.iter().any(|grp| &grp.id == g))
-            .unwrap_or_else(|| ROOT_ID.to_string());
-        entry.trashed_from = None;
-        entry.group_id = target;
-        entry.updated_at = stamp_next(now, entry.updated_at);
-        payload.device.sync.mark_dirty("entry", id);
-    }
-    drop(guard);
-    commit(state, dir)
+        for id in ids {
+            let entry = payload
+                .entries
+                .iter_mut()
+                .find(|e| &e.id == id)
+                .expect("validated above");
+            // Back to trashed_from when that group still exists, else root.
+            let target = entry
+                .trashed_from
+                .clone()
+                .filter(|g| payload.groups.iter().any(|grp| &grp.id == g))
+                .unwrap_or_else(|| ROOT_ID.to_string());
+            entry.trashed_from = None;
+            entry.group_id = target;
+            entry.updated_at = stamp_next(now, entry.updated_at);
+            payload.device.sync.mark_dirty("entry", id);
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -394,32 +403,28 @@ pub(crate) fn vault_entry_delete_inner(
     dir: &Path,
     ids: Vec<String>,
 ) -> Result<(), String> {
-    state.ensure_writable()?;
-    let mut guard = state.access()?;
-    let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
-    let payload = &mut unlocked.payload;
-    let now = now_ms();
-    for id in &ids {
-        let entry = payload
-            .entries
-            .iter()
-            .find(|e| &e.id == id)
-            .ok_or_else(|| "vault: no such entry".to_string())?;
-        if entry.group_id != TRASH_ID {
-            return Err("vault: only entries in Trash can be deleted permanently".to_string());
+    mutate_entries(state, dir, &ids, |payload, ids, now| {
+        for id in ids {
+            let entry = payload
+                .entries
+                .iter()
+                .find(|e| &e.id == id)
+                .ok_or_else(|| "vault: no such entry".to_string())?;
+            if entry.group_id != TRASH_ID {
+                return Err("vault: only entries in Trash can be deleted permanently".to_string());
+            }
         }
-    }
-    for id in &ids {
-        payload.entries.retain(|e| &e.id != id);
-        payload.device.sync.mark_dirty("entry", id);
-        payload.tombstones.push(Tombstone {
-            id: id.clone(),
-            kind: TombstoneKind::Entry,
-            deleted_at: now,
-        });
-    }
-    drop(guard);
-    commit(state, dir)
+        for id in ids {
+            payload.entries.retain(|e| &e.id != id);
+            payload.device.sync.mark_dirty("entry", id);
+            payload.tombstones.push(Tombstone {
+                id: id.clone(),
+                kind: TombstoneKind::Entry,
+                deleted_at: now,
+            });
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]

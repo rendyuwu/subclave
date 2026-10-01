@@ -24,8 +24,8 @@
 //! `src-tauri/src/modules/vault/merge_history.rs`, are what make that safe.
 //!
 //! NOTHING HERE RUNS A BLOCKING CALL ON THE ASYNC THREADS. The KDF and every
-//! file write go through `tokio::task::spawn_blocking` (the testable helpers)
-//! or `tauri::async_runtime::spawn_blocking` (the command shells). The
+//! file write go through `tokio::task::spawn_blocking`, wrapped once as the
+//! `blocking` helper in `src-tauri/src/modules/sync/engine/commands.rs`. The
 //! `no_new_sync_tauri_commands` test in `src-tauri/src/commands.rs` enforces the
 //! async half of that.
 
@@ -45,10 +45,7 @@ use super::provider::{ProviderError, SyncProvider};
 use layout::{name_of, object_key, object_prefix, slot, TOMBSTONE_TTL_MS};
 
 pub use commands::*;
-pub use payload::{
-    apply_pull, finish_push, local_envelope, locals_from_payload, take_dirty_envelopes,
-    write_envelope,
-};
+pub use payload::{apply_pull, finish_push, locals_from_payload, take_dirty_envelopes};
 pub use types::*;
 
 // ---------------------------------------------------------------------------
@@ -104,7 +101,7 @@ pub(super) fn seal_envelope(keys: &SyncKeys, envelope: &Envelope) -> Result<Vec<
 /// `etags` is what the previous pull returned, minus anything the apply
 /// refused.
 #[allow(clippy::too_many_arguments)]
-pub async fn pull(
+async fn pull(
     provider: &dyn SyncProvider,
     keys: &SyncKeys,
     prefix: &str,
@@ -346,7 +343,7 @@ pub async fn pull(
 /// field on an envelope that is not a fact about the record, and the prune
 /// deletes remote objects on the strength of it - so the frontend is not
 /// allowed a say in what it says.
-pub async fn push(
+async fn push(
     provider: &dyn SyncProvider,
     keys: &SyncKeys,
     prefix: &str,
@@ -354,7 +351,7 @@ pub async fn push(
     envelopes: Vec<Envelope>,
     etags: BTreeMap<String, String>,
 ) -> PushReport {
-    let cas = provider.capabilities().cas;
+    let cas = provider.cas();
     let mut report = PushReport::default();
     for mut envelope in envelopes {
         envelope.device = device.to_string();
@@ -446,7 +443,7 @@ mod test_support {
     use crate::modules::sync::crypto::{new_keyfile, object_name, SyncKeys};
     use crate::modules::sync::model::{Envelope, ENTRY_KIND, WIRE_VERSION};
     use crate::modules::sync::provider::{
-        Caps, Entry as ProviderEntry, Object, ProviderError, SyncProvider,
+        Entry as ProviderEntry, Object, ProviderError, SyncProvider,
     };
     use crate::modules::vault::model::{DeviceState, Entry, Tombstone, VaultPayload, ROOT_ID};
 
@@ -522,8 +519,10 @@ mod test_support {
             "fake"
         }
 
-        fn capabilities(&self) -> Caps {
-            Caps { cas: self.cas }
+        /// The fake's stored toggle: the tests set it to model a provider that
+        /// honours a conditional write.
+        fn cas(&self) -> bool {
+            self.cas
         }
 
         fn get<'a>(

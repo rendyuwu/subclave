@@ -14,7 +14,25 @@ import { DEFAULT_CUSTOM_THEME, THEME_PRESETS } from "@/modules/settings/themePre
 import { BookmarkPlus, X } from "lucide-react";
 import { useState } from "react";
 import { SettingsAccordion } from "../../components/SettingsAccordion";
-import { PalettePreview } from "./PalettePreview";
+
+/**
+ * Small palette swatch chip: a colored background plus a strip of accent dots,
+ * one per preset card. Callers pass the representative background and the dot
+ * colors (ANSI hues).
+ */
+function PalettePreview({ background, dots }: { background: string; dots: string[] }) {
+  return (
+    <div
+      aria-hidden
+      className="border-border/40 flex h-7 w-16 shrink-0 items-center gap-[3px] overflow-hidden rounded-[3px] border px-1.5"
+      style={{ background }}
+    >
+      {dots.map((c, i) => (
+        <span key={i} className="h-2.5 w-2.5 rounded-full" style={{ background: c }} />
+      ))}
+    </div>
+  );
+}
 
 /**
  * The Presets accordion: the built-in preset grid plus the user's saved

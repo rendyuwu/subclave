@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Rasterise the whole icon set from the two SVG sources in src-tauri/icons/.
+ * Rasterise the desktop icon set from `subclave-mark.svg`.
  *
- * Run after editing `subclave-mark.svg` or `subclave-mark-foreground.svg`:
+ * Run after editing `subclave-mark.svg`:
  *
  *   node scripts/gen-icons.mjs
  *
@@ -29,7 +29,6 @@ import { tmpdir } from "node:os";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ICONS = join(ROOT, "src-tauri", "icons");
 const MARK = join(ICONS, "subclave-mark.svg");
-const FOREGROUND = join(ICONS, "subclave-mark-foreground.svg");
 const STAGE = join(tmpdir(), "subclave-icons");
 
 function run(cmd, args) {
@@ -116,45 +115,6 @@ buildIcns(
   }),
   join(ICONS, "icon.icns"),
 );
-
-// --- mobile ----------------------------------------------------------------
-// Subclave ships desktop only, but `tauri icon` writes these and a future
-// mobile target would expect them present rather than stale.
-const ANDROID = [
-  ["mdpi", 48, 108],
-  ["hdpi", 49, 162],
-  ["xhdpi", 96, 216],
-  ["xxhdpi", 144, 324],
-  ["xxxhdpi", 192, 432],
-];
-for (const [density, launcher, foreground] of ANDROID) {
-  const dir = join(ICONS, "android", `mipmap-${density}`);
-  render(MARK, launcher, join(dir, "ic_launcher.png"));
-  render(MARK, launcher, join(dir, "ic_launcher_round.png"));
-  render(FOREGROUND, foreground, join(dir, "ic_launcher_foreground.png"));
-}
-
-const IOS = [
-  ["20x20@1x", 20],
-  ["20x20@2x", 40],
-  ["20x20@2x-1", 40],
-  ["20x20@3x", 60],
-  ["29x29@1x", 29],
-  ["29x29@2x", 58],
-  ["29x29@2x-1", 58],
-  ["29x29@3x", 87],
-  ["40x40@1x", 40],
-  ["40x40@2x", 80],
-  ["40x40@2x-1", 80],
-  ["40x40@3x", 120],
-  ["60x60@2x", 120],
-  ["60x60@3x", 180],
-  ["76x76@1x", 76],
-  ["76x76@2x", 152],
-  ["83.5x83.5@2x", 167],
-  ["512@2x", 1024],
-];
-for (const [name, size] of IOS) render(MARK, size, join(ICONS, "ios", `AppIcon-${name}.png`));
 
 // --- repo-level logo -------------------------------------------------------
 render(MARK, 750, join(ROOT, "subclave.png"));

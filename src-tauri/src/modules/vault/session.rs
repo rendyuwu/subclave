@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use crate::modules::lockext::LockExt as _;
+use crate::modules::lockext::lock_or_recover;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -140,7 +140,7 @@ pub(crate) fn install_new_vault(
     // was told does not exist for the retry to land later. A successful
     // write also drops any parked seal.
     {
-        let _held = state.save_lock.lock_or_recover();
+        let _held = lock_or_recover(&state.save_lock);
         if state.save_blocked.load(Ordering::SeqCst) {
             return Err("vault: restore the snapshot before saving".to_string());
         }
@@ -150,7 +150,7 @@ pub(crate) fn install_new_vault(
     // Refresh BEFORE installing: a concurrent access() must not see the
     // previous session's expired deadline while the new one is installed.
     state.refresh_deadline(prefs::read(dir).auto_lock_minutes);
-    *state.inner.lock_or_recover() = Some(Unlocked { payload, key, kdf });
+    *lock_or_recover(&state.inner) = Some(Unlocked { payload, key, kdf });
     Ok(())
 }
 
@@ -196,14 +196,14 @@ pub(crate) fn vault_unlock_inner(
     // derived, so opening it shows the user their edits. A stale disk copy is
     // not a broken primary, so this does not set save_blocked: the next
     // commit simply lands.
-    let payload = match state.pending.lock_or_recover().clone() {
+    let payload = match lock_or_recover(&state.pending).clone() {
         Some(pending) => open_file(&pending, master_password)
             .map(|o| o.payload)
             .unwrap_or_else(|_| opened.payload),
         None => opened.payload,
     };
     state.refresh_deadline(prefs::read(dir).auto_lock_minutes);
-    *state.inner.lock_or_recover() = Some(Unlocked {
+    *lock_or_recover(&state.inner) = Some(Unlocked {
         payload,
         key: opened.key,
         kdf: opened.kdf,
@@ -269,7 +269,7 @@ pub(crate) fn vault_change_master_inner(
     }
     // save_lock first, per the save-machinery lock order: the re-seal and
     // its write are one ordered unit against concurrent commits.
-    let _held = state.save_lock.lock_or_recover();
+    let _held = lock_or_recover(&state.save_lock);
     // The in-memory payload is the source of truth for the re-seal: it holds
     // every edit since unlock, and the sync state and browser pairings inside
     // it carry over untouched.
@@ -330,11 +330,11 @@ pub async fn vault_retry_save(app: AppHandle) -> Result<(), String> {
 /// which is what [`VaultState::has_pending`] needs to answer the quit prompt
 /// (a taken seal left a window where a close would exit and lose the write).
 pub(crate) fn vault_retry_save_inner(state: &VaultState, dir: &Path) -> Result<(), String> {
-    let _held = state.save_lock.lock_or_recover();
+    let _held = lock_or_recover(&state.save_lock);
     // Bound in its own statement, not read inside the `match` scrutinee: a
     // temporary guard there lives until the end of the match and
     // `perform_save_locked` locks `pending` itself, which deadlocks.
-    let parked = state.pending.lock_or_recover().clone();
+    let parked = lock_or_recover(&state.pending).clone();
     match parked {
         // perform_save_locked re-parks it on failure, so the retry state is kept.
         Some(file) => perform_save_locked(state, dir, file),
@@ -360,7 +360,7 @@ fn vault_restore_snapshot_inner(state: &VaultState, dir: &Path) -> Result<(), St
     // Held across the whole restore, so two clicks cannot interleave: without
     // it the second call could pass the flag check before the first clears it
     // and rename the freshly written good primary over the broken copy.
-    let _held = state.save_lock.lock_or_recover();
+    let _held = lock_or_recover(&state.save_lock);
     if !state.save_blocked.load(Ordering::SeqCst) {
         return Err("vault: no snapshot to restore".to_string());
     }

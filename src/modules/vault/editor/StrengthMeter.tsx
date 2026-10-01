@@ -12,29 +12,44 @@ import { cn } from "@/lib/utils";
 
 const LABELS = ["Very weak", "Weak", "Fair", "Strong", "Very strong"] as const;
 
-export function StrengthMeter({ value, className }: { value: string; className?: string }) {
+export function StrengthMeter({
+  value,
+  className,
+  onScore,
+}: {
+  value: string;
+  className?: string;
+  /** Called with the clamped 0..4 score (null while unknown) so a caller can
+   *  react to the same probe that drives the bar instead of re-asking. */
+  onScore?: (score: number | null) => void;
+}) {
   const [strength, setStrength] = useState<Strength | null>(null);
 
   useEffect(() => {
     if (value === "") {
       setStrength(null);
+      onScore?.(null);
       return;
     }
     let cancelled = false;
     const timer = setTimeout(() => {
       genStrength(value)
         .then((next) => {
-          if (!cancelled) setStrength(next);
+          if (cancelled) return;
+          setStrength(next);
+          onScore?.(Math.min(4, Math.max(0, next.score)));
         })
         .catch(() => {
-          if (!cancelled) setStrength(null);
+          if (cancelled) return;
+          setStrength(null);
+          onScore?.(null);
         });
     }, 200);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [value]);
+  }, [value, onScore]);
 
   const score = strength ? Math.min(4, Math.max(0, strength.score)) : 0;
   const label = strength ? LABELS[score] : "";

@@ -50,7 +50,7 @@ const HISTORY_CAP: usize = 10;
 /// for an insertion-ordered one, so two devices that built the same record by
 /// different routes would compute different strings and the tie-break would
 /// stop being reproducible.
-pub(crate) fn canonical(e: &Entry) -> String {
+fn canonical(e: &Entry) -> String {
     let mut value = serde_json::to_value(e).expect("entry serialization");
     if let Some(obj) = value.as_object_mut() {
         obj.remove("history");
@@ -64,7 +64,7 @@ pub(crate) fn canonical(e: &Entry) -> String {
 /// A total order over content, so two devices comparing the same pair cannot
 /// disagree. `updated_at` is a plain `u64` and not an `Option`, unlike the
 /// envelope's, because a live record always carries one.
-pub(crate) fn entry_key(e: &Entry) -> (u64, String) {
+fn entry_key(e: &Entry) -> (u64, String) {
     (e.updated_at, canonical(e))
 }
 
@@ -135,23 +135,10 @@ fn dedupe_and_cap(versions: Vec<EntryVersion>) -> Vec<EntryVersion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::test_rng::xorshift;
     use crate::modules::vault::model::{CustomField, EntryUrl, MatchMode};
 
     const CHARS: &[u8] = b"abcdefghij";
-
-    /// xorshift64* deterministic fill, seeded per test, as in
-    /// `src-tauri/src/modules/generator.rs`.
-    fn xorshift(seed: u64) -> impl FnMut(&mut [u8]) {
-        let mut state = seed | 1;
-        move |buf: &mut [u8]| {
-            for slot in buf.iter_mut() {
-                state ^= state >> 12;
-                state ^= state << 25;
-                state ^= state >> 27;
-                *slot = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
-            }
-        }
-    }
 
     fn text(draw: &mut impl FnMut(u64) -> u64, max_len: u64) -> String {
         let len = draw(max_len + 1);

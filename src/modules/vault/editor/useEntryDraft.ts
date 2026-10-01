@@ -106,7 +106,7 @@ export function useEntryDraft(request: EditorRequest | null, onClose: () => void
         entries: current.entries,
         scope: current.scope,
         tagFilter: current.tagFilter,
-        searchIds: current.searchIds === null ? null : new Set(current.searchIds),
+        searchIds: current.searchIds,
         now: Date.now(),
       });
       // A create into another group (or a move) must not land off screen.

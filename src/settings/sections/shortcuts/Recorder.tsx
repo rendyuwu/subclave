@@ -1,4 +1,4 @@
-import { canonicalKeyFromEvent, type KeyBinding } from "@/modules/shortcuts/shortcuts";
+import { canonicalKey, type KeyBinding } from "@/modules/shortcuts/shortcuts";
 import { useEffect, useRef } from "react";
 
 export function Recorder({
@@ -38,7 +38,7 @@ export function Recorder({
       // Record the canonical, layout-independent key. Option+Z on macOS or
       // Ctrl+T on a Cyrillic layout would otherwise store the glyph and never re-fire.
       onRecordRef.current({
-        key: canonicalKeyFromEvent(e),
+        key: canonicalKey(e),
         ctrl: e.ctrlKey,
         shift: e.shiftKey,
         alt: e.altKey,

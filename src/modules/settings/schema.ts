@@ -75,20 +75,6 @@ export function normalizeBrandColor(value: string | undefined | null): string {
 }
 
 export const STORE_PATH = "subclave-settings.json";
-export const KEY_THEME = "theme";
-export const KEY_AUTOSTART = "autostart";
-export const KEY_RESTORE_WINDOW = "restoreWindowState";
-export const KEY_SHORTCUTS = "shortcuts";
-export const KEY_BRAND_COLOR = "brandColor";
-export const KEY_CUSTOM_THEME_ENABLED = "customThemeEnabled";
-export const KEY_CUSTOM_THEME = "customTheme";
-export const KEY_APP_OPACITY = "appOpacity";
-export const KEY_USER_THEME_PRESETS = "userThemePresets";
-export const KEY_AUTO_LOCK_MINUTES = "autoLockMinutes";
-export const KEY_CLIPBOARD_CLEAR_SECONDS = "clipboardClearSeconds";
-export const KEY_LOCK_ON_MINIMIZE = "lockOnMinimize";
-export const KEY_CLOSE_TO_TRAY = "closeToTray";
-export const KEY_GENERATOR = "generator";
 
 export const APP_OPACITY_DEFAULT = 1;
 // 0 = fully transparent (app dissolves into the wallpaper / desktop), 1 = solid.
@@ -129,27 +115,27 @@ export const DEFAULT_PREFERENCES: Preferences = {
 
 export type PrefKey = keyof Preferences;
 
-// One entry per PrefKey. `satisfies Record<PrefKey, string>` turns a forgotten
-// key into a COMPILE error instead of a silently-dropped cross-window update -
-// a missing entry here was the documented root cause of the opacity/preset
-// cross-window bugs (appOpacity + userThemePresets were the entries that got
-// dropped). The reverse lookup the listeners need is derived below.
+// The one place a preference's on-disk key is written down. `satisfies
+// Record<PrefKey, string>` turns a forgotten key into a COMPILE error instead
+// of a silently-dropped cross-window update - a missing entry here was the
+// documented root cause of the opacity/preset cross-window bugs. The reverse
+// lookup the listeners need is derived below.
 export const PREF_STORE_KEYS = {
-  theme: KEY_THEME,
-  autostart: KEY_AUTOSTART,
-  restoreWindowState: KEY_RESTORE_WINDOW,
-  shortcuts: KEY_SHORTCUTS,
-  brandColor: KEY_BRAND_COLOR,
-  customThemeEnabled: KEY_CUSTOM_THEME_ENABLED,
-  customTheme: KEY_CUSTOM_THEME,
+  theme: "theme",
+  autostart: "autostart",
+  restoreWindowState: "restoreWindowState",
+  shortcuts: "shortcuts",
+  brandColor: "brandColor",
+  customThemeEnabled: "customThemeEnabled",
+  customTheme: "customTheme",
   // Written from the Settings window, consumed live by the main window.
-  appOpacity: KEY_APP_OPACITY,
-  userThemePresets: KEY_USER_THEME_PRESETS,
-  autoLockMinutes: KEY_AUTO_LOCK_MINUTES,
-  clipboardClearSeconds: KEY_CLIPBOARD_CLEAR_SECONDS,
-  lockOnMinimize: KEY_LOCK_ON_MINIMIZE,
-  closeToTray: KEY_CLOSE_TO_TRAY,
-  generator: KEY_GENERATOR,
+  appOpacity: "appOpacity",
+  userThemePresets: "userThemePresets",
+  autoLockMinutes: "autoLockMinutes",
+  clipboardClearSeconds: "clipboardClearSeconds",
+  lockOnMinimize: "lockOnMinimize",
+  closeToTray: "closeToTray",
+  generator: "generator",
 } satisfies Record<PrefKey, string>;
 
 export function clampOpacity(value: number): number {

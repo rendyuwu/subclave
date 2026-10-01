@@ -16,6 +16,20 @@ use crate::modules::vault::model::{Entry, Group, Tombstone, TombstoneKind, Vault
 // Payload to envelopes
 // ---------------------------------------------------------------------------
 
+/// The stored shape of one slot. `record` is `None` for a tombstone, which
+/// carries no record and reads as `deleted`.
+fn envelope(kind: &str, id: &str, updated_at: u64, record: Option<Value>) -> Envelope {
+    Envelope {
+        v: WIRE_VERSION,
+        kind: kind.to_string(),
+        id: id.to_string(),
+        updated_at: Some(updated_at),
+        device: String::new(),
+        deleted: record.is_none(),
+        record: record.unwrap_or(Value::Null),
+    }
+}
+
 /// The record as it sits in the payload, device-local fields included.
 ///
 /// NOT STRIPPED, and that is what the merge expects: `model::merge` builds its
@@ -25,42 +39,29 @@ use crate::modules::vault::model::{Entry, Group, Tombstone, TombstoneKind, Vault
 /// changed. The strip that matters happens on PUBLISH (`seal_envelope`) and on
 /// a merged envelope before it is compared against a remote copy.
 fn entry_envelope(entry: &Entry) -> Envelope {
-    Envelope {
-        v: WIRE_VERSION,
-        kind: ENTRY_KIND.to_string(),
-        id: entry.id.clone(),
-        updated_at: Some(entry.updated_at),
-        device: String::new(),
-        deleted: false,
-        record: serde_json::to_value(entry).expect("entry serialization"),
-    }
+    envelope(
+        ENTRY_KIND,
+        &entry.id,
+        entry.updated_at,
+        Some(serde_json::to_value(entry).expect("entry serialization")),
+    )
 }
 
 fn group_envelope(group: &Group) -> Envelope {
-    Envelope {
-        v: WIRE_VERSION,
-        kind: GROUP_KIND.to_string(),
-        id: group.id.clone(),
-        updated_at: Some(group.updated_at),
-        device: String::new(),
-        deleted: false,
-        record: serde_json::to_value(group).expect("group serialization"),
-    }
+    envelope(
+        GROUP_KIND,
+        &group.id,
+        group.updated_at,
+        Some(serde_json::to_value(group).expect("group serialization")),
+    )
 }
 
 fn tombstone_envelope(tombstone: &Tombstone) -> Envelope {
-    Envelope {
-        v: WIRE_VERSION,
-        kind: match tombstone.kind {
-            TombstoneKind::Entry => ENTRY_KIND.to_string(),
-            TombstoneKind::Group => GROUP_KIND.to_string(),
-        },
-        id: tombstone.id.clone(),
-        updated_at: Some(tombstone.deleted_at),
-        device: String::new(),
-        deleted: true,
-        record: Value::Null,
-    }
+    let kind = match tombstone.kind {
+        TombstoneKind::Entry => ENTRY_KIND,
+        TombstoneKind::Group => GROUP_KIND,
+    };
+    envelope(kind, &tombstone.id, tombstone.deleted_at, None)
 }
 
 /// The stored shape of one slot, tombstone included and regardless of age.
@@ -112,7 +113,7 @@ pub fn locals_from_payload(payload: &VaultPayload, now: u64) -> Vec<Envelope> {
 
 /// The stored shape of one slot for the merge, with expired tombstones reading
 /// as absent so this view matches [`locals_from_payload`].
-pub fn local_envelope(payload: &VaultPayload, kind: &str, id: &str, now: u64) -> Option<Envelope> {
+fn local_envelope(payload: &VaultPayload, kind: &str, id: &str, now: u64) -> Option<Envelope> {
     let envelope = envelope_of_slot(payload, kind, id)?;
     if envelope.deleted {
         let deleted_at = envelope.updated_at.unwrap_or(0);
@@ -156,16 +157,11 @@ pub fn take_dirty_envelopes(
     (envelopes, etags)
 }
 
-fn remove_entry(payload: &mut VaultPayload, id: &str) -> bool {
-    let before = payload.entries.len();
-    payload.entries.retain(|e| e.id != id);
-    payload.entries.len() != before
-}
-
-fn remove_group(payload: &mut VaultPayload, id: &str) -> bool {
-    let before = payload.groups.len();
-    payload.groups.retain(|g| g.id != id);
-    payload.groups.len() != before
+/// Drop the record `id` from `records`, answering whether it was there.
+fn remove<T>(records: &mut Vec<T>, id: &str, id_of: impl Fn(&T) -> &str) -> bool {
+    let before = records.len();
+    records.retain(|record| id_of(record) != id);
+    records.len() != before
 }
 
 /// Store one reconciled envelope into the payload.
@@ -174,7 +170,7 @@ fn remove_group(payload: &mut VaultPayload, id: &str) -> bool {
 /// live entry whose record does not deserialize, or an unknown kind); the
 /// caller quarantines it. `Ok(false)` = a tombstone for a record that was not
 /// there; `Ok(true)` = the stored form changed.
-pub fn write_envelope(
+fn write_envelope(
     payload: &mut VaultPayload,
     envelope: &Envelope,
     now: u64,
@@ -192,8 +188,8 @@ pub fn write_envelope(
             TombstoneKind::Group
         };
         let removed = match kind {
-            TombstoneKind::Entry => remove_entry(payload, &envelope.id),
-            TombstoneKind::Group => remove_group(payload, &envelope.id),
+            TombstoneKind::Entry => remove(&mut payload.entries, &envelope.id, |e| &e.id),
+            TombstoneKind::Group => remove(&mut payload.groups, &envelope.id, |g| &g.id),
         };
         payload.tombstones.retain(|t| t.id != envelope.id);
         payload.tombstones.push(Tombstone {

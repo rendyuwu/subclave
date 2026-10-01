@@ -215,7 +215,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       entries: state.entries,
       scope: state.scope,
       tagFilter: state.tagFilter,
-      searchIds: state.searchIds === null ? null : new Set(state.searchIds),
+      searchIds: state.searchIds,
       now: Date.now(),
     });
     if (visible.some((entry) => entry.id === state.selectedId)) return;

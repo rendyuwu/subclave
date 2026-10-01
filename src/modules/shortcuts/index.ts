@@ -1,5 +1,4 @@
 export {
-  parseKeybindingString,
   SHORTCUTS,
   SHORTCUT_GROUPS,
   type KeyBinding,

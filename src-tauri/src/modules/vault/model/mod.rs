@@ -18,6 +18,6 @@ pub use records::{
     TombstoneKind, VaultPayload, VersionReason, BROWSER_ID, ROOT_ID, TRASH_ID,
 };
 pub use views::{
-    detail_of, host_of, summary_of, DetailCustomField, DetailVersion, EntryDetail, EntrySummary,
+    detail_of, summary_of, DetailCustomField, DetailVersion, EntryDetail, EntrySummary,
 };
 pub(crate) use views::{version_changed_names, version_of};

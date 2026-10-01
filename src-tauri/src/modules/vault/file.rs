@@ -18,7 +18,7 @@ use crate::modules::vault::kdf::{check_params, derive_key, Argon2Params};
 use crate::modules::vault::model::VaultPayload;
 
 pub const VAULT_FILE_NAME: &str = "subclave-vault.json";
-pub const FORMAT: &str = "subclave-vault";
+const FORMAT: &str = "subclave-vault";
 pub const FORMAT_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -115,7 +115,7 @@ pub fn open_file(file: &VaultFile, password: &str) -> Result<OpenVault, String> 
 /// Lenient peek of just `format` and `v`. Used by [`load_vault`] so a
 /// newer-version file with a changed shape still answers the
 /// newer-Subclave refusal instead of falling through to the `.bak`.
-pub fn peek_version(bytes: &[u8]) -> Option<(String, u32)> {
+fn peek_version(bytes: &[u8]) -> Option<(String, u32)> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let format = value.get("format")?.as_str()?.to_string();
     let v = value.get("v")?.as_u64()?;

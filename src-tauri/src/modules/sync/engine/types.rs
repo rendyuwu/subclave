@@ -134,9 +134,19 @@ pub struct Applied {
 pub struct SyncConfigArg {
     pub provider: String,
     pub endpoint: String,
+    /// S3's alone. `#[serde(default)]` so a WebDAV caller does not have to send
+    /// an S3 field `provider_config` ignores. The S3 form still requires it
+    /// (`connectionFieldsReady` in `src/modules/sync/types.ts`) and
+    /// `provider_config` still puts it into the JSON `S3Config` deserializes.
+    #[serde(default)]
     pub region: String,
+    /// S3's alone, by the same default as the `region` field.
+    #[serde(default)]
     pub bucket: String,
     pub prefix: String,
+    /// A stored user toggle, and S3's alone; `false` is the safe default for a
+    /// backend with no conditional write to turn on.
+    #[serde(default)]
     pub cas: bool,
 }
 

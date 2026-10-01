@@ -67,7 +67,7 @@ pub struct DetailVersion {
 
 /// Host of a URL, lowercased. Full public-suffix matching belongs to the
 /// browser-integration matcher; this is only the summary's `primaryHost`.
-pub fn host_of(url: &str) -> Option<String> {
+fn host_of(url: &str) -> Option<String> {
     Url::parse(url).ok()?.host_str().map(|h| h.to_lowercase())
 }
 
@@ -90,18 +90,6 @@ pub fn summary_of(entry: &Entry) -> EntrySummary {
     }
 }
 
-/// Content fields a history version carries. Order is the report order too:
-/// [`detail_of`] reports changed names sorted by this list's position.
-const VERSION_FIELDS: [&str; 7] = [
-    "title",
-    "username",
-    "password",
-    "urls",
-    "notes",
-    "totp",
-    "customFields",
-];
-
 /// The content snapshot of one entry, for a history version or for the
 /// current state the newest version compares against.
 pub(crate) fn version_of(e: &Entry, reason: VersionReason) -> EntryVersion {
@@ -118,25 +106,28 @@ pub(crate) fn version_of(e: &Entry, reason: VersionReason) -> EntryVersion {
     }
 }
 
+/// Content fields a history version carries, in report order: [`detail_of`]
+/// lists changed names in this order.
 pub(crate) fn version_changed_names(
     current: &EntryVersion,
     previous: &EntryVersion,
 ) -> Vec<String> {
-    let differs = [
-        current.title != previous.title,
-        current.username != previous.username,
-        current.password != previous.password,
-        current.urls != previous.urls,
-        current.notes != previous.notes,
-        current.totp != previous.totp,
-        current.custom_fields != previous.custom_fields,
-    ];
-    VERSION_FIELDS
-        .iter()
-        .zip(differs)
-        .filter(|(_, d)| *d)
-        .map(|(name, _)| name.to_string())
-        .collect()
+    [
+        ("title", current.title != previous.title),
+        ("username", current.username != previous.username),
+        ("password", current.password != previous.password),
+        ("urls", current.urls != previous.urls),
+        ("notes", current.notes != previous.notes),
+        ("totp", current.totp != previous.totp),
+        (
+            "customFields",
+            current.custom_fields != previous.custom_fields,
+        ),
+    ]
+    .iter()
+    .filter(|(_, differs)| *differs)
+    .map(|(name, _)| name.to_string())
+    .collect()
 }
 
 pub fn detail_of(entry: &Entry) -> EntryDetail {

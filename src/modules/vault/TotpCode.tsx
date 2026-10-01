@@ -1,12 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
+import { groupDigits } from "@/lib/format";
 import { totpCode } from "./ipc";
 import type { TotpCode as TotpCodeValue } from "./types";
-
-/** Space the digits into readable groups of three. */
-function groupDigits(code: string): string {
-  return code.replace(/(.{3})/g, "$1 ").trim();
-}
 
 const RING_RADIUS = 8;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;

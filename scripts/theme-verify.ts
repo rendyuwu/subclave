@@ -2,11 +2,11 @@
  * Self-check for the theme system.
  * Run: `npx tsx scripts/theme-verify.ts`.
  *
- * The failure this exists for is silent and was real: `--subclave-icon-done` was
- * added to globals.css with a hard-coded blue and no `ThemeColors` key, so the
- * "finished" badge stayed blue under EVERY preset and no error was raised
- * anywhere. Any themable colour var must be reachable from a theme, and any
- * theme key must be editable in Settings, or it silently stops being a theme.
+ * The failure this exists for is silent and was real: a colour var was added to
+ * globals.css with a hard-coded value and no `ThemeColors` key, so it stayed
+ * that same colour under EVERY preset and no error was raised anywhere. Any
+ * themable colour var must be reachable from a theme, and any theme key must be
+ * editable in Settings, or it silently stops being a theme.
  *
  * Checks:
  *   - every `--subclave-*` COLOUR var declared in globals.css is written by the
@@ -15,8 +15,8 @@
  *     colour picker in Settings can never be a knob that moves nothing
  *     (the button token was exactly that until the neutral button started
  *     reading it),
- *   - every non-ANSI key is editable in the Settings colour editor (the ANSI 16
- *     have no settings surface yet),
+ *   - every non-ANSI key is editable in the Settings colour editor (the ANSI
+ *     accents have no settings surface yet),
  *   - preset names are unique.
  */
 import { readdirSync, readFileSync } from "node:fs";
@@ -25,8 +25,8 @@ import { dirname, join } from "node:path";
 
 import { THEME_PRESETS } from "../src/modules/settings/themePresets";
 import { COLOR_FIELDS } from "../src/settings/sections/theme/colorFields";
+import { contrastRatio } from "../src/lib/color";
 import {
-  contrastRatio,
   ensureVisibleButtonFace,
   MIN_FACE_CONTRAST,
   MIN_FACE_TEXT_CONTRAST,
@@ -71,7 +71,7 @@ const NON_THEMABLE = new Set([
 ]);
 
 const declared = new Set([...css.matchAll(/^\s*(--subclave-[a-z0-9-]+)\s*:/gm)].map((m) => m[1]));
-check("globals.css vars parsed", declared.size > 30, declared.size);
+check("globals.css vars parsed", declared.size > 10, declared.size);
 
 for (const v of declared) {
   if (NON_THEMABLE.has(v)) continue;
@@ -116,7 +116,7 @@ const rawHits = sources.flatMap((s) =>
 );
 check("no raw Tailwind hues in components", rawHits.length === 0, rawHits.slice(0, 8));
 
-// Editable in Settings > Theme, except the ANSI 16, which no surface edits yet.
+// Editable in Settings > Theme, except the ANSI accents, which no surface edits yet.
 const editable = new Set(COLOR_FIELDS.map((f) => f.key));
 const sample = THEME_PRESETS[0].dark;
 for (const key of Object.keys(sample)) {

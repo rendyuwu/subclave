@@ -82,26 +82,4 @@ export function runExemptionControls(): void {
     "a bare self-reference with no other file of that name is NOT flagged",
     kindsOf("src/lib/storeRecovery.ts", "// as `storeRecovery.ts` does above\n") === "",
   );
-
-  // The tracker window, which is now the comment rather than a character count.
-  // The project name sits on the line ABOVE the number inside one block comment,
-  // which a 90-character window did not reach.
-  check(
-    "a project named earlier in the same block comment still qualifies its number",
-    kindsOf(
-      "src/x.ts",
-      "const a = 1;\n/*\n * a known issue (xterm.js\n * #4054) dims the glyphs\n */\n",
-    ) === "",
-  );
-  check(
-    "the same number with no project anywhere in that comment IS flagged",
-    kindsOf("src/x.ts", "const a = 1;\n/*\n * a known issue\n * (#4054) dims the glyphs\n */\n") ===
-      "bare-tracker",
-  );
-  // And the attached form passes for ANY word, which is why the tracker list needs
-  // no entry for a project only ever cited that way.
-  check(
-    "an attached tracker reference passes without the project being on the list",
-    kindsOf("src/x.ts", "const a = 1; // torn by a power cut (some-project#3085)\n") === "",
-  );
 }

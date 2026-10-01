@@ -40,7 +40,7 @@ impl Default for GeneratorOptions {
     }
 }
 
-pub fn charset(options: &GeneratorOptions) -> Result<Vec<char>, String> {
+fn charset(options: &GeneratorOptions) -> Result<Vec<char>, String> {
     let mut set: Vec<char> = Vec::new();
     if options.lower {
         set.extend('a'..='z');
@@ -167,18 +167,7 @@ pub async fn gen_password(options: GeneratorOptions) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    /// xorshift64* deterministic fill, seeded per test.
-    fn xorshift(seed: u64) -> impl FnMut(&mut [u8]) {
-        let mut state = seed | 1;
-        move |buf: &mut [u8]| {
-            for slot in buf.iter_mut() {
-                state ^= state >> 12;
-                state ^= state << 25;
-                state ^= state >> 27;
-                *slot = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
-            }
-        }
-    }
+    use crate::modules::test_rng::xorshift;
 
     fn defaults() -> GeneratorOptions {
         GeneratorOptions::default()

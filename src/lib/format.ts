@@ -29,3 +29,8 @@ export function formatRelativeTime(at: number, now: number = Date.now()): string
   if (magnitude < 86_400) return formatter.format(Math.round(seconds / 3600), "hour");
   return formatter.format(Math.round(seconds / 86_400), "day");
 }
+
+/** A digit string spaced into readable groups of three, e.g. "123 456". */
+export function groupDigits(code: string): string {
+  return code.replace(/(.{3})(?=.)/g, "$1 ");
+}

@@ -25,23 +25,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-/// What a backend can do that the layer above has to branch on.
-///
-/// One field today, and a struct rather than a bare `bool` so the second
-/// capability is an added field rather than a changed signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Caps {
-    /// Whether a conditional write is honoured, so the caller may use
-    /// compare-and-swap instead of last-write-wins.
-    ///
-    /// A STORED USER TOGGLE, not a probe. Probing would mean writing a
-    /// throwaway object into the user's bucket during setup, and a rejection
-    /// can come back for reasons other than the one being probed. Set wrong it
-    /// degrades to last-write-wins, which is the normal path for backends that
-    /// have no conditional write at all; it does not lose data.
-    pub cas: bool,
-}
-
 /// One object's bytes and the etag the remote gave them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
@@ -175,7 +158,21 @@ pub trait SyncProvider: Send + Sync {
     /// A stable id, matching the one [`build`] dispatches on.
     fn id(&self) -> &'static str;
 
-    fn capabilities(&self) -> Caps;
+    /// Whether this backend honours a conditional write, so the caller may use
+    /// compare-and-swap instead of last-write-wins.
+    ///
+    /// `false` UNLESS A BACKEND SAYS OTHERWISE, which is the reading that
+    /// cannot lose data: a condition that is not honoured degrades to
+    /// last-write-wins, the normal path for a backend with no conditional write
+    /// at all, and the merge recovers the overwritten copy on the next pull.
+    ///
+    /// THE S3 BACKEND ANSWERS FROM A STORED USER TOGGLE rather than a probe.
+    /// Probing would mean writing a throwaway object into the user's bucket
+    /// during setup, and a rejection can come back for reasons other than the
+    /// one being probed.
+    fn cas(&self) -> bool {
+        false
+    }
 
     /// The object at `key`, or `Ok(None)` when there is none.
     ///
@@ -191,9 +188,9 @@ pub trait SyncProvider: Send + Sync {
     /// Store `bytes` at `key` and answer with the new etag.
     ///
     /// `if_match` asks for a conditional write. It is HONOURED ONLY WHEN
-    /// [`Caps::cas`] is set, so a caller may pass it unconditionally and a
-    /// backend that cannot do it degrades to last-write-wins rather than
-    /// failing.
+    /// [`cas`](SyncProvider::cas) answers `true`, so a caller may pass it
+    /// unconditionally and a backend that cannot do it degrades to
+    /// last-write-wins rather than failing.
     ///
     /// A missing key IS an error here - see [`ProviderError::NotFound`] - and
     /// that asymmetry with `get` is deliberate.
@@ -288,7 +285,7 @@ mod tests {
     fn a_known_id_with_a_good_config_builds_something_behind_the_trait() {
         let provider = build("s3", s3_config()).expect("s3 builds");
         assert_eq!(provider.id(), "s3");
-        assert!(provider.capabilities().cas);
+        assert!(provider.cas());
     }
 
     fn webdav_config() -> Value {
@@ -305,7 +302,7 @@ mod tests {
         assert_eq!(provider.id(), "webdav");
         // A CONSTANT, not a toggle the user can set: the protocol gives no
         // guarantee for the user to report.
-        assert!(!provider.capabilities().cas);
+        assert!(!provider.cas());
     }
 
     #[test]

@@ -8,8 +8,13 @@
 import { readdirSync, statSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
 
-import { UPSTREAM_TRACKERS } from "./allowlist";
 import { check, ROOT, sortedSet } from "./report";
+
+/**
+ * Upstream project names that are spelled like a file, and so are never read as
+ * one. `xterm.js` is the live example.
+ */
+const PROJECT_NAMES = ["xterm.js"];
 
 /**
  * Every file a clone would have, by walking the checkout.
@@ -94,10 +99,8 @@ export function notAFileSpelling(s: string): string | null {
   // `xterm.js` is one. Found by writing this file's own prose: backticking the
   // project name produced a `dead-path` finding against text that is plainly
   // correct, and a comment legitimately naming that project in backticks would
-  // have hit the same thing. Read off `UPSTREAM_TRACKERS`, which is already this
-  // check's register of upstream project names, so the two cannot disagree and
-  // adding a project does not also require remembering this.
-  if (UPSTREAM_TRACKERS.includes(s)) return "project-name";
+  // have hit the same thing.
+  if (PROJECT_NAMES.includes(s)) return "project-name";
   if (!FILE_EXT.test(s)) return "no-extension";
   if (/^\.[A-Za-z]{1,2}\.[A-Za-z]+$/.test(s)) return "bare-extension";
   if (!/[A-Za-z0-9_)\]]\.[A-Za-z0-9]+$/.test(s)) return "bare-extension";

@@ -1,32 +1,22 @@
-import { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { loadPreferences, onPreferencesChange } from "@/modules/settings/load";
+import { createContext, use, useCallback, useEffect, useMemo, useState } from "react";
+import { readShadow, writeShadow } from "@/lib/fastPath";
+import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
   setAppOpacity,
   setCustomThemeEnabled,
   setTheme as persistTheme,
 } from "@/modules/settings/mutations";
 import type { ThemePref } from "@/modules/settings/schema";
-import {
-  applyBrandColor,
-  applyBrandColorFastPath,
-  readBrandShadow,
-} from "@/modules/settings/brandColor";
+import { applyBrandColor, applyBrandColorFastPath } from "@/modules/settings/brandColor";
 import {
   applyAppOpacity,
   applyAppOpacityPreviewCss,
   onAppOpacityPreview,
 } from "@/modules/settings/appOpacity";
 import { applyBackground, applyCustomTheme } from "@/modules/settings/theme/apply";
-import { normalizeCustomTheme, type CustomTheme } from "@/modules/settings/theme/model";
 import { onWallpaperPreview } from "@/modules/settings/theme/preview";
-import { DEFAULT_CUSTOM_THEME } from "@/modules/settings/themePresets";
 
 export type Theme = ThemePref;
-
-type ThemeProviderProps = {
-  children: React.ReactNode;
-  defaultTheme?: Theme;
-};
 
 type ThemeProviderState = {
   theme: Theme;
@@ -37,132 +27,95 @@ type ThemeProviderState = {
 const ThemeProviderContext = createContext<ThemeProviderState | null>(null);
 
 // Synchronous fast-path so the initial paint isn't unstyled. The persistent
-// preference (in the settings store file) overwrites this on mount; we keep a
-// localStorage shadow of the *last applied* theme just for first-paint fidelity.
+// preference (in the settings store file) overwrites this as soon as the store
+// hydrates; we keep a localStorage shadow of the *last applied* theme just for
+// first-paint fidelity.
 const FAST_PATH_KEY = "subclave-ui-theme-shadow";
 
-function readFastTheme(fallback: Theme): Theme {
-  if (typeof window === "undefined") return fallback;
-  const v = window.localStorage.getItem(FAST_PATH_KEY);
-  return v === "dark" || v === "light" || v === "system" ? v : fallback;
+function readFastTheme(): Theme {
+  const v = readShadow(FAST_PATH_KEY);
+  return v === "dark" || v === "light" || v === "system" ? v : "system";
 }
 
-function writeFastTheme(t: Theme): void {
-  try {
-    window.localStorage.setItem(FAST_PATH_KEY, t);
-  } catch {
-    // ignore
-  }
-}
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const hydrated = usePreferencesStore((s) => s.hydrated);
+  const storedTheme = usePreferencesStore((s) => s.theme);
+  const brandColor = usePreferencesStore((s) => s.brandColor);
+  const customThemeEnabled = usePreferencesStore((s) => s.customThemeEnabled);
+  const customTheme = usePreferencesStore((s) => s.customTheme);
+  const appOpacity = usePreferencesStore((s) => s.appOpacity);
 
-export function ThemeProvider({ children, defaultTheme = "system" }: ThemeProviderProps) {
-  const [theme, setThemeState] = useState<Theme>(() => readFastTheme(defaultTheme));
+  // Before the store hydrates it still holds the defaults, so paint from the
+  // shadow. Every window runs the store's `init()` (App / SettingsApp), which
+  // keeps this provider in sync with writes from the other window.
+  const [fastTheme] = useState<Theme>(readFastTheme);
+  const theme = hydrated ? storedTheme : fastTheme;
+
   const [systemDark, setSystemDark] = useState<boolean>(() =>
     typeof window === "undefined"
       ? true
       : window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
 
-  // Track the latest known custom-theme state so brand/theme toggles can
-  // re-resolve which layer should be active without re-fetching the store.
-  const customStateRef = useRef<{ enabled: boolean; theme: CustomTheme | null }>({
-    enabled: false,
-    theme: null,
-  });
-
-  const reconcileLayers = useCallback((brand: string) => {
-    if (customStateRef.current.enabled && customStateRef.current.theme) {
-      applyCustomTheme(customStateRef.current.theme);
-    } else {
-      // Order matters: clear any leftover custom-theme overrides first so
-      // `clearCssVars()` does not wipe the `--primary` / `--ring` / `--accent`
-      // values that `applyBrandColor` is about to set.
-      applyCustomTheme(null);
-      applyBrandColor(brand);
-    }
-  }, []);
-
-  // Hydrate from the persistent store (cross-window source of truth).
   useEffect(() => {
-    let alive = true;
-    loadPreferences()
-      .then((p) => {
-        if (!alive) return;
-        setThemeState(p.theme);
-        writeFastTheme(p.theme);
-        customStateRef.current = {
-          enabled: p.customThemeEnabled,
-          theme: p.customTheme,
-        };
-        reconcileLayers(p.brandColor);
-        applyAppOpacity(p.appOpacity);
-        // Wallpaper image is independent of the colour theme so it always
-        // paints when set (won't vanish when the custom theme is off).
-        applyBackground(p.customTheme.background);
-        // Migration: a wallpaper only shows through translucent surfaces, and
-        // it only paints while the custom theme is on. The unified opacity
-        // defaults to 1 (solid), so a wallpaper saved before the unify would
-        // silently vanish. Main window only: if one is enabled, make sure the
-        // custom theme is on and opacity drops below solid so it reappears.
-        // Persisted, so it self-corrects just once.
-        if (
-          document.getElementById("root") !== null &&
-          p.customTheme.background.enabled &&
-          !!p.customTheme.background.dataUrl
-        ) {
-          if (!p.customThemeEnabled) void setCustomThemeEnabled(true);
-          if (p.appOpacity >= 1) void setAppOpacity(0.5);
-        }
-      })
-      .catch((err) => {
-        console.error("ThemeProvider: loadPreferences failed", err);
-      });
-    const unlistenP = onPreferencesChange((key, value) => {
-      if (key === "theme" && (value === "system" || value === "light" || value === "dark")) {
-        setThemeState(value);
-        writeFastTheme(value);
-      } else if (key === "brandColor" && typeof value === "string") {
-        reconcileLayers(value);
-      } else if (key === "customThemeEnabled" && typeof value === "boolean") {
-        customStateRef.current = { ...customStateRef.current, enabled: value };
-        // Reconcile synchronously: the disable/fallback branch only needs the
-        // brand hex, which is mirrored in localStorage by applyBrandColor and
-        // kept current by this same listener - so read the shadow instead of a
-        // full loadPreferences() IPC roundtrip on every toggle.
-        reconcileLayers(readBrandShadow());
-      } else if (key === "customTheme" && value && typeof value === "object") {
-        const normalized = normalizeCustomTheme(value, DEFAULT_CUSTOM_THEME);
-        customStateRef.current = {
-          ...customStateRef.current,
-          theme: normalized,
-        };
-        if (customStateRef.current.enabled) applyCustomTheme(normalized);
-        // Repaint the wallpaper regardless of whether the custom theme is on.
-        applyBackground(normalized.background);
-      } else if (key === "appOpacity" && typeof value === "number") {
-        applyAppOpacity(value);
-      }
-    });
-    // Live drag preview from the settings opacity slider (transient, applies
-    // CSS only — no store write, so the slider thumb tracks smoothly and we
-    // don't churn the localStorage shadow on every tick).
-    const unlistenPreview = onAppOpacityPreview((v) => applyAppOpacityPreviewCss(v));
-    // Live drag preview for the wallpaper blur/darken/opacity sliders. The
-    // settings window has no wallpaper layer of its own, so it broadcasts just
-    // the numbers; we merge them onto the wallpaper we already hold (no image
-    // blob crosses IPC) and re-run the same applyBackground path the commit uses.
+    if (hydrated) writeShadow(FAST_PATH_KEY, storedTheme);
+  }, [hydrated, storedTheme]);
+
+  // Colour layers. A custom theme owns the palette; otherwise the brand hex
+  // re-tints the base. Order matters: clear any leftover custom-theme overrides
+  // first so `clearCssVars()` does not wipe the `--primary` / `--ring` /
+  // `--accent` values that `applyBrandColor` is about to set.
+  useEffect(() => {
+    if (!hydrated) return;
+    if (customThemeEnabled) {
+      applyCustomTheme(customTheme);
+    } else {
+      applyCustomTheme(null);
+      applyBrandColor(brandColor);
+    }
+  }, [hydrated, customThemeEnabled, customTheme, brandColor]);
+
+  // Wallpaper image is independent of the colour theme so it always paints when
+  // set (won't vanish when the custom theme is off).
+  useEffect(() => {
+    if (hydrated) applyBackground(customTheme.background);
+  }, [hydrated, customTheme]);
+
+  useEffect(() => {
+    if (hydrated) applyAppOpacity(appOpacity);
+  }, [hydrated, appOpacity]);
+
+  // Migration: a wallpaper only shows through translucent surfaces, and it only
+  // paints while the custom theme is on. The unified opacity defaults to 1
+  // (solid), so a wallpaper saved before the unify would silently vanish. Main
+  // window only: if one is enabled, make sure the custom theme is on and
+  // opacity drops below solid so it reappears. Persisted, so it self-corrects
+  // just once, on the hydration that follows launch.
+  useEffect(() => {
+    if (!hydrated) return;
+    if (document.getElementById("root") === null) return;
+    const prefs = usePreferencesStore.getState();
+    if (!prefs.customTheme.background.enabled || !prefs.customTheme.background.dataUrl) return;
+    if (!prefs.customThemeEnabled) void setCustomThemeEnabled(true);
+    if (prefs.appOpacity >= 1) void setAppOpacity(0.5);
+  }, [hydrated]);
+
+  // Live drag previews from the settings window: transient, applies CSS only -
+  // no store write, so the slider thumb tracks smoothly. The settings window
+  // has no wallpaper layer of its own, so it broadcasts just the numbers; we
+  // merge them onto the wallpaper we already hold (no image blob crosses IPC)
+  // and re-run the same applyBackground path the commit uses.
+  useEffect(() => {
+    const unlistenOpacity = onAppOpacityPreview((v) => applyAppOpacityPreviewCss(v));
     const unlistenWallpaper = onWallpaperPreview((p) => {
-      const bg = customStateRef.current.theme?.background;
-      if (!bg) return;
+      const bg = usePreferencesStore.getState().customTheme.background;
       applyBackground({ ...bg, blur: p.blur, darken: p.darken, opacity: p.opacity });
     });
     return () => {
-      alive = false;
-      void unlistenP.then((fn) => fn());
-      void unlistenPreview.then((fn) => fn());
+      void unlistenOpacity.then((fn) => fn());
       void unlistenWallpaper.then((fn) => fn());
     };
-  }, [reconcileLayers]);
+  }, []);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -179,18 +132,18 @@ export function ThemeProvider({ children, defaultTheme = "system" }: ThemeProvid
     root.classList.remove("light", "dark");
     root.classList.add(resolvedTheme);
     // Accent derivation differs per mode, so re-apply on theme flips. When a
-    // custom theme is active it owns the palette and wins; otherwise fall
-    // back to the cached brand hex (cheaper than re-hitting the store).
-    if (customStateRef.current.enabled && customStateRef.current.theme) {
-      applyCustomTheme(customStateRef.current.theme);
-    } else {
-      applyBrandColorFastPath();
-    }
+    // custom theme is active it owns the palette and wins; otherwise fall back
+    // to the cached brand hex (cheaper than re-hitting the store).
+    const prefs = usePreferencesStore.getState();
+    if (prefs.customThemeEnabled) applyCustomTheme(prefs.customTheme);
+    else applyBrandColorFastPath();
   }, [resolvedTheme]);
 
   const setTheme = useCallback((next: Theme) => {
-    setThemeState(next);
-    writeFastTheme(next);
+    // Optimistic: the store only learns the new value after the file write and
+    // its broadcast, which would lag the toggle visibly. The write echoes back
+    // through the same channel and lands on the same value.
+    usePreferencesStore.setState({ theme: next });
     void persistTheme(next);
   }, []);
 

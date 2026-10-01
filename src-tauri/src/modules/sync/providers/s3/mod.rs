@@ -59,7 +59,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 
 use super::http;
-use crate::modules::sync::provider::{Caps, Entry, Object, ProviderError, SyncProvider};
+use crate::modules::sync::provider::{Entry, Object, ProviderError, SyncProvider};
 
 mod build;
 mod classify;
@@ -101,7 +101,7 @@ pub struct S3Config {
     pub region: String,
     pub bucket: String,
     /// Whether this endpoint honours a conditional write. A user toggle, not a
-    /// probe - see `Caps` in `src-tauri/src/modules/sync/provider.rs`.
+    /// probe - see [`SyncProvider::cas`].
     pub cas: bool,
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -139,8 +139,10 @@ impl SyncProvider for S3Provider {
         "s3"
     }
 
-    fn capabilities(&self) -> Caps {
-        Caps { cas: self.cfg.cas }
+    /// The stored user toggle, not a probe. See [`SyncProvider::cas`] for why
+    /// `false` is the safe answer when the user has not turned it on.
+    fn cas(&self) -> bool {
+        self.cfg.cas
     }
 
     fn get<'a>(

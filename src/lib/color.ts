@@ -1,18 +1,19 @@
 /**
- * HEX <-> RGB <-> HSV conversion helpers for the theme color picker.
- *
- * The picker stores HSV locally so dragging through a grey value (s=0 or v=0)
- * doesn't lose the hue. Output to the store is always 6-digit HEX (theme tokens
- * are HEX6, no alpha).
+ * Colour maths shared by the theme picker, the brand-colour applier and the
+ * button-face contrast floors: hex <-> RGB <-> HSV conversion, plus WCAG
+ * relative luminance and contrast ratio.
  */
 
 export const HEX6_RE = /^#[0-9a-fA-F]{6}$/;
 
-export const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
-
+export type Rgb = { r: number; g: number; b: number };
 export type Hsv = { h: number; s: number; v: number };
 
-function hexToRgb(hex: string): { r: number; g: number; b: number } {
+/** Clamp a number to 0..1. */
+export const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+/** Parse a 6-digit hex colour. Anything else reads as black. */
+export function hexToRgb(hex: string): Rgb {
   const h = HEX6_RE.test(hex) ? hex : "#000000";
   return {
     r: parseInt(h.slice(1, 3), 16),
@@ -21,7 +22,7 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
   };
 }
 
-function rgbToHex(r: number, g: number, b: number): string {
+export function rgbToHex({ r, g, b }: Rgb): string {
   const c = (n: number) =>
     Math.max(0, Math.min(255, Math.round(n)))
       .toString(16)
@@ -29,7 +30,7 @@ function rgbToHex(r: number, g: number, b: number): string {
   return `#${c(r)}${c(g)}${c(b)}`;
 }
 
-function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: number } {
+function rgbToHsv(r: number, g: number, b: number): Hsv {
   const rn = r / 255;
   const gn = g / 255;
   const bn = b / 255;
@@ -47,7 +48,7 @@ function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: n
   return { h, s: max === 0 ? 0 : d / max, v: max };
 }
 
-function hsvToRgb(h: number, s: number, v: number): { r: number; g: number; b: number } {
+function hsvToRgb(h: number, s: number, v: number): Rgb {
   const c = v * s;
   const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
   const m = v - c;
@@ -70,5 +71,18 @@ export function hexToHsv(hex: string): Hsv {
 
 export function hsvToHex({ h, s, v }: Hsv): string {
   const { r, g, b } = hsvToRgb(h, s, v);
-  return rgbToHex(r, g, b);
+  return rgbToHex({ r, g, b });
+}
+
+/** sRGB relative luminance per WCAG. */
+export function relLuminance(hex: string): number {
+  return [1, 3, 5]
+    .map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4))
+    .reduce((acc, c, i) => acc + c * [0.2126, 0.7152, 0.0722][i], 0);
+}
+
+export function contrastRatio(a: string, b: string): number {
+  const [hi, lo] = [relLuminance(a), relLuminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
 }

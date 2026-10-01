@@ -1,61 +1,167 @@
-//! The listing scan: the S3 `ListBucketResult` body read by hand.
+//! The listing scan: the S3 `ListBucketResult` body.
 //!
-//! A HAND SCAN AND NOT AN XML CRATE. The grammar consumed here is four element
-//! names in a document the remote generates, and the root element is the
-//! discriminator, so an HTML error page and a legitimately empty bucket cannot
-//! be read as the same thing.
+//! READ WITH `quick-xml`, whose event stream is walked once into a small tree,
+//! so a lookup by element name can be made from anywhere in the document. The
+//! grammar consumed here is four element names in a document the remote
+//! generates, and the root element is the discriminator, so an HTML error page
+//! and a legitimately empty bucket cannot be read as the same thing.
+//!
+//! IT MATCHES ON THE LOCAL NAME, so the server's choice of namespace prefix
+//! does not reach a caller. The ceiling that buys, named: an element from some
+//! other namespace sharing a local name would be read as well, and closing
+//! that means resolving namespaces, which a listing from this service has no
+//! use for.
+
+use quick_xml::events::Event;
+use quick_xml::name::QName;
+use quick_xml::Reader;
 
 use super::super::http::normalize_etag;
 use super::super::sigv4;
 use crate::modules::sync::provider::{Entry, ProviderError};
 
-/// The five predefined XML entities, expanded.
+/// The local name of an element: everything after the last `:` of its
+/// qualified name.
 ///
-/// `&amp;` LAST, or an escaped entity would be double-expanded: a literal
-/// ampersand-l-t written as five characters would come back as a less-than
-/// sign rather than as the four characters it names.
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+/// Cannot fail: the reader borrows the document from a `&str`, so every name it
+/// reports is UTF-8.
+fn local_name<'a>(name: &QName<'a>) -> &'a str {
+    std::str::from_utf8(name.local_name().into_inner())
+        .expect("the reader reported a non-UTF-8 name")
 }
 
-/// The text of the first `tag` element in `xml`.
+/// A parse failure of any kind, in the taxonomy's own terms: the body came from
+/// the remote and a listing this client cannot read is not an empty listing.
+fn malformed<E: std::fmt::Display>(e: E) -> ProviderError {
+    ProviderError::Malformed(format!("the listing did not parse: {e}"))
+}
+
+/// One element of a body, with the text inside it and its children.
+struct Element {
+    /// The LOCAL name, so the server's choice of prefix reaches no caller.
+    name: String,
+    /// The character data between this element's tags, with the predefined
+    /// entities and any character references resolved. Nested elements are in
+    /// `children` and their text is NOT folded in here.
+    text: String,
+    children: Vec<Element>,
+}
+
+impl Element {
+    fn new(name: &str) -> Self {
+        Element {
+            name: name.to_string(),
+            text: String::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// The first element with this local name, at or below this one.
+    fn find(&self, name: &str) -> Option<&Element> {
+        if self.name == name {
+            return Some(self);
+        }
+        self.children.iter().find_map(|child| child.find(name))
+    }
+
+    /// Every element with this local name below this one, in document order.
+    fn all(&self, name: &str) -> Vec<&Element> {
+        let mut out = Vec::new();
+        self.collect(name, &mut out);
+        out
+    }
+
+    fn collect<'a>(&'a self, name: &str, out: &mut Vec<&'a Element>) {
+        for child in &self.children {
+            if child.name == name {
+                out.push(child);
+            }
+            child.collect(name, out);
+        }
+    }
+}
+
+/// Walk `body`'s event stream into one element per node.
+///
+/// The text of an element is the text of the events between its tags, so a
+/// self-closing element and `<x></x>` both come out empty, and text after a
+/// nested element belongs to the nested one.
+fn tree(body: &str) -> Result<Vec<Element>, ProviderError> {
+    let mut reader = Reader::from_str(body);
+    let mut roots = Vec::new();
+    let mut open: Vec<Element> = Vec::new();
+    loop {
+        match reader.read_event().map_err(malformed)? {
+            Event::Start(e) => open.push(Element::new(local_name(&e.name()))),
+            Event::Empty(e) => {
+                let element = Element::new(local_name(&e.name()));
+                attach(&mut open, &mut roots, element);
+            }
+            Event::End(_) => {
+                if let Some(element) = open.pop() {
+                    attach(&mut open, &mut roots, element);
+                }
+            }
+            Event::Text(t) => {
+                if let Some(element) = open.last_mut() {
+                    element.text.push_str(&t.decode().map_err(malformed)?);
+                }
+            }
+            Event::GeneralRef(r) => {
+                if let Some(element) = open.last_mut() {
+                    // A character reference resolves on its own; the five names
+                    // XML defines without a DTD are spelled out; an entity no
+                    // DTD defines is left as it was written rather than
+                    // refused.
+                    match r.resolve_char_ref().map_err(malformed)? {
+                        Some(c) => element.text.push(c),
+                        None => {
+                            let name = r.decode().map_err(malformed)?;
+                            match name.as_ref() {
+                                "amp" => element.text.push('&'),
+                                "lt" => element.text.push('<'),
+                                "gt" => element.text.push('>'),
+                                "quot" => element.text.push('"'),
+                                "apos" => element.text.push('\''),
+                                other => {
+                                    element.text.push('&');
+                                    element.text.push_str(other);
+                                    element.text.push(';');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(roots)
+}
+
+/// A finished element lands in its parent, or among the roots when there is no
+/// open parent left.
+fn attach(open: &mut [Element], roots: &mut Vec<Element>, element: Element) {
+    match open.last_mut() {
+        Some(parent) => parent.children.push(element),
+        None => roots.push(element),
+    }
+}
+
+/// The text of the first element with this local name in `xml`.
+///
+/// The error body is `<Error><Code>...</Code></Error>`, so this is the same
+/// lookup `parse_list` makes, over a body whose root is not the listing's.
 pub(super) fn tag_text(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(unescape(&xml[start..end]))
-}
-
-/// The inner text of every `tag` element in `xml`, in order.
-fn blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(at) = rest.find(&open) {
-        let from = at + open.len();
-        let Some(len) = rest[from..].find(&close) else {
-            break;
-        };
-        out.push(&rest[from..from + len]);
-        rest = &rest[from + len + close.len()..];
-    }
-    out
+    tree(xml)
+        .ok()?
+        .iter()
+        .find_map(|root| root.find(tag))
+        .map(|element| element.text.clone())
 }
 
 /// One page of a listing: its rows, and the token for the next page.
-///
-/// A HAND SCAN AND NOT AN XML CRATE, matching the shape already chosen for the
-/// other protocol this port will carry. The grammar consumed here is four
-/// element names in a document the remote generates.
 ///
 /// ITS DISCRIMINATOR IS THE ROOT ELEMENT, and that is the load-bearing part.
 /// Keying on a row element instead would read an HTML error page and a
@@ -65,23 +171,29 @@ fn blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 pub fn parse_list(bytes: &[u8]) -> Result<(Vec<Entry>, Option<String>), ProviderError> {
     let body = std::str::from_utf8(bytes)
         .map_err(|e| ProviderError::Malformed(format!("the listing did not decode: {e}")))?;
-    if !body.contains("<ListBucketResult") {
+    let roots = tree(body)?;
+    let Some(root) = roots.first().filter(|root| root.name == "ListBucketResult") else {
         return Err(ProviderError::Malformed(
             "the listing carried no ListBucketResult element".to_string(),
         ));
-    }
+    };
 
     let mut entries = Vec::new();
-    for row in blocks(body, "Contents") {
-        let key = tag_text(row, "Key").ok_or_else(|| {
-            ProviderError::Malformed("a listing row carried no Key element".to_string())
-        })?;
+    for row in root.all("Contents") {
+        let key = row
+            .find("Key")
+            .map(|element| element.text.as_str())
+            .ok_or_else(|| {
+                ProviderError::Malformed("a listing row carried no Key element".to_string())
+            })?
+            .to_string();
         // AN ABSENT ETAG IS REFUSED RATHER THAN DEFAULTED, because the empty
         // string is not an etag and would be handed straight back as a
         // condition on the next write - where it fails every conditional put,
         // silently and permanently. Same rule the object read applies.
-        let etag = tag_text(row, "ETag")
-            .map(|e| normalize_etag(&e))
+        let etag = row
+            .find("ETag")
+            .map(|element| normalize_etag(&element.text))
             .filter(|e| !e.is_empty())
             .ok_or_else(|| {
                 ProviderError::Malformed(format!("the listing row for \"{key}\" carried no etag"))
@@ -89,14 +201,15 @@ pub fn parse_list(bytes: &[u8]) -> Result<(Vec<Entry>, Option<String>), Provider
         entries.push(Entry {
             key,
             etag,
-            modified_at: tag_text(row, "LastModified")
-                .as_deref()
-                .and_then(sigv4::parse_iso8601_utc),
+            modified_at: row
+                .find("LastModified")
+                .and_then(|element| sigv4::parse_iso8601_utc(&element.text)),
         });
     }
 
-    let truncated = tag_text(body, "IsTruncated")
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+    let truncated = root
+        .find("IsTruncated")
+        .map(|element| element.text.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     // A PAGE THAT SAYS IT IS TRUNCATED AND THEN NAMES NO TOKEN IS A PROTOCOL
     // FAILURE, not the end of the listing. Reading it as the end is the
@@ -105,7 +218,8 @@ pub fn parse_list(bytes: &[u8]) -> Result<(Vec<Entry>, Option<String>), Provider
     // reads as every absent record having been deleted.
     let next = if truncated {
         Some(
-            tag_text(body, "NextContinuationToken")
+            root.find("NextContinuationToken")
+                .map(|element| element.text.clone())
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| {
                     ProviderError::Protocol(

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::modules::lockext::LockExt as _;
+use crate::modules::lockext::lock_or_recover;
 use zeroize::Zeroizing;
 
 use crate::modules::vault::events::LockReason;
@@ -88,7 +88,7 @@ impl VaultState {
     /// A deadline hit here is the one place the auto-lock flag is recorded;
     /// the tick thread reuses this path, so the event fires exactly once.
     pub fn access(&self) -> Result<std::sync::MutexGuard<'_, Option<Unlocked>>, String> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = lock_or_recover(&self.inner);
         if guard.is_some()
             && deadline_passed(lock::boot_now_ms(), self.deadline_ms.load(Ordering::SeqCst))
         {
@@ -101,10 +101,7 @@ impl VaultState {
             // unlock or touch is what stores a real deadline.
             self.deadline_ms
                 .store(deadline_after(0, lock::boot_now_ms()), Ordering::SeqCst);
-            *self
-                .auto_lock_event
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(LockReason::Idle);
+            *lock_or_recover(&self.auto_lock_event) = Some(LockReason::Idle);
             return Err(LOCKED_ERR.to_string());
         }
         Ok(guard)
@@ -116,7 +113,7 @@ impl VaultState {
     /// payload was actually dropped, so the minimize and tray paths emit only
     /// a real lock.
     pub(crate) fn lock_inner(&self) -> bool {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = lock_or_recover(&self.inner);
         let dropped = guard.is_some();
         if let Some(unlocked) = guard.as_mut() {
             unlocked.payload.wipe();
@@ -137,30 +134,24 @@ impl VaultState {
     /// The reason an automatic lock happened, if one has not been drained
     /// yet. Command shells call this after every result.
     pub(crate) fn take_auto_lock(&self) -> Option<LockReason> {
-        self.auto_lock_event
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        lock_or_recover(&self.auto_lock_event).take()
     }
 
     /// The outcome of the last save attempt, if no shell has drained it yet.
     pub(crate) fn take_save_event(&self) -> Option<SaveOutcome> {
-        self.save_event
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        lock_or_recover(&self.save_event).take()
     }
 
     /// True while a failed write is parked. The quit flow asks before it lets
     /// the process exit and lose those changes.
     pub(crate) fn has_pending(&self) -> bool {
-        self.pending.lock_or_recover().is_some()
+        lock_or_recover(&self.pending).is_some()
     }
 
     /// Drop the parked seal: a write that landed makes it stale, and a
     /// confirmed quit loses it with the process either way.
     pub(crate) fn drop_pending(&self) {
-        *self.pending.lock_or_recover() = None;
+        *lock_or_recover(&self.pending) = None;
     }
 
     /// The refusal every mutation answers while the payload came from the
@@ -193,7 +184,7 @@ pub(crate) fn commit(state: &VaultState, dir: &Path) -> Result<(), String> {
     // The lock is held across the seal AND the write, so a commit is one
     // ordered unit: two commits can never seal in one order and land in the
     // other, and an older seal can never land after a newer one.
-    let _held = state.save_lock.lock_or_recover();
+    let _held = lock_or_recover(&state.save_lock);
     let sealed = {
         let guard = state.access()?;
         let unlocked = guard.as_ref().ok_or_else(|| LOCKED_ERR.to_string())?;
@@ -214,12 +205,12 @@ pub(crate) fn perform_save_locked(
     match save_vault(dir, &file) {
         Ok(()) => {
             state.drop_pending();
-            *state.save_event.lock_or_recover() = Some(SaveOutcome::Succeeded);
+            *lock_or_recover(&state.save_event) = Some(SaveOutcome::Succeeded);
             Ok(())
         }
         Err(e) => {
-            *state.pending.lock_or_recover() = Some(file);
-            *state.save_event.lock_or_recover() = Some(SaveOutcome::Failed(e.clone()));
+            *lock_or_recover(&state.pending) = Some(file);
+            *lock_or_recover(&state.save_event) = Some(SaveOutcome::Failed(e.clone()));
             Err(e)
         }
     }
@@ -284,7 +275,7 @@ mod tests {
         eprintln!("titles after failed save: {titles_now:?}");
         let err = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Two")).unwrap_err();
         assert!(
-            state.pending.lock_or_recover().is_some(),
+            lock_or_recover(&state.pending).is_some(),
             "upsert must park: {err}"
         );
 
@@ -294,7 +285,7 @@ mod tests {
         std::fs::rename(&stash, &primary).unwrap();
         vault_entry_upsert_inner(&state, &dir.0, draft(None, "Three")).unwrap();
         assert!(
-            state.pending.lock_or_recover().is_none(),
+            lock_or_recover(&state.pending).is_none(),
             "a successful save must clear the parked seal"
         );
 
@@ -336,7 +327,7 @@ mod tests {
             "the failure must come from the write, not validation: {err}"
         );
         assert!(
-            state.pending.lock_or_recover().is_none(),
+            lock_or_recover(&state.pending).is_none(),
             "a failed change must park no seal"
         );
         // Un-block: the disk must still open with the OLD password.
@@ -371,7 +362,7 @@ mod tests {
         std::fs::rename(&primary, &stash).unwrap();
         std::fs::create_dir_all(&primary).unwrap();
         assert!(vault_entry_upsert_inner(&state, &dir.0, draft(None, "Parked")).is_err());
-        assert!(state.pending.lock_or_recover().is_some());
+        assert!(lock_or_recover(&state.pending).is_some());
         // Put the intact primary back: the disk copy is stale, not broken.
         std::fs::remove_dir_all(&primary).unwrap();
         std::fs::rename(&stash, &primary).unwrap();
@@ -390,7 +381,7 @@ mod tests {
             .any(|e| e.title == "Parked"));
         // ...and the next commit simply lands.
         vault_entry_upsert_inner(&state, &dir.0, draft(None, "Landed")).unwrap();
-        assert!(state.pending.lock_or_recover().is_none());
+        assert!(lock_or_recover(&state.pending).is_none());
     }
 
     /// The retry must keep the parked seal while it is blocked. Taking it and

@@ -152,26 +152,7 @@ function toCustomFieldPayload(field: EditorCustomField): DraftCustomField {
 
 /** True when the draft differs from the one the dialog opened with. */
 export function isDirty(draft: EditorDraft, initial: EditorDraft): boolean {
-  const serialise = (d: EditorDraft): string =>
-    JSON.stringify([
-      d.id,
-      d.groupId,
-      d.title,
-      d.username,
-      d.password,
-      d.passwordTouched,
-      d.urls,
-      d.notes,
-      d.totp,
-      d.totpTouched,
-      d.customFields,
-      d.tags,
-      d.icon,
-      d.color,
-      d.favorite,
-      d.expiresAt,
-    ]);
-  return serialise(draft) !== serialise(initial);
+  return JSON.stringify(draft) !== JSON.stringify(initial);
 }
 
 /**

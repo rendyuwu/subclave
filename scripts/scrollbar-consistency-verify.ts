@@ -15,7 +15,7 @@
  *
  * So: no stylesheet anywhere may set a scrollbar to a size or colour of its
  * own. Hiding one is fine (hidden means the same thing in both engines), which
- * is what `.no-scrollbar` and the Radix viewport override do.
+ * is what the `no-scrollbar` utility does.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";

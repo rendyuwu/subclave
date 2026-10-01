@@ -18,7 +18,6 @@ import {
   buildGroupTree,
   descendantIds,
   effectiveParentId,
-  collectIds,
   type GroupNode,
 } from "../src/modules/groups/groupTreeModel";
 import {
@@ -92,9 +91,6 @@ console.log("[forest] nesting, sibling order, and the reserved ids");
     "and is empty for a group that is not in the forest",
     descendantIds("root", groups).size === 0,
   );
-  const collected = new Set<string>();
-  collectIds(tree[0], collected);
-  check("collectIds walks the whole subtree", [...collected].sort().join(",") === "a,a2");
 }
 
 console.log("[forest] a synced parentId the device never agreed on");
@@ -139,8 +135,11 @@ console.log("[list] scope rules");
     entry("other", { groupId: "b" }),
     entry("trashed", { groupId: TRASH_SCOPE, favorite: true }),
   ];
-  const show = (scope: string, tagFilter: string[] = [], searchIds: Set<string> | null = null) =>
-    visibleEntries({ entries: rows, scope, tagFilter, searchIds, now: 0 }).map((e) => e.id);
+  const show = (
+    scope: string,
+    tagFilter: string[] = [],
+    searchIds: readonly string[] | null = null,
+  ) => visibleEntries({ entries: rows, scope, tagFilter, searchIds, now: 0 }).map((e) => e.id);
 
   check("All is every entry outside Trash", show(ALL_SCOPE).join(",") === "live,other,plain");
   check("Favourites is the favourites outside Trash", show(FAVORITES_SCOPE).join(",") === "live");
@@ -156,7 +155,7 @@ console.log("[list] query intersection, tag AND, and title ordering");
     entry("Item 2", { tags: ["web"] }),
     entry("Alpha", { tags: ["web", "work"] }),
   ];
-  const titles = (tagFilter: string[], searchIds: Set<string> | null) =>
+  const titles = (tagFilter: string[], searchIds: readonly string[] | null) =>
     visibleEntries({ entries: rows, scope: ALL_SCOPE, tagFilter, searchIds, now: 0 }).map(
       (e) => e.title,
     );
@@ -170,8 +169,8 @@ console.log("[list] query intersection, tag AND, and title ordering");
     "every selected tag must be present (AND)",
     titles(["web", "work"], null).join(" | ") === "Alpha | Item 10",
   );
-  check("a query narrows to its id set", titles([], new Set(["Item 2"])).join(" | ") === "Item 2");
-  check("a query with no hits filters everything out", titles([], new Set()).length === 0);
+  check("a query narrows to its id set", titles([], ["Item 2"]).join(" | ") === "Item 2");
+  check("a query with no hits filters everything out", titles([], []).length === 0);
 }
 
 console.log("[list] counts are per group and direct-entry only");

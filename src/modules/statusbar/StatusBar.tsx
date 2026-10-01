@@ -1,5 +1,5 @@
 import { UpdaterPill } from "@/modules/updater";
-import { ALL_SCOPE, groupCounts } from "@/modules/vault/list/derive";
+import { TRASH_SCOPE } from "@/modules/vault/list/derive";
 import { useVaultStore } from "@/modules/vault/store";
 import { useEffect, useState } from "react";
 import { SyncPill } from "./SyncPill";
@@ -73,8 +73,7 @@ function LockGroup() {
 
 function EntryCountGroup() {
   const entries = useVaultStore((s) => s.entries);
-  const groups = useVaultStore((s) => s.groups);
-  const count = groupCounts(entries, groups).get(ALL_SCOPE) ?? 0;
+  const count = entries.reduce((n, entry) => (entry.groupId === TRASH_SCOPE ? n : n + 1), 0);
   return <Group>{count === 1 ? "1 entry" : `${count} entries`}</Group>;
 }
 

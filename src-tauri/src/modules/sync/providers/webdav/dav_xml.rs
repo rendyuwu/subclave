@@ -1,14 +1,23 @@
-//! The DAV XML scan: a multi-status body read by hand.
+//! The DAV XML scan: a multi-status body.
+
+use quick_xml::events::Event;
+use quick_xml::name::QName;
+use quick_xml::Reader;
 
 use super::super::http::normalize_etag;
 use super::dav_time::parse_http_date;
 use crate::modules::sync::provider::{Entry, ProviderError};
 
-// --- the hand scan --------------------------------------------------------
+// --- the scan -------------------------------------------------------------
 //
-// A HAND SCAN AND NOT AN XML CRATE, matching the shape the other backend
-// already chose and for the same reason: the grammar consumed here is six
-// element names in a document the remote generates.
+// READ WITH `quick-xml`, whose event stream is walked once into a small tree, so
+// a lookup by element name can be made from anywhere in the document.
+//
+// A SECOND COPY OF THE OTHER BACKEND'S, and kept rather than shared for the
+// reason the `unescape` it replaces was: the two sit behind a boundary whose
+// whole stated property is that a backend is one file reachable through one
+// dispatch arm, and a helper reaching across that boundary would be the first
+// thing to make adding a third backend touch a second one.
 //
 // IT MATCHES ON THE LOCAL NAME, which is the one thing that cannot be copied
 // from the other backend. That protocol's listing carries no namespace
@@ -20,110 +29,141 @@ use crate::modules::sync::provider::{Entry, ProviderError};
 // The ceiling, named: matching a local name across namespaces means an element
 // from some other namespace sharing a local name would be read. In a
 // multi-status body that is not a shape any server produces, and closing it
-// properly means a namespace-resolving parser, which is a dependency this tree
-// has decided against.
+// properly means a namespace-resolving parser, for namespaces neither this
+// provider nor the other one draws anything from.
 
-/// One `<`-delimited tag, located.
-struct Tag<'a> {
-    /// Byte offset of the `<`.
-    at: usize,
-    /// Byte offset just past the `>`.
-    end: usize,
-    /// Everything after the last `:` of the element name, so the server's
-    /// choice of prefix does not reach any caller.
-    name: &'a str,
-    closing: bool,
-    self_closing: bool,
-}
-
-/// Every element tag in `xml`, in order, ignoring declarations and comments.
-fn tags(xml: &str) -> Vec<Tag<'_>> {
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(rel) = xml[cursor..].find('<') {
-        let at = cursor + rel;
-        let Some(rel_end) = xml[at..].find('>') else {
-            break;
-        };
-        let end = at + rel_end + 1;
-        let inner = &xml[at + 1..end - 1];
-        cursor = end;
-        // A declaration, a comment or a processing instruction names no
-        // element.
-        if inner.starts_with('!') || inner.starts_with('?') {
-            continue;
-        }
-        let closing = inner.starts_with('/');
-        let self_closing = !closing && inner.ends_with('/');
-        let raw = inner
-            .trim_start_matches('/')
-            .split(|c: char| c.is_ascii_whitespace() || c == '/')
-            .next()
-            .unwrap_or("");
-        if raw.is_empty() {
-            continue;
-        }
-        out.push(Tag {
-            at,
-            end,
-            name: raw.rsplit(':').next().unwrap_or(raw),
-            closing,
-            self_closing,
-        });
-    }
-    out
-}
-
-/// The inner text of every element whose local name is `name`, in order.
+/// The local name of an element: everything after the last `:` of its
+/// qualified name.
 ///
-/// A self-closing element yields the empty string rather than being skipped,
-/// so a property the server declined to supply is visible as empty rather than
-/// as absent - which is the distinction the status gate below is built on.
-fn local_name_blocks<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
-    let tags = tags(xml);
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < tags.len() {
-        let open = &tags[i];
-        if open.closing || open.name != name {
-            i += 1;
-            continue;
+/// Cannot fail: the reader borrows the document from a `&str`, so every name it
+/// reports is UTF-8.
+fn local_name<'a>(name: &QName<'a>) -> &'a str {
+    std::str::from_utf8(name.local_name().into_inner())
+        .expect("the reader reported a non-UTF-8 name")
+}
+
+/// A parse failure of any kind, in the taxonomy's own terms: the body came from
+/// the remote and a listing this client cannot read is not an empty listing.
+fn malformed<E: std::fmt::Display>(e: E) -> ProviderError {
+    ProviderError::Malformed(format!("the listing did not parse: {e}"))
+}
+
+/// One element of a body, with the text inside it and its children.
+///
+/// A self-closing element yields the empty string rather than being skipped, so
+/// a property the server declined to supply is visible as empty rather than as
+/// absent - which is the distinction the status gate in [`prop_of`] is built
+/// on.
+struct Element {
+    /// The LOCAL name, so the server's choice of prefix reaches no caller.
+    name: String,
+    /// The character data between this element's tags, with the predefined
+    /// entities and any character references resolved. Nested elements are in
+    /// `children` and their text is NOT folded in here.
+    text: String,
+    children: Vec<Element>,
+}
+
+impl Element {
+    fn new(name: &str) -> Self {
+        Element {
+            name: name.to_string(),
+            text: String::new(),
+            children: Vec::new(),
         }
-        if open.self_closing {
-            out.push("");
-            i += 1;
-            continue;
+    }
+
+    /// The first element with this local name, at or below this one.
+    fn find(&self, name: &str) -> Option<&Element> {
+        if self.name == name {
+            return Some(self);
         }
-        let mut depth = 1usize;
-        let mut j = i + 1;
-        while j < tags.len() {
-            let tag = &tags[j];
-            if tag.name == name && !tag.self_closing {
-                if tag.closing {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    depth += 1;
+        self.children.iter().find_map(|child| child.find(name))
+    }
+
+    /// Every element with this local name below this one, in document order.
+    fn all(&self, name: &str) -> Vec<&Element> {
+        let mut out = Vec::new();
+        self.collect(name, &mut out);
+        out
+    }
+
+    fn collect<'a>(&'a self, name: &str, out: &mut Vec<&'a Element>) {
+        for child in &self.children {
+            if child.name == name {
+                out.push(child);
+            }
+            child.collect(name, out);
+        }
+    }
+}
+
+/// Walk `body`'s event stream into one element per node.
+///
+/// The text of an element is the text of the events between its tags, so a
+/// self-closing element and `<x></x>` both come out empty, and text after a
+/// nested element belongs to the nested one.
+fn tree(body: &str) -> Result<Vec<Element>, ProviderError> {
+    let mut reader = Reader::from_str(body);
+    let mut roots = Vec::new();
+    let mut open: Vec<Element> = Vec::new();
+    loop {
+        match reader.read_event().map_err(malformed)? {
+            Event::Start(e) => open.push(Element::new(local_name(&e.name()))),
+            Event::Empty(e) => {
+                let element = Element::new(local_name(&e.name()));
+                attach(&mut open, &mut roots, element);
+            }
+            Event::End(_) => {
+                if let Some(element) = open.pop() {
+                    attach(&mut open, &mut roots, element);
                 }
             }
-            j += 1;
+            Event::Text(t) => {
+                if let Some(element) = open.last_mut() {
+                    element.text.push_str(&t.decode().map_err(malformed)?);
+                }
+            }
+            Event::GeneralRef(r) => {
+                if let Some(element) = open.last_mut() {
+                    // A character reference resolves on its own; the five names
+                    // XML defines without a DTD are spelled out; an entity no
+                    // DTD defines is left as it was written rather than
+                    // refused.
+                    match r.resolve_char_ref().map_err(malformed)? {
+                        Some(c) => element.text.push(c),
+                        None => {
+                            let name = r.decode().map_err(malformed)?;
+                            match name.as_ref() {
+                                "amp" => element.text.push('&'),
+                                "lt" => element.text.push('<'),
+                                "gt" => element.text.push('>'),
+                                "quot" => element.text.push('"'),
+                                "apos" => element.text.push('\''),
+                                other => {
+                                    element.text.push('&');
+                                    element.text.push_str(other);
+                                    element.text.push(';');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
         }
-        if j == tags.len() {
-            // Unterminated: stop rather than returning a block whose end was
-            // guessed.
-            break;
-        }
-        out.push(&xml[open.end..tags[j].at]);
-        i = j + 1;
     }
-    out
+    Ok(roots)
 }
 
-/// The inner text of the first element whose local name is `name`.
-fn local_name_text<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    local_name_blocks(xml, name).into_iter().next()
+/// A finished element lands in its parent, or among the roots when there is no
+/// open parent left.
+fn attach(open: &mut [Element], roots: &mut Vec<Element>, element: Element) {
+    match open.last_mut() {
+        Some(parent) => parent.children.push(element),
+        None => roots.push(element),
+    }
 }
 
 /// The path half of an `href`, which a server may spell as a whole URL or as an
@@ -132,44 +172,22 @@ fn local_name_text<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 /// Both spellings are handled per row even though a server has to pick one and
 /// stay with it across a response, because handling both costs nothing and
 /// relying on that consistency buys nothing.
+///
+/// THE TEXT ARRIVES UNESCAPED, from the reader: the XML escaping is the outer
+/// layer and is already gone, so nothing here may expand an ampersand a second
+/// time.
 fn href_path(href: &str) -> String {
-    // UNESCAPED FIRST, BEFORE ANYTHING PARSES IT. The XML escaping is the outer
-    // layer: an ampersand in a name reaches this as five characters, and a url
-    // parser handed those would keep them.
-    let href = unescape(href.trim());
-    match url::Url::parse(&href) {
+    let href = href.trim();
+    match url::Url::parse(href) {
         Ok(url) => url.path().to_string(),
         // Not a whole URL, so it is the absolute-path spelling - which may
         // carry a query the path does not include.
-        Err(_) => href.split('?').next().unwrap_or(&href).to_string(),
+        Err(_) => href.split('?').next().unwrap_or(href).to_string(),
     }
 }
 
 fn segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
-}
-
-/// The five predefined XML entities, expanded.
-///
-/// `&amp;` LAST, or an escaped entity would be double-expanded: a literal
-/// ampersand-l-t written as five characters would come back as a less-than sign
-/// rather than as the four characters it names.
-///
-/// A SECOND COPY OF THE OTHER BACKEND'S, kept rather than shared for the reason
-/// `src-tauri/src/modules/sync/providers/sigv4.rs` gives about its own hex fold:
-/// the two sit behind a boundary whose whole stated property is that a backend
-/// is one file reachable through one dispatch arm, and a helper reaching across
-/// that boundary would be the first thing to make adding a third backend touch
-/// a second one.
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
 
 /// Whether a status line carries a success code.
@@ -194,35 +212,36 @@ fn is_ok_status(line: &str) -> bool {
 /// Gated on success rather than on "not missing", because a server may decline
 /// a property with a forbidden status just as readily as with a missing one.
 ///
-/// THE VALUE IS UNESCAPED, and an etag is the reason that is not optional. A
-/// server is free to escape a quotation mark in a text node and at least one
-/// common one does, so the listing would carry an etag spelled differently from
-/// the one the same server puts in a response HEADER - and those two are
-/// compared against each other by the layer above. Storing the escaped spelling
-/// makes that comparison fail on every row forever, which turns every pull into
-/// a full download of the whole inventory.
-fn prop_of(row: &str, name: &str) -> Option<String> {
-    for group in local_name_blocks(row, "propstat") {
-        let Some(status) = local_name_text(group, "status") else {
+/// THE VALUE IS TAKEN AS THE READER SPELLED IT, with the five predefined
+/// entities and any character reference resolved, and an etag is the reason
+/// that matters. A server is free to escape a quotation mark in a text node and
+/// at least one common one does, so the listing would carry an etag spelled
+/// differently from the one the same server puts in a response HEADER - and
+/// those two are compared against each other by the layer above. Keeping the
+/// escaped spelling makes that comparison fail on every row forever, which
+/// turns every pull into a full download of the whole inventory.
+fn prop_of(row: &Element, name: &str) -> Option<String> {
+    for group in row.all("propstat") {
+        let Some(status) = group.find("status") else {
             continue;
         };
-        if !is_ok_status(status) {
+        if !is_ok_status(&status.text) {
             continue;
         }
-        let Some(props) = local_name_text(group, "prop") else {
+        let Some(props) = group.find("prop") else {
             continue;
         };
-        if let Some(value) = local_name_text(props, name) {
-            return Some(unescape(value));
+        if let Some(value) = props.find(name) {
+            return Some(value.text.clone());
         }
     }
     None
 }
 
-fn is_collection(row: &str) -> bool {
-    local_name_blocks(row, "resourcetype")
+fn is_collection(row: &Element) -> bool {
+    row.all("resourcetype")
         .iter()
-        .any(|kind| !local_name_blocks(kind, "collection").is_empty())
+        .any(|kind| kind.find("collection").is_some())
 }
 
 /// The rows of a listing.
@@ -257,7 +276,8 @@ pub fn parse_multistatus(
 ) -> Result<Vec<Entry>, ProviderError> {
     let body = std::str::from_utf8(bytes)
         .map_err(|e| ProviderError::Malformed(format!("the listing did not decode: {e}")))?;
-    let Some(inside) = local_name_text(body, "multistatus") else {
+    let roots = tree(body)?;
+    let Some(root) = roots.first().filter(|root| root.name == "multistatus") else {
         return Err(ProviderError::Malformed(
             "the listing carried no multistatus element".to_string(),
         ));
@@ -265,11 +285,11 @@ pub fn parse_multistatus(
 
     let depth = segments(request_path).len();
     let mut entries = Vec::new();
-    for row in local_name_blocks(inside, "response") {
-        let href = local_name_text(row, "href").ok_or_else(|| {
+    for row in root.all("response") {
+        let href = row.find("href").ok_or_else(|| {
             ProviderError::Malformed("a listing row carried no href element".to_string())
         })?;
-        let path = href_path(href);
+        let path = href_path(&href.text);
         let found = segments(&path);
         if found.len() != depth + 1 {
             continue;
@@ -290,7 +310,7 @@ pub fn parse_multistatus(
         // entire prefix on every pull while every other row was readable. A row
         // that DOES carry property groups and still yields no usable etag is a
         // server contradicting itself, and that is refused.
-        if local_name_blocks(row, "propstat").is_empty() {
+        if row.find("propstat").is_none() {
             continue;
         }
         let key = format!("{prefix}{}", found[found.len() - 1]);

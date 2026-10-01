@@ -8,20 +8,6 @@ import {
   clampPref,
   CLIPBOARD_CLEAR_SECONDS_MAX,
   DEFAULT_PREFERENCES,
-  KEY_APP_OPACITY,
-  KEY_AUTOSTART,
-  KEY_AUTO_LOCK_MINUTES,
-  KEY_BRAND_COLOR,
-  KEY_CLIPBOARD_CLEAR_SECONDS,
-  KEY_CLOSE_TO_TRAY,
-  KEY_CUSTOM_THEME,
-  KEY_CUSTOM_THEME_ENABLED,
-  KEY_GENERATOR,
-  KEY_LOCK_ON_MINIMIZE,
-  KEY_RESTORE_WINDOW,
-  KEY_SHORTCUTS,
-  KEY_THEME,
-  KEY_USER_THEME_PRESETS,
   normalizeBrandColor,
   normalizeGeneratorOptions,
   PREF_STORE_KEYS,
@@ -45,7 +31,7 @@ const PREFS_STORE_CHANGED_EVENT = "subclave://prefs-store-changed";
 
 export const io = createRecoveredStore({
   path: STORE_PATH,
-  loadKey: KEY_THEME,
+  loadKey: PREF_STORE_KEYS.theme,
   changedEvent: PREFS_STORE_CHANGED_EVENT,
 });
 
@@ -70,21 +56,25 @@ export async function loadPreferences(): Promise<Preferences> {
   // this is one less shape to reason about rather than a fix for a break.
   const get = <T>(k: string): T | undefined => (map.get(k) ?? undefined) as T | undefined;
   return {
-    theme: get<ThemePref>(KEY_THEME) ?? DEFAULT_PREFERENCES.theme,
-    autostart: get<boolean>(KEY_AUTOSTART) ?? DEFAULT_PREFERENCES.autostart,
-    restoreWindowState: get<boolean>(KEY_RESTORE_WINDOW) ?? DEFAULT_PREFERENCES.restoreWindowState,
+    theme: get<ThemePref>(PREF_STORE_KEYS.theme) ?? DEFAULT_PREFERENCES.theme,
+    autostart: get<boolean>(PREF_STORE_KEYS.autostart) ?? DEFAULT_PREFERENCES.autostart,
+    restoreWindowState:
+      get<boolean>(PREF_STORE_KEYS.restoreWindowState) ?? DEFAULT_PREFERENCES.restoreWindowState,
     shortcuts:
-      get<Record<ShortcutId, KeyBinding[]>>(KEY_SHORTCUTS) ?? DEFAULT_PREFERENCES.shortcuts,
-    brandColor: normalizeBrandColor(get<string>(KEY_BRAND_COLOR)),
+      get<Record<ShortcutId, KeyBinding[]>>(PREF_STORE_KEYS.shortcuts) ??
+      DEFAULT_PREFERENCES.shortcuts,
+    brandColor: normalizeBrandColor(get<string>(PREF_STORE_KEYS.brandColor)),
     customThemeEnabled:
-      get<boolean>(KEY_CUSTOM_THEME_ENABLED) ?? DEFAULT_PREFERENCES.customThemeEnabled,
+      get<boolean>(PREF_STORE_KEYS.customThemeEnabled) ?? DEFAULT_PREFERENCES.customThemeEnabled,
     customTheme: normalizeCustomTheme(
-      get<unknown>(KEY_CUSTOM_THEME),
+      get<unknown>(PREF_STORE_KEYS.customTheme),
       DEFAULT_PREFERENCES.customTheme,
     ),
-    appOpacity: clampOpacity(get<number>(KEY_APP_OPACITY) ?? DEFAULT_PREFERENCES.appOpacity),
+    appOpacity: clampOpacity(
+      get<number>(PREF_STORE_KEYS.appOpacity) ?? DEFAULT_PREFERENCES.appOpacity,
+    ),
     userThemePresets: (() => {
-      const raw = get<unknown>(KEY_USER_THEME_PRESETS);
+      const raw = get<unknown>(PREF_STORE_KEYS.userThemePresets);
       if (!Array.isArray(raw)) return DEFAULT_PREFERENCES.userThemePresets;
       // Normalise each entry through `normalizeCustomTheme` so a corrupt
       // / partial preset doesn't crash the settings page on load.
@@ -94,18 +84,19 @@ export async function loadPreferences(): Promise<Preferences> {
       });
     })(),
     autoLockMinutes: clampPref(
-      get<unknown>(KEY_AUTO_LOCK_MINUTES),
+      get<unknown>(PREF_STORE_KEYS.autoLockMinutes),
       DEFAULT_PREFERENCES.autoLockMinutes,
       AUTO_LOCK_MINUTES_MAX,
     ),
     clipboardClearSeconds: clampPref(
-      get<unknown>(KEY_CLIPBOARD_CLEAR_SECONDS),
+      get<unknown>(PREF_STORE_KEYS.clipboardClearSeconds),
       DEFAULT_PREFERENCES.clipboardClearSeconds,
       CLIPBOARD_CLEAR_SECONDS_MAX,
     ),
-    lockOnMinimize: get<boolean>(KEY_LOCK_ON_MINIMIZE) ?? DEFAULT_PREFERENCES.lockOnMinimize,
-    closeToTray: get<boolean>(KEY_CLOSE_TO_TRAY) ?? DEFAULT_PREFERENCES.closeToTray,
-    generator: normalizeGeneratorOptions(get<unknown>(KEY_GENERATOR)),
+    lockOnMinimize:
+      get<boolean>(PREF_STORE_KEYS.lockOnMinimize) ?? DEFAULT_PREFERENCES.lockOnMinimize,
+    closeToTray: get<boolean>(PREF_STORE_KEYS.closeToTray) ?? DEFAULT_PREFERENCES.closeToTray,
+    generator: normalizeGeneratorOptions(get<unknown>(PREF_STORE_KEYS.generator)),
   };
 }
 

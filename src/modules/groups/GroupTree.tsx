@@ -13,7 +13,7 @@ import {
   TrashRowActions,
 } from "./GroupRowActions";
 import { deleteGroup, emptyTrash, moveGroup, runVaultAction } from "./groupActions";
-import { ROOT_ID, TRASH_ID, buildGroupTree, treeRows, type TreeRow } from "./groupTreeModel";
+import { ROOT_ID, buildGroupTree, treeRows, type TreeRow } from "./groupTreeModel";
 import { Button } from "@/components/ui/button";
 import { vaultEntryMove } from "@/modules/vault/ipc";
 import { groupCounts, TRASH_SCOPE } from "@/modules/vault/list/derive";
@@ -101,7 +101,7 @@ export function GroupTree(): ReactNode {
         className="flex min-h-0 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2"
       >
         {rows.map((row) => {
-          const isDropTarget = row.group !== null && row.group.id !== TRASH_ID;
+          const isDropTarget = row.group !== null && row.group.id !== TRASH_SCOPE;
           return (
             <GroupRow
               key={row.id}

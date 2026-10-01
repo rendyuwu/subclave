@@ -15,7 +15,6 @@ import { ALL_SCOPE, FAVORITES_SCOPE, TRASH_SCOPE } from "@/modules/vault/list/de
 import type { Group } from "@/modules/vault/types";
 
 export const ROOT_ID = "root";
-export const TRASH_ID = "trash";
 
 /** One node in the forest {@link buildGroupTree} returns. */
 export type GroupNode = {
@@ -55,7 +54,7 @@ export function buildGroupTree(groups: Group[]): GroupNode[] {
   const byId = new Map(groups.map((g) => [g.id, g]));
   const childrenOf = new Map<string, Group[]>();
   for (const group of groups) {
-    if (group.id === ROOT_ID || group.id === TRASH_ID) continue;
+    if (group.id === ROOT_ID || group.id === TRASH_SCOPE) continue;
     const parentId = effectiveParentId(group.id, byId);
     const list = childrenOf.get(parentId);
     if (list) list.push(group);
@@ -70,7 +69,7 @@ export function buildGroupTree(groups: Group[]): GroupNode[] {
 }
 
 /** `node`'s own id plus every id in its subtree, collected into `into`. */
-export function collectIds(node: GroupNode, into: Set<string>): void {
+function collectIds(node: GroupNode, into: Set<string>): void {
   into.add(node.group.id);
   for (const child of node.children) collectIds(child, into);
 }

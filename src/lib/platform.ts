@@ -16,8 +16,6 @@ export const USE_CUSTOM_WINDOW_CONTROLS = !IS_MAC && PLATFORM !== "";
 
 /** KeyBinding property for the platform's primary modifier. */
 export const MOD_PROP: "meta" | "ctrl" = IS_MAC ? "meta" : "ctrl";
-export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
-export const SHIFT_KEY = IS_MAC ? "⇧" : "Shift";
 
 export const KEY_SEP = IS_MAC ? "" : "+";
 

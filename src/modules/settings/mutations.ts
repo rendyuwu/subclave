@@ -8,20 +8,8 @@ import {
   clampOpacity,
   clampPref,
   DEFAULT_PREFERENCES,
-  KEY_APP_OPACITY,
-  KEY_AUTOSTART,
-  KEY_AUTO_LOCK_MINUTES,
-  KEY_CLIPBOARD_CLEAR_SECONDS,
-  KEY_CLOSE_TO_TRAY,
-  KEY_CUSTOM_THEME,
-  KEY_CUSTOM_THEME_ENABLED,
-  KEY_GENERATOR,
-  KEY_LOCK_ON_MINIMIZE,
-  KEY_RESTORE_WINDOW,
-  KEY_SHORTCUTS,
-  KEY_THEME,
-  KEY_USER_THEME_PRESETS,
   normalizeGeneratorOptions,
+  PREF_STORE_KEYS,
   PREFS_CHANGED_EVENT,
   type ThemePref,
 } from "./schema";
@@ -32,7 +20,7 @@ import type { CustomTheme } from "./theme/model";
 // moved. Declared in `./schema` so `./load` can listen for it without importing
 // this module (which imports that one).
 
-export async function writePref<T>(key: string, value: T): Promise<void> {
+async function writePref<T>(key: string, value: T): Promise<void> {
   // Through the port's queue: it is the only queue per store file, and two
   // setters firing as the user leaves two fields is the ordinary case.
   await io.enqueueWrite(async () => {
@@ -49,59 +37,59 @@ export async function writePref<T>(key: string, value: T): Promise<void> {
 }
 
 export async function setTheme(value: ThemePref): Promise<void> {
-  await writePref(KEY_THEME, value);
+  await writePref(PREF_STORE_KEYS.theme, value);
 }
 
 export async function setAppOpacity(value: number): Promise<void> {
-  await writePref(KEY_APP_OPACITY, clampOpacity(value));
+  await writePref(PREF_STORE_KEYS.appOpacity, clampOpacity(value));
 }
 
 export async function setAutostart(value: boolean): Promise<void> {
-  await writePref(KEY_AUTOSTART, value);
+  await writePref(PREF_STORE_KEYS.autostart, value);
 }
 
 export async function setRestoreWindowState(value: boolean): Promise<void> {
-  await writePref(KEY_RESTORE_WINDOW, value);
+  await writePref(PREF_STORE_KEYS.restoreWindowState, value);
 }
 
 export async function setShortcuts(value: Record<ShortcutId, KeyBinding[]> | {}): Promise<void> {
-  await writePref(KEY_SHORTCUTS, value);
+  await writePref(PREF_STORE_KEYS.shortcuts, value);
 }
 
 export async function setCustomThemeEnabled(value: boolean): Promise<void> {
-  await writePref(KEY_CUSTOM_THEME_ENABLED, value);
+  await writePref(PREF_STORE_KEYS.customThemeEnabled, value);
 }
 
 export async function setCustomTheme(value: CustomTheme): Promise<void> {
-  await writePref(KEY_CUSTOM_THEME, value);
+  await writePref(PREF_STORE_KEYS.customTheme, value);
 }
 
 export async function setUserThemePresets(value: CustomTheme[]): Promise<void> {
-  await writePref(KEY_USER_THEME_PRESETS, value);
+  await writePref(PREF_STORE_KEYS.userThemePresets, value);
 }
 
 export async function setAutoLockMinutes(value: number): Promise<void> {
   await writePref(
-    KEY_AUTO_LOCK_MINUTES,
+    PREF_STORE_KEYS.autoLockMinutes,
     clampPref(value, DEFAULT_PREFERENCES.autoLockMinutes, AUTO_LOCK_MINUTES_MAX),
   );
 }
 
 export async function setClipboardClearSeconds(value: number): Promise<void> {
   await writePref(
-    KEY_CLIPBOARD_CLEAR_SECONDS,
+    PREF_STORE_KEYS.clipboardClearSeconds,
     clampPref(value, DEFAULT_PREFERENCES.clipboardClearSeconds, CLIPBOARD_CLEAR_SECONDS_MAX),
   );
 }
 
 export async function setLockOnMinimize(value: boolean): Promise<void> {
-  await writePref(KEY_LOCK_ON_MINIMIZE, value);
+  await writePref(PREF_STORE_KEYS.lockOnMinimize, value);
 }
 
 export async function setCloseToTray(value: boolean): Promise<void> {
-  await writePref(KEY_CLOSE_TO_TRAY, value);
+  await writePref(PREF_STORE_KEYS.closeToTray, value);
 }
 
 export async function setGenerator(value: GeneratorOptions): Promise<void> {
-  await writePref(KEY_GENERATOR, normalizeGeneratorOptions(value));
+  await writePref(PREF_STORE_KEYS.generator, normalizeGeneratorOptions(value));
 }

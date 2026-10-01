@@ -9,6 +9,7 @@
  * settings dialog) is the live feedback while dragging the slider.
  */
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { readShadow as readStored, writeShadow as writeStoredShadow } from "@/lib/fastPath";
 import { isSecondaryWindow } from "@/lib/platform";
 import { APP_OPACITY_DEFAULT, clampOpacity } from "./schema";
 
@@ -21,17 +22,8 @@ const PREVIEW_EVENT = "subclave://app-opacity-preview";
 const GLASS_EPSILON = 0.999;
 
 function readShadow(): number {
-  if (typeof window === "undefined") return APP_OPACITY_DEFAULT;
-  const raw = window.localStorage.getItem(FAST_PATH_KEY);
+  const raw = readStored(FAST_PATH_KEY);
   return clampOpacity(raw === null ? APP_OPACITY_DEFAULT : Number(raw));
-}
-
-function writeShadow(value: number): void {
-  try {
-    window.localStorage.setItem(FAST_PATH_KEY, String(value));
-  } catch {
-    // ignore: localStorage may be unavailable in some embeddings.
-  }
 }
 
 /**
@@ -57,7 +49,7 @@ export function applyAppOpacity(opacity: number): void {
   // Persist the fast-path shadow before the settings-window opt-out so the
   // next-boot first paint reflects the committed value regardless of which
   // window wrote it.
-  writeShadow(value);
+  writeStoredShadow(FAST_PATH_KEY, String(value));
   applyOpacityCss(value);
 }
 

@@ -34,16 +34,14 @@ export function hasCommand(id: ShortcutId): boolean {
 }
 
 /**
- * Run a registered command by id. Returns false when nothing is registered
- * (e.g. a documentation-only `readOnly` shortcut). When more than one component
- * owns the id, the FIRST-registered handler wins - matching the keyboard path,
- * where the first-mounted capture listener fires first and stops the rest. The
- * handler signature takes the triggering KeyboardEvent for the keyboard path; a
- * synthetic one is passed here since no palette-exposed command reads it.
+ * Run a registered command by id. Returns false when nothing is registered.
+ * When more than one component owns the id, the FIRST-registered handler wins -
+ * matching the keyboard path, where the first-mounted capture listener fires
+ * first and stops the rest.
  */
 export function runCommand(id: ShortcutId): boolean {
   const stack = registry.get(id);
   if (!stack || stack.length === 0) return false;
-  stack[0](new KeyboardEvent("keydown"));
+  stack[0]();
   return true;
 }

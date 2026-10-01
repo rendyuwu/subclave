@@ -296,7 +296,8 @@ pub fn open_record(keys: &SyncKeys, sealed: &SealedRecord) -> Result<Zeroizing<V
 /// can list the storage.
 ///
 /// Hex rather than base64 because the result is a path segment, and base64's
-/// alphabet includes `/`. The encoding is one fold, not a dependency.
+/// alphabet includes `/`. The encoding is the `hex` crate's, which
+/// `sigv4::hex` in `src-tauri/src/modules/sync/providers/sigv4.rs` also calls.
 ///
 /// The `:` is a real separator only because NO `kind` CONTAINS ONE. The two in
 /// use are `entry` and `group`, and both live in
@@ -305,11 +306,7 @@ pub fn open_record(keys: &SyncKeys, sealed: &SealedRecord) -> Result<Zeroizing<V
 pub fn object_name(keys: &SyncKeys, kind: &str, id: &str) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, &keys.name[..]);
     let tag = hmac::sign(&key, format!("{kind}:{id}").as_bytes());
-    tag.as_ref().iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    hex::encode(tag.as_ref())
 }
 
 #[cfg(test)]

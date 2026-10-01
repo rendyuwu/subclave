@@ -4,7 +4,7 @@
 use tauri::{Emitter, Manager};
 
 use crate::modules::vault::VaultState;
-use crate::windows::open_or_reveal_child;
+use crate::windows::{recenter_over_main, reveal};
 
 #[tauri::command]
 pub(crate) async fn open_settings_window(
@@ -15,26 +15,62 @@ pub(crate) async fn open_settings_window(
         Some(t) if !t.is_empty() => format!("settings.html?tab={}", t),
         _ => "settings.html".to_string(),
     };
+    let tab = tab.as_deref().filter(|s| !s.is_empty());
 
-    // Freshly built windows carry the tab in `url_path`; a revealed existing
-    // window won't re-read the URL, so it gets the tab pushed via event.
-    if open_or_reveal_child(
-        &app,
-        "settings",
-        url_path,
-        "Settings",
-        (880.0, 620.0),
-        (600.0, 480.0),
-    )?
-    .is_none()
-    {
-        if let Some(t) = tab.as_deref().filter(|s| !s.is_empty()) {
-            if let Some(window) = app.get_webview_window("settings") {
-                // emit() serializes via JSON, so no string-escape footgun.
-                let _ = window.emit(crate::modules::events::SETTINGS_TAB, t);
-            }
+    // Reopening an existing window won't re-read the URL, so it gets the tab
+    // pushed via event; a freshly built window carries the tab in `url_path`.
+    if let Some(window) = app.get_webview_window("settings") {
+        // Re-center over the main window so reopening follows the user
+        // across displays.
+        recenter_over_main(&app, &window);
+        reveal(&window);
+        if let Some(t) = tab {
+            // emit() serializes via JSON, so no string-escape footgun.
+            let _ = window.emit(crate::modules::events::SETTINGS_TAB, t);
         }
+        return Ok(());
     }
+
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(&app, "settings", tauri::WebviewUrl::App(url_path.into()))
+            .title("Settings")
+            .inner_size(880.0, 620.0)
+            .min_inner_size(600.0, 480.0)
+            .resizable(true)
+            .visible(false);
+
+    // Owner-window relationship: keeps the child z-ordered above main without
+    // pinning it above other apps. On Windows the OS auto-hides owned windows
+    // when the owner minimizes, so the child follows main into the taskbar
+    // instead of floating on the desktop.
+    if let Some(main) = app.get_webview_window("main") {
+        builder = builder.parent(&main).map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    // Linux/Windows render our own titlebar, so drop native chrome and make the
+    // window transparent.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let builder = builder.decorations(false).transparent(true);
+
+    let window = builder.build().map_err(|e| e.to_string())?;
+
+    // Some Linux compositors (GNOME/Mutter with CSD-by-default) ignore the
+    // builder-time decorations flag, so re-assert it after realize.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = window.set_decorations(false);
+    }
+    crate::platform::windows::disable_windows_corner_rounding(&window);
+
+    // Tauri's default placement lands at the primary monitor's center even when
+    // main is on a secondary display; re-center over main so it follows the
+    // user.
+    recenter_over_main(&app, &window);
     Ok(())
 }
 
@@ -51,16 +87,7 @@ pub(crate) async fn quit_subclave(app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod ui_thread_guard {
-    use std::collections::BTreeSet;
     use std::path::Path;
-
-    /// Sync `#[tauri::command]`s that are allowed to exist, each because it does
-    /// no blocking work.
-    ///
-    /// Every remaining command is `async`, so the list is empty. A new sync
-    /// command needs an entry here with the reason it cannot block - adding one
-    /// should be a deliberate act, not a way around `spawn_blocking`.
-    const ALLOWED_SYNC_COMMANDS: &[&str] = &[];
 
     fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -77,15 +104,14 @@ mod ui_thread_guard {
     }
 
     /// Names of every `#[tauri::command]` declared as `pub fn` rather than
-    /// `pub async fn`. A `BTreeSet` because `#[cfg]`-gated commands are declared
-    /// once per platform and would otherwise count twice.
-    fn sync_command_names() -> BTreeSet<String> {
+    /// `pub async fn`.
+    fn sync_command_names() -> Vec<String> {
         let mut files = Vec::new();
         rs_files(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
-        let mut found = BTreeSet::new();
+        let mut found = Vec::new();
         for path in files {
             let Ok(src) = std::fs::read_to_string(&path) else {
                 continue;
@@ -105,7 +131,7 @@ mod ui_thread_guard {
                     if let Some(rest) = t.strip_prefix("pub fn ") {
                         let name = rest.split('(').next().unwrap_or("").trim();
                         if !name.is_empty() {
-                            found.insert(name.to_string());
+                            found.push(name.to_string());
                         }
                         break;
                     }
@@ -122,35 +148,18 @@ mod ui_thread_guard {
     /// command off the thread, and each time the next one was added without
     /// anybody noticing the rule.
     ///
-    /// So the list is pinned. A new sync command fails here, which is the point:
-    /// adding one should be a deliberate act with a reason, and the default for
-    /// anything touching the filesystem, a subprocess, a socket or a pipe is
-    /// `pub async fn` plus `spawn_blocking`.
+    /// So sync commands are banned outright. A new one fails here, which is the
+    /// point: the default for anything touching the filesystem, a subprocess, a
+    /// socket or a pipe is `pub async fn` plus `spawn_blocking`.
     #[test]
     fn no_new_sync_tauri_commands() {
         let found = sync_command_names();
-        let allowed: BTreeSet<String> = ALLOWED_SYNC_COMMANDS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let added: Vec<&String> = found.difference(&allowed).collect();
         assert!(
-            added.is_empty(),
-            "new sync #[tauri::command]s found: {added:?}\n\
+            found.is_empty(),
+            "sync #[tauri::command]s found: {found:?}\n\
              On Windows these run on the WebView2 UI thread and will freeze the \
              window if they block. Make them `pub async fn` + \
-             `tauri::async_runtime::spawn_blocking`, or add them to \
-             ALLOWED_SYNC_COMMANDS with a reason why they cannot block."
-        );
-
-        // The other direction matters too: a command that got fixed should be
-        // struck off, so the list keeps describing reality instead of rotting.
-        let stale: Vec<&String> = allowed.difference(&found).collect();
-        assert!(
-            stale.is_empty(),
-            "ALLOWED_SYNC_COMMANDS lists commands that are no longer sync: {stale:?}\n\
-             Remove them from the list."
+             `tauri::async_runtime::spawn_blocking`."
         );
     }
 }

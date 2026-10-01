@@ -5,16 +5,7 @@
  */
 import { commentRangesOf, lineNumbersFor } from "../comments";
 
-import {
-  ANY_PINNED_CRATE,
-  BARE_LINE,
-  BARE_TRACKER,
-  DEP_OPENER,
-  DEP_SHAPE,
-  DEP_WELL_FORMED,
-  NAMED_CITATION,
-  TRACKER_PREFIX,
-} from "./detectors";
+import { BARE_LINE, NAMED_CITATION } from "./detectors";
 import {
   BACKTICKED,
   exemptDeadPath,
@@ -65,29 +56,8 @@ export function violationsIn(rel: string, src: string): Violation[] {
       flag("bare-line", at, m[0].trim());
     }
 
-    for (const m of comment.text.matchAll(BARE_TRACKER)) {
-      const at = m.index ?? 0;
-      const before = comment.text.slice(0, at);
-      if (!TRACKER_PREFIX.test(before)) flag("bare-tracker", at, m[0]);
-    }
-
-    // A pinned crate in citation position must complete its triple, on one line,
-    // at the version the lockfile pins.
-    for (const m of comment.text.matchAll(DEP_OPENER)) {
-      const at = m.index ?? 0;
-      const rest = comment.text.slice(at);
-      if (!DEP_WELL_FORMED.some((re) => re.test(rest))) {
-        flag("dep-form", at, rest.slice(0, 72).split("\n")[0]);
-      }
-    }
-    // And a citation shaped like a triple must credit one. Skipped when a pinned
-    // crate IS named, because then the more specific `dep-form` owns the finding.
-    for (const m of comment.text.matchAll(DEP_SHAPE)) {
-      if (!ANY_PINNED_CRATE.test(m[0])) flag("dep-uncredited", m.index ?? 0, m[0]);
-    }
-
     // Finally the REFERENT rather than the shape: every file this comment names
-    // has to be a file that exists. The five detectors above all pass a citation
+    // has to be a file that exists. The line detectors above all pass a citation
     // that is beautifully formed and points at nothing.
     for (const m of comment.text.matchAll(BACKTICKED)) {
       const spelling = m[1].trim();

@@ -36,7 +36,7 @@ export function EntryList(): ReactNode {
         entries,
         scope,
         tagFilter,
-        searchIds: searchIds === null ? null : new Set(searchIds),
+        searchIds,
         now: Date.now(),
       }),
     [entries, scope, tagFilter, searchIds],

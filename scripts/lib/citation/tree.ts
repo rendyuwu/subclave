@@ -89,15 +89,7 @@ export function runTreeChecks(): void {
       found.push(...violationsIn(rel, src));
     }
 
-    for (const kind of [
-      "named",
-      "bare-line",
-      "bare-tracker",
-      "dep-form",
-      "dep-uncredited",
-      "dead-path",
-      "self-resolved",
-    ]) {
+    for (const kind of ["named", "bare-line", "dead-path", "self-resolved"]) {
       const offenders = found.filter((v) => v.kind === kind);
       check(
         `${root} carries no ${kind} citation in a comment`,

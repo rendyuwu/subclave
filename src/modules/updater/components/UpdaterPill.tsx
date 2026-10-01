@@ -1,9 +1,33 @@
 import { IconTooltip } from "@/components/ui/icon-tooltip";
 import { formatBytes } from "@/lib/format";
-import { CircleAlert, Download, RefreshCw } from "lucide-react";
+import { CircleAlert, Download, RefreshCw, type LucideIcon } from "lucide-react";
 import { useState } from "react";
-import { useUpdater } from "../lib/useUpdater";
+import { useUpdater, type UpdaterState } from "../lib/useUpdater";
 import { UpdaterDialog } from "./UpdaterDialog";
+
+/** The long-form status copy, shared by the pill's tooltip and the About
+ *  section's update button so both windows say the same thing. */
+export function updaterLabel(state: UpdaterState): string {
+  switch (state.kind) {
+    case "ready":
+      return "Restart to apply update";
+    case "downloading":
+      return `Downloading update ${formatProgress(state.received, state.total)}`;
+    case "available":
+    case "manual-available":
+      return `Update available · v${state.version}`;
+    case "error":
+      return `Update check failed: ${state.message}`;
+    default:
+      return "Update";
+  }
+}
+
+export function updaterIcon(state: UpdaterState): LucideIcon {
+  if (state.kind === "ready") return RefreshCw;
+  if (state.kind === "error") return CircleAlert;
+  return Download;
+}
 
 export function UpdaterPill() {
   const updater = useUpdater();
@@ -20,25 +44,8 @@ export function UpdaterPill() {
     updater.state.kind === "ready" ||
     updater.state.kind === "error";
 
-  const label =
-    updater.state.kind === "ready"
-      ? "Restart to apply update"
-      : updater.state.kind === "downloading"
-        ? `Downloading update ${formatProgress(updater.state.received, updater.state.total)}`
-        : updater.state.kind === "available"
-          ? `Update available · v${updater.state.version}`
-          : updater.state.kind === "manual-available"
-            ? `Update available · v${updater.state.version}`
-            : updater.state.kind === "error"
-              ? `Update check failed: ${updater.state.message}`
-              : "Update";
-
-  const Icon =
-    updater.state.kind === "ready"
-      ? RefreshCw
-      : updater.state.kind === "error"
-        ? CircleAlert
-        : Download;
+  const label = updaterLabel(updater.state);
+  const Icon = updaterIcon(updater.state);
 
   const isError = updater.state.kind === "error";
   const pillClass = isError

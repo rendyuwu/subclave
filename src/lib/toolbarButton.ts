@@ -1,5 +1,5 @@
 /**
- * Shared hover / open / active styling for the top toolbar icon buttons
+ * Shared hover styling for the top toolbar icon buttons
  * (Header, inline Search, SSH menu) so every one of
  * them picks up the active theme's `--accent` identically.
  *
@@ -17,23 +17,6 @@
 /** Accent hover that also wins in dark mode (beats the ghost `dark:hover:bg-muted/50`). */
 export const TOOLBAR_HOVER =
   "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent dark:hover:text-accent-foreground";
-
-/**
- * The same hover, in the pane header's quieter vocabulary. A pane header's own
- * buttons (grip / float / gear / close) are raw `<button>`s that hover to
- * `bg-muted`; a `<Button variant="ghost">` sitting among them needs
- * the `dark:` twin spelled out for exactly the reason above, or dark mode gives
- * it `muted/50` and it hovers a shade paler than every button beside it.
- */
-export const PANE_HEADER_HOVER =
-  "hover:bg-muted hover:text-foreground dark:hover:bg-muted dark:hover:text-foreground";
-
-/** Accent highlight for an open dropdown trigger (e.g. the SSH menu), light + dark. */
-export const TOOLBAR_EXPANDED =
-  "aria-expanded:bg-accent aria-expanded:text-accent-foreground dark:aria-expanded:bg-accent dark:aria-expanded:text-accent-foreground";
-
-/** Accent fill for a toggle button's active state (markdown preview, word wrap). */
-export const TOOLBAR_ACTIVE = "bg-accent text-accent-foreground";
 
 /**
  * Delete / remove icon buttons (trash glyphs, and the close X on a workspace or

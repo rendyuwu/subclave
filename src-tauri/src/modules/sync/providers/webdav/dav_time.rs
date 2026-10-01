@@ -1,6 +1,6 @@
 //! The one date format a listing spells its modification time in.
 
-use super::super::sigv4;
+use chrono::DateTime;
 
 /// Unix MILLISECONDS from the date format a listing's modification time is
 /// spelled in, or `None`.
@@ -22,9 +22,14 @@ use super::super::sigv4;
 /// mistaken for expired. If a real server is ever found emitting one, this is
 /// additive.
 ///
-/// Shares the era arithmetic in
-/// `src-tauri/src/modules/sync/providers/sigv4.rs` rather than carrying a
-/// second copy of it.
+/// THE CALENDAR IS `chrono`'S, and the gate in front of it does the two jobs
+/// `chrono` cannot do here. It fixes the zone: the format's only zone is
+/// `GMT`, where an RFC 2822 parser also reads a numeric offset or one of the
+/// obsolete American ones. And it drops the day name before parsing, because
+/// the name is redundant with the date beside it and this must not refuse a
+/// row over a server that got the name wrong, where `chrono` checks the two
+/// against each other. The seconds field is bounded here as well: the general
+/// format allows a leap second and the count below has no room for one.
 pub fn parse_http_date(s: &str) -> Option<u64> {
     let s = s.trim();
     let b = s.as_bytes();
@@ -50,35 +55,13 @@ pub fn parse_http_date(s: &str) -> Option<u64> {
         }
         part.parse().ok()
     };
-    // The day name is not checked. It is redundant with the date beside it, and
-    // a recipient is told to ignore it rather than to validate it.
-    let day = num(5, 7)?;
-    let month = match &s[8..11] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year = num(12, 16)? as i64;
-    let hour = num(17, 19)?;
-    let minute = num(20, 22)?;
-    let second = num(23, 25)?;
-    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+    if num(23, 25)? > 59 {
         return None;
     }
-    let secs = sigv4::days_from_civil(year, month, day) * 86_400
-        + hour as i64 * 3600
-        + minute as i64 * 60
-        + second as i64;
+    // Past the `", "`, so the day name and its comma are left behind; RFC 2822
+    // makes the name optional and this one is not checked.
+    let at = DateTime::parse_from_rfc2822(&s[5..]).ok()?;
+    let secs = at.timestamp();
     if secs < 0 {
         return None;
     }

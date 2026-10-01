@@ -31,26 +31,21 @@ pub(crate) fn disable_windows_corner_rounding(window: &tauri::WebviewWindow) {
 pub(crate) fn disable_windows_corner_rounding(_window: &tauri::WebviewWindow) {}
 
 /// Make a borderless (`decorations: false`) window behave like a normal app on
-/// Windows. Two defects come from dropping the native frame:
+/// Windows. Dropping the native frame leaves one defect here:
 ///
-///   1. **Maximize covers the taskbar.** Windows only auto-clamps a maximized
-///      window to the monitor *work area* when it carries a standard frame
-///      (`WS_THICKFRAME` + `WS_CAPTION`). A borderless window instead fills the
-///      whole monitor, so it runs off the bottom over the taskbar - and an
-///      OS-level window screenshot then faithfully captures a window that
-///      genuinely extends to the bottom of the screen.
-///   2. **Taskbar button can't minimize.** Without `WS_MINIMIZEBOX`, clicking
-///      the app's taskbar button does not toggle minimize the way every other
-///      window does (only the in-app control works).
+///   **Maximize covers the taskbar.** Windows only auto-clamps a maximized
+///   window to the monitor *work area* when it carries a standard frame
+///   (`WS_THICKFRAME` + `WS_CAPTION`). A borderless window instead fills the
+///   whole monitor, so it runs off the bottom over the taskbar - and an
+///   OS-level window screenshot then faithfully captures a window that
+///   genuinely extends to the bottom of the screen.
 ///
-/// Both are fixed without re-adding any visible chrome (`WS_CAPTION` /
-/// `WS_SYSMENU` stay off, so no title bar or system buttons are painted):
-///   - re-add `WS_MINIMIZEBOX | WS_MAXIMIZEBOX` so the taskbar button and Aero
-///     Snap work, and
-///   - subclass the window proc to clamp `WM_GETMINMAXINFO`'s maximized rect to
-///     the current monitor's work area. The original proc is called first so
-///     TAO's `min_inner_size` enforcement (also delivered via this message) is
-///     preserved; only the maximized position/size are overridden.
+/// It is fixed without re-adding any visible chrome (`WS_CAPTION` /
+/// `WS_SYSMENU` stay off, so no title bar or system buttons are painted) by
+/// subclassing the window proc to clamp `WM_GETMINMAXINFO`'s maximized rect to
+/// the current monitor's work area. The original proc is called first so TAO's
+/// `min_inner_size` enforcement (also delivered via this message) is preserved;
+/// only the maximized position/size are overridden.
 #[cfg(target_os = "windows")]
 pub(crate) fn apply_windows_frame_fixes(window: &tauri::WebviewWindow) {
     use std::sync::atomic::{AtomicIsize, Ordering};
@@ -59,8 +54,8 @@ pub(crate) fn apply_windows_frame_fixes(window: &tauri::WebviewWindow) {
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, DefWindowProcW, GetWindowLongPtrW, SetWindowLongPtrW, GWLP_WNDPROC,
-        GWL_STYLE, MINMAXINFO, WM_GETMINMAXINFO, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+        CallWindowProcW, DefWindowProcW, SetWindowLongPtrW, GWLP_WNDPROC, MINMAXINFO,
+        WM_GETMINMAXINFO,
     };
 
     // Single main window, so one slot for the original proc is enough.
@@ -110,12 +105,6 @@ pub(crate) fn apply_windows_frame_fixes(window: &tauri::WebviewWindow) {
     let hwnd = hwnd.0 as HWND;
 
     unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let new_style = style | (WS_MINIMIZEBOX as isize) | (WS_MAXIMIZEBOX as isize);
-        if new_style != style {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
-        }
-
         // Install the subclass once; re-running would chain it onto itself.
         if PREV_WNDPROC.load(Ordering::Relaxed) == 0 {
             let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as isize);
@@ -156,11 +145,10 @@ pub(crate) fn disable_browser_accelerator_keys(window: &tauri::WebviewWindow) {
 pub(crate) fn disable_browser_accelerator_keys(_window: &tauri::WebviewWindow) {}
 
 /// The Windows setup block from `run`, in its original order: strip DWM rounded
-/// corners, clamp borderless maximize to the work area and restore the taskbar
-/// minimize affordance, then stop WebView2 from hijacking Ctrl+W / Ctrl+P /
-/// Ctrl+R / etc. as browser shortcuts (as window-closing actions they would act
-/// on the whole window before web content could cancel them). Off Windows every
-/// step is a no-op.
+/// corners, clamp borderless maximize to the work area, then stop WebView2 from
+/// hijacking Ctrl+W / Ctrl+P / Ctrl+R / etc. as browser shortcuts (as
+/// window-closing actions they would act on the whole window before web content
+/// could cancel them). Off Windows every step is a no-op.
 pub(crate) fn apply_main_window_fixes(window: &tauri::WebviewWindow) {
     disable_windows_corner_rounding(window);
     apply_windows_frame_fixes(window);

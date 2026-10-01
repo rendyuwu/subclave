@@ -1,4 +1,4 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { IPC_EVENTS } from "@/lib/ipc";
 
 export type VaultLockReason = "manual" | "idle" | "minimize" | "tray";
@@ -12,11 +12,11 @@ export type VaultEventHandlers = {
 };
 
 /**
- * Subscribe to the vault events the Rust side emits. Resolves to the unlisten
- * functions in subscription order; the app window holds them for its lifetime.
+ * Subscribe to the vault events the Rust side emits. The app window owns the
+ * subscriptions for its lifetime, so the unlisten functions are discarded.
  */
-export async function subscribeVaultEvents(handlers: VaultEventHandlers): Promise<UnlistenFn[]> {
-  return Promise.all([
+export async function subscribeVaultEvents(handlers: VaultEventHandlers): Promise<void> {
+  await Promise.all([
     listen<{ reason: VaultLockReason }>(IPC_EVENTS.VAULT_LOCKED, (event) =>
       handlers.onLocked?.(event.payload.reason),
     ),

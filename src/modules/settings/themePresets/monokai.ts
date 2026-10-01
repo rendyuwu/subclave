@@ -35,31 +35,16 @@ const MONOKAI_DARK: ThemeColors = {
   sidebarAccent: "#75715e",
   sidebarAccentForeground: "#f8f8f2",
   iconWorking: "#e6db74",
-  iconIdle: "#a6e22e",
-  iconBlocked: "#f92672",
-  iconDone: "#66d9ef",
-  iconBranch: "#ae81ff",
   diffAdded: "#a6e22e",
-  diffRemoved: "#f92672",
   info: "#66d9ef",
   resizeHandle: "#3e3d32",
-  // Monokai ANSI 16.
-  ansiBlack: "#272822",
+  // Monokai ANSI accents.
   ansiRed: "#f92672",
   ansiGreen: "#a6e22e",
   ansiYellow: "#f4bf75",
   ansiBlue: "#66d9ef",
   ansiMagenta: "#ae81ff",
   ansiCyan: "#a1efe4",
-  ansiWhite: "#f8f8f2",
-  ansiBrightBlack: "#75715e",
-  ansiBrightRed: "#f92672",
-  ansiBrightGreen: "#a6e22e",
-  ansiBrightYellow: "#f4bf75",
-  ansiBrightBlue: "#66d9ef",
-  ansiBrightMagenta: "#ae81ff",
-  ansiBrightCyan: "#a1efe4",
-  ansiBrightWhite: "#f9f8f5",
 };
 // Monokai Light. The bright cyan accent (#0099a8) on white text fails AA
 // (~3.5:1); deepened to #006d75 (~5.6:1) while keeping the Monokai cyan
@@ -92,33 +77,17 @@ const MONOKAI_LIGHT: ThemeColors = {
   sidebarAccent: "#5e5b4a",
   sidebarAccentForeground: "#fafafa",
   iconWorking: "#b58900",
-  iconIdle: "#75af00",
-  iconBlocked: "#f92672",
-  iconDone: "#006d75",
-  iconBranch: "#7c4dbd",
   diffAdded: "#75af00",
-  diffRemoved: "#f92672",
   info: "#006d75",
   resizeHandle: "#d1d1d1",
   // Monokai has no canonical light terminal palette; these keep the Monokai
   // hues but deepened so red/green/yellow/cyan read on the #fafafa background.
-  // Brights restore the familiar neon Monokai tones.
-  ansiBlack: "#272822",
   ansiRed: "#c2185b",
   ansiGreen: "#5a7d00",
   ansiYellow: "#a6770a",
   ansiBlue: "#1c7e8e",
   ansiMagenta: "#7c4dbd",
   ansiCyan: "#0a8a8a",
-  ansiWhite: "#5a5848",
-  ansiBrightBlack: "#75715e",
-  ansiBrightRed: "#f92672",
-  ansiBrightGreen: "#7aab00",
-  ansiBrightYellow: "#c89a2a",
-  ansiBrightBlue: "#0099a8",
-  ansiBrightMagenta: "#9a6fe0",
-  ansiBrightCyan: "#3aa9a0",
-  ansiBrightWhite: "#272822",
 };
 
 export const MONOKAI: CustomTheme = {

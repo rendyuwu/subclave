@@ -36,6 +36,16 @@ pub fn classify(status: u16) -> ProviderError {
     }
 }
 
+/// The refusal for a 409 that survives the collection ladder: the parents
+/// exist, so the only reading left is that one of them is an ordinary file
+/// where a collection was needed. Nothing about trying again changes that.
+fn not_a_collection(key: &str) -> ProviderError {
+    let parent = ancestors(key).pop().unwrap_or_else(|| "/".to_string());
+    ProviderError::Blocked(format!(
+        "blocked: \"{parent}\" exists but is not a collection, so \"{key}\" cannot be stored under it"
+    ))
+}
+
 /// A get's outcome. `Ok(None)` means the key is simply not there.
 ///
 /// An authentication failure is NOT that: it goes to `classify` and comes back
@@ -64,12 +74,7 @@ pub fn classify_put(status: u16, key: &str, retried: bool) -> Result<Option<()>,
     match status {
         200..=299 => Ok(Some(())),
         409 if !retried => Ok(None),
-        409 => {
-            let parent = ancestors(key).pop().unwrap_or_else(|| "/".to_string());
-            Err(ProviderError::Blocked(format!(
-                "blocked: \"{parent}\" exists but is not a collection, so \"{key}\" cannot be stored under it"
-            )))
-        }
+        409 => Err(not_a_collection(key)),
         _ => Err(classify(status)),
     }
 }
@@ -115,12 +120,7 @@ pub fn classify_put_if_absent(
         200..=299 => Ok(PutIfAbsent::Stored),
         412 => Ok(PutIfAbsent::Exists),
         409 if !retried => Ok(PutIfAbsent::NeedsParents),
-        409 => {
-            let parent = ancestors(key).pop().unwrap_or_else(|| "/".to_string());
-            Err(ProviderError::Blocked(format!(
-                "blocked: \"{parent}\" exists but is not a collection, so \"{key}\" cannot be stored under it"
-            )))
-        }
+        409 => Err(not_a_collection(key)),
         _ => Err(classify(status)),
     }
 }
@@ -147,11 +147,9 @@ pub fn classify_put_if_absent(
 /// `parse_multistatus` names: an empty inventory is republished whole
 /// under the new prefix.
 pub fn classify_list(status: u16) -> Result<Option<()>, ProviderError> {
-    match status {
-        200..=299 => Ok(Some(())),
-        404 => Ok(None),
-        _ => Err(classify(status)),
-    }
+    // The same map as a get: a 404 is the ordinary "nothing is there" answer,
+    // which for a listing is an empty inventory.
+    classify_get(status)
 }
 
 /// A delete's outcome. Removing something already gone is not an error.

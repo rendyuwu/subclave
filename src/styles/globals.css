@@ -19,19 +19,7 @@
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: "Inter Variable", sans-serif;
-  --color-sidebar-ring: var(--sidebar-ring);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar: var(--sidebar);
-  --color-chart-5: var(--chart-5);
-  --color-chart-4: var(--chart-4);
-  --color-chart-3: var(--chart-3);
-  --color-chart-2: var(--chart-2);
-  --color-chart-1: var(--chart-1);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
@@ -51,20 +39,8 @@
   --color-foreground: var(--foreground);
   --color-background: var(--background);
   --color-diff-added: var(--subclave-diff-added);
-  --color-diff-removed: var(--subclave-diff-removed);
   --color-info: var(--subclave-info);
   --color-icon-working: var(--subclave-icon-working);
-  --color-icon-idle: var(--subclave-icon-idle);
-  --color-icon-blocked: var(--subclave-icon-blocked);
-  --color-icon-done: var(--subclave-icon-done);
-  --color-icon-branch: var(--subclave-icon-branch);
-  --radius-sm: 0px;
-  --radius-md: 0px;
-  --radius-lg: 0px;
-  --radius-xl: 0px;
-  --radius-2xl: 0px;
-  --radius-3xl: 0px;
-  --radius-4xl: 0px;
 }
 
 /* Toast auto-dismiss countdown (src/components/ui/toast.tsx). The bar drains
@@ -80,22 +56,14 @@
 }
 
 :root {
-  /* AI CLI status colors. Themable via Settings > Theme. Defaults match the
+  /* AI CLI working color. Themable via Settings > Theme. Defaults match the
    * pre-existing emerald/yellow/red pill the codebase shipped with so the
    * out-of-box look is unchanged. */
-  --subclave-icon-idle: #059669;
   --subclave-icon-working: #ca8a04;
-  --subclave-icon-blocked: #dc2626;
-  /* "done" (finished, unacknowledged): blue, distinct from the green idle. */
-  --subclave-icon-done: #2563eb;
-  /* Git branch glyph wherever a branch NAME is shown. Violet so a branch reads
-   * as a branch at a glance and never as an AI/CLI status colour. */
-  --subclave-icon-branch: #7c3aed;
-  /* Semantic diff colors (git +/-, SCM status). Themable. Kept distinct
+  /* Semantic diff-additions color (git +, SCM status). Themable. Kept distinct
    * from --destructive so destructive remains an actionable-danger token
-   * and diff removed stays a "kind of change" indicator. */
+   * and diff stays a "kind of change" indicator. */
   --subclave-diff-added: #16a34a;
-  --subclave-diff-removed: #dc2626;
   /* Semantic "info" / neutral status color (toasts, renamed/copied SCM
    * rows, SSH info pills). Themable. */
   --subclave-info: #0284c7;
@@ -108,34 +76,17 @@
    * `data-subclave-glass`, consumed by the `html[data-subclave-glass="on"]`
    * rules. */
   --subclave-app-opacity: 1;
-  /* Tab focus / active stripe color per tab kind. Themable via Settings
-   * > Theme (the "Tabs" group of the colour editor). */
-  --subclave-tab-terminal: #10b981;
-  --subclave-tab-ssh: #0ea5e9;
-  --subclave-tab-editor: #0057fe;
-  --subclave-tab-browser: #06b6d4;
-  --subclave-tab-ai-diff: #8b5cf6;
-  --subclave-tab-git-diff: #f59e0b;
   /* Drag-to-resize divider between split panes. Themable via Settings. */
   --subclave-resize-handle: #e5e7eb;
-  /* ANSI 16 palette for the terminal. Themable per preset. Light-mode
-   * defaults are slightly muted; dark variants below brighten them. */
-  --subclave-ansi-black: #3f3f46;
+  /* ANSI accent palette the entry / group colour picker paints with. Themable
+   * per preset. Light-mode defaults are slightly muted; dark variants below
+   * brighten them. */
   --subclave-ansi-red: #dc2626;
   --subclave-ansi-green: #16a34a;
   --subclave-ansi-yellow: #ca8a04;
   --subclave-ansi-blue: #2563eb;
   --subclave-ansi-magenta: #9333ea;
   --subclave-ansi-cyan: #0891b2;
-  --subclave-ansi-white: #e4e4e7;
-  --subclave-ansi-bright-black: #71717a;
-  --subclave-ansi-bright-red: #ef4444;
-  --subclave-ansi-bright-green: #22c55e;
-  --subclave-ansi-bright-yellow: #eab308;
-  --subclave-ansi-bright-blue: #3b82f6;
-  --subclave-ansi-bright-magenta: #a855f7;
-  --subclave-ansi-bright-cyan: #06b6d4;
-  --subclave-ansi-bright-white: #fafafa;
   --background: oklch(1 0 0);
   --foreground: oklch(0.148 0.004 228.8);
   --card: #f6f7f9;
@@ -154,12 +105,6 @@
   --border: #e4e7ec;
   --input: #dce1e7;
   --ring: #0057fe;
-  --chart-1: oklch(0.872 0.007 219.6);
-  --chart-2: oklch(0.56 0.021 213.5);
-  --chart-3: oklch(0.45 0.017 213.2);
-  --chart-4: oklch(0.378 0.015 216);
-  --chart-5: oklch(0.275 0.011 216.9);
-  --radius: 0px;
   --sidebar: #eef0f3;
   --sidebar-foreground: oklch(0.148 0.004 228.8);
   --sidebar-primary: #0057fe;
@@ -175,44 +120,22 @@
  * focus/brand #0057FE (logo blue), fg #CCCCCC. Hex kept as-is (sRGB) so the
  * result matches VSCode's pixel feel rather than drifting through OKLCH. */
 .dark {
-  /* Brighter defaults for the AI CLI status icons under dark mode. */
-  --subclave-icon-idle: #34d399;
+  /* Brighter working-icon default for dark mode. */
   --subclave-icon-working: #facc15;
-  --subclave-icon-blocked: #f87171;
-  --subclave-icon-done: #60a5fa;
-  --subclave-icon-branch: #a78bfa;
   /* Brighter diff + info colors for dark mode. */
   --subclave-diff-added: #4ade80;
-  --subclave-diff-removed: #f87171;
   --subclave-info: #38bdf8;
   /* Dark base for the canvas. */
   --subclave-canvas-bg: #1a1a1a;
-  /* Slightly brighter tab stripes for dark mode. */
-  --subclave-tab-terminal: #34d399;
-  --subclave-tab-ssh: #38bdf8;
-  --subclave-tab-editor: #5b8bff;
-  --subclave-tab-browser: #22d3ee;
-  --subclave-tab-ai-diff: #a78bfa;
-  --subclave-tab-git-diff: #fbbf24;
   --subclave-resize-handle: #2b2b2b;
-  /* Brighter ANSI palette for dark mode (matches the previous hardcoded
+  /* Brighter ANSI accents for dark mode (matches the previous hardcoded
    * Tailwind defaults the codebase shipped with). */
-  --subclave-ansi-black: #18181b;
   --subclave-ansi-red: #ef4444;
   --subclave-ansi-green: #22c55e;
   --subclave-ansi-yellow: #eab308;
   --subclave-ansi-blue: #3b82f6;
   --subclave-ansi-magenta: #a855f7;
   --subclave-ansi-cyan: #06b6d4;
-  --subclave-ansi-white: #e4e4e7;
-  --subclave-ansi-bright-black: #52525b;
-  --subclave-ansi-bright-red: #f87171;
-  --subclave-ansi-bright-green: #4ade80;
-  --subclave-ansi-bright-yellow: #facc15;
-  --subclave-ansi-bright-blue: #60a5fa;
-  --subclave-ansi-bright-magenta: #c084fc;
-  --subclave-ansi-bright-cyan: #22d3ee;
-  --subclave-ansi-bright-white: #fafafa;
   --background: #1a1a1a;
   --foreground: #cccccc;
   --card: #2b2b2b;
@@ -231,11 +154,6 @@
   --border: #383838;
   --input: #3f3f3f;
   --ring: #0057fe;
-  --chart-1: #5a8aff;
-  --chart-2: #c586c0;
-  --chart-3: #dcdcaa;
-  --chart-4: #9cdcfe;
-  --chart-5: #ce9178;
   --sidebar: #141414;
   --sidebar-foreground: #cccccc;
   --sidebar-primary: #0057fe;
@@ -302,10 +220,9 @@
     @apply font-sans;
   }
 
-  /* Squarify everything globally - Tailwind's `rounded` (no suffix) and
-   * `rounded-full` use literal values not derived from --radius-*, so the
-   * @theme overrides above don't reach them. Force-zero every border-radius
-   * to guarantee a fully boxed UI. */
+  /* Squarify everything globally. Tailwind's `rounded-*` utilities resolve to
+   * their own radius values, so force-zero every border-radius to guarantee a
+   * fully boxed UI. */
   *,
   *::before,
   *::after {
@@ -495,12 +412,6 @@ html[data-subclave-glass="on"] *::after {
  * approach via `scrollbar-width: none` on `*` is exactly what made the
  * scrollbars vanish - keeping those properties untouched here
  * is what lets the rest of these rules actually take effect.
- *
- * Opt out per-region with `.no-scrollbar` (single element) or
- * `.no-scrollbar-deep` (cascades to descendants). The Radix `<ScrollArea>`
- * primitive renders its own custom thumb on top of an `overflow:scroll`
- * viewport; the override at the bottom of this section keeps that
- * viewport's native bar hidden so we don't get double scrollbars.
  */
 html[data-chrome="borderless"] *::-webkit-scrollbar {
   width: 10px;
@@ -522,80 +433,16 @@ html[data-chrome="borderless"] *::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-/* Radix ScrollArea: viewport already gets `overflow:scroll` from the
- * primitive and a custom thumb is rendered on top. The global rule above
- * wins on specificity, so without these overrides every Radix scroll area
- * would show TWO scrollbars (native + custom).
- *
- * Both axes are belt-and-braces: `scrollbar-width: none` hides the native
- * bar under the modern CSS scrollbar UI that WebView2 falls back to in
- * some HiDPI/zoom states (where `::-webkit-scrollbar { display: none }`
- * is silently ignored), and the webkit rule covers the legacy path. We
- * scope `scrollbar-width` to this single element so it does NOT trip the
- * "switches the engine to modern UI globally" footgun described above. */
-[data-radix-scroll-area-viewport] {
-  scrollbar-width: none !important;
-}
-[data-radix-scroll-area-viewport]::-webkit-scrollbar {
-  display: none !important;
-  width: 0 !important;
-  height: 0 !important;
-}
-
-/* Radix wraps Viewport children in an inner `<div style="display:table;
- * min-width:100%">`. With `display:table`, the wrapper shrinks-to-fit
- * its widest descendant, so long unbreakable content (paths, hit lines)
- * pushes it wider than the viewport and triggers horizontal scroll -
- * which breaks `truncate` and `break-all` on inner rows. Every
- * ScrollArea in this app is a vertical-only list, so coerce the wrapper
- * to a block that respects the viewport's width and lets children
- * truncate/wrap normally. */
-[data-radix-scroll-area-viewport] > div {
-  display: block !important;
-  width: 100% !important;
-  min-width: 0 !important;
-}
-
 /* `react-resizable-panels` wraps every Panel's children in an internal
  * <div style="overflow: auto"> (so consumers don't have to think about
- * runaway content). In this app every panel handles its own scroll via
- * an inner Radix `<ScrollArea>`, so that wrapper's `overflow:auto` is
- * dead weight — but sub-pixel rounding at scroll extremes (e.g. when
- * the file explorer is scrolled to the bottom) gives the wrapper a
- * 1-2px overflow and it paints a native scrollbar right next to the
- * Radix custom one. Result: a phantom second scrollbar. The selector
- * targets the panel's immediate child (the library always renders
- * exactly one wrapper there) and uses `!important` to beat the inline
- * style. */
+ * runaway content). Each panel here is a fixed-height, `overflow-hidden`
+ * frame, but sub-pixel rounding of the fractional panel size gives that
+ * wrapper a 1-2px overflow at the extremes and it paints a native scrollbar
+ * down the pane edge. The selector targets the panel's immediate child (the
+ * library always renders exactly one wrapper there) and uses `!important` to
+ * beat the inline style. */
 [data-slot="resizable-panel"] > div {
   overflow: hidden !important;
-}
-
-/* ===== Opt-out classes =====
- * `.no-scrollbar` hides the scrollbar on a single element; the deep variant
- * cascades to every descendant. Both win against the global webkit rules
- * above via `!important`. Used for command palettes / dropdowns where a
- * visible scrollbar would clutter the menu. */
-.no-scrollbar {
-  scrollbar-width: none !important;
-  -ms-overflow-style: none !important;
-}
-.no-scrollbar::-webkit-scrollbar {
-  width: 0 !important;
-  height: 0 !important;
-  display: none !important;
-}
-
-.no-scrollbar-deep,
-.no-scrollbar-deep * {
-  scrollbar-width: none !important;
-  -ms-overflow-style: none !important;
-}
-.no-scrollbar-deep::-webkit-scrollbar,
-.no-scrollbar-deep *::-webkit-scrollbar {
-  width: 0 !important;
-  height: 0 !important;
-  display: none !important;
 }
 
 /* ===== Status-bar groups (StatusBar.tsx right cluster) =====

@@ -53,28 +53,18 @@ pub(crate) fn emit_changed(app: &AppHandle, ids: &[String], origin: &str) {
     );
 }
 
-/// `{ reason } | null`, per the event table: `None` is the success signal a
-/// retry sends to clear the banner.
-fn emit_save_failed(app: &AppHandle, reason: Option<&str>) {
-    let _ = app.emit(
-        events::VAULT_SAVE_FAILED,
-        match reason {
-            Some(r) => serde_json::json!(r),
-            None => serde_json::Value::Null,
-        },
-    );
-}
-
-/// Drain the last save outcome into `subclave:vault-save-failed`. Every
-/// command shell calls this after its inner result, and the tick after its
-/// retry, so the banner tracks every save attempt whatever path made it.
+/// Drain the last save outcome into `subclave:vault-save-failed`: `{ reason }`
+/// on failure, `null` on success (the retry's clear signal). Every command
+/// shell calls this after its inner result, and the tick after its retry, so
+/// the banner tracks every save attempt whatever path made it.
 pub(crate) fn drain_save_event(app: &AppHandle) {
     let state = app.state::<VaultState>();
-    match state.take_save_event() {
-        Some(SaveOutcome::Failed(reason)) => emit_save_failed(app, Some(&reason)),
-        Some(SaveOutcome::Succeeded) => emit_save_failed(app, None),
-        None => {}
-    }
+    let reason = match state.take_save_event() {
+        Some(SaveOutcome::Failed(reason)) => serde_json::json!(reason),
+        Some(SaveOutcome::Succeeded) => serde_json::Value::Null,
+        None => return,
+    };
+    let _ = app.emit(events::VAULT_SAVE_FAILED, reason);
 }
 
 /// Run `f` on the blocking pool with the managed [`VaultState`] resolved

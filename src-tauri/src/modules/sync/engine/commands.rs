@@ -68,9 +68,8 @@ impl SyncState {
     }
 
     /// ONE SPELLING OF THE WRITE for both the open and the close.
-    pub(crate) fn set(&self, session: Option<SyncSession>) -> Result<(), String> {
+    pub(crate) fn set(&self, session: Option<SyncSession>) {
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
-        Ok(())
     }
 
     pub(crate) fn clear(&self) {
@@ -83,6 +82,17 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Run `f` on the blocking pool, turning a panic or a cancelled task into the
+/// one error string every caller here spells the same way.
+async fn blocking<T>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("sync: task failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -183,9 +193,7 @@ pub async fn configure_keyfile(
         let pass = non_empty(passphrase)
             .ok_or_else(|| "sync: the sync passphrase is required".to_string())?;
         let pass_for_strength = pass.clone();
-        let strength = tokio::task::spawn_blocking(move || strength_of(&pass_for_strength))
-            .await
-            .map_err(|e| format!("sync: task failed: {e}"))?;
+        let strength = blocking(move || strength_of(&pass_for_strength)).await?;
         if strength.score < 3 {
             return Err(match strength.warning {
                 Some(warning) => format!("sync: the sync passphrase is too weak: {warning}"),
@@ -193,10 +201,7 @@ pub async fn configure_keyfile(
             });
         }
         let pass_for_mint = pass.clone();
-        let (keyfile, root) =
-            tokio::task::spawn_blocking(move || new_keyfile_with_root(&pass_for_mint))
-                .await
-                .map_err(|e| format!("sync: task failed: {e}"))??;
+        let (keyfile, root) = blocking(move || new_keyfile_with_root(&pass_for_mint)).await??;
         let bytes = serde_json::to_vec(&keyfile)
             .map_err(|_| "sync: the keyfile could not be written".to_string())?;
         return match provider
@@ -219,9 +224,7 @@ pub async fn configure_keyfile(
                 };
                 let keyfile: SyncKeyfile =
                     serde_json::from_slice(&object.bytes).map_err(|_| NOT_A_KEYFILE.to_string())?;
-                let root = tokio::task::spawn_blocking(move || open_keyfile_root(&keyfile, &pass))
-                    .await
-                    .map_err(|e| format!("sync: task failed: {e}"))??;
+                let root = blocking(move || open_keyfile_root(&keyfile, &pass)).await??;
                 Ok(Configured {
                     remote: RemoteState::Existing,
                     root: Some(root),
@@ -242,9 +245,7 @@ pub async fn configure_keyfile(
     }
     let pass =
         non_empty(passphrase).ok_or_else(|| "sync: the sync passphrase is required".to_string())?;
-    let root = tokio::task::spawn_blocking(move || open_keyfile_root(&keyfile, &pass))
-        .await
-        .map_err(|e| format!("sync: task failed: {e}"))??;
+    let root = blocking(move || open_keyfile_root(&keyfile, &pass)).await??;
     Ok(Configured {
         remote: RemoteState::Existing,
         root: Some(root),
@@ -318,7 +319,7 @@ pub async fn sync_configure(
     let prefix = args.config.prefix.clone();
     let provider_for_task = Arc::clone(&provider);
     let keys_for_task = Arc::clone(&keys);
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    blocking(move || -> Result<(), String> {
         let vault_state = task_app.state::<VaultState>();
         let sync_state = task_app.state::<SyncState>();
         let dir = crate::modules::vault::vault_dir(&task_app)?;
@@ -348,11 +349,10 @@ pub async fn sync_configure(
             provider: provider_for_task,
             prefix,
             device,
-        }))?;
+        }));
         Ok(())
     })
-    .await
-    .map_err(|e| format!("sync: task failed: {e}"))??;
+    .await??;
 
     Ok(SyncConfigureResult {
         remote: match configured.remote {
@@ -371,7 +371,7 @@ pub async fn sync_configure(
 pub async fn sync_disable(app: AppHandle) -> Result<(), String> {
     app.state::<SyncState>().clear();
     let task_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    blocking(move || -> Result<(), String> {
         let vault_state = task_app.state::<VaultState>();
         let dir = crate::modules::vault::vault_dir(&task_app)?;
         {
@@ -393,8 +393,7 @@ pub async fn sync_disable(app: AppHandle) -> Result<(), String> {
         }
         commit(&vault_state, &dir)
     })
-    .await
-    .map_err(|e| format!("sync: task failed: {e}"))??;
+    .await??;
     Ok(())
 }
 
@@ -429,7 +428,7 @@ pub async fn sync_pull(app: AppHandle) -> Result<SyncPullResult, String> {
 
     let task_app = app.clone();
     let report_for_task = report.clone();
-    let applied = tauri::async_runtime::spawn_blocking(move || -> Result<Applied, String> {
+    let applied = blocking(move || -> Result<Applied, String> {
         let vault_state = task_app.state::<VaultState>();
         let dir = crate::modules::vault::vault_dir(&task_app)?;
         let applied = {
@@ -440,8 +439,7 @@ pub async fn sync_pull(app: AppHandle) -> Result<SyncPullResult, String> {
         commit(&vault_state, &dir)?;
         Ok(applied)
     })
-    .await
-    .map_err(|e| format!("sync: task failed: {e}"))??;
+    .await??;
 
     emit_changed(&app, &applied.changed_ids, "sync");
     crate::modules::vault::drain_save_event(&app);
@@ -488,7 +486,7 @@ pub async fn sync_push(app: AppHandle) -> Result<SyncPushResult, String> {
 
     let task_app = app.clone();
     let report_for_task = report.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    blocking(move || -> Result<(), String> {
         let vault_state = task_app.state::<VaultState>();
         let dir = crate::modules::vault::vault_dir(&task_app)?;
         {
@@ -498,8 +496,7 @@ pub async fn sync_push(app: AppHandle) -> Result<SyncPushResult, String> {
         }
         commit(&vault_state, &dir)
     })
-    .await
-    .map_err(|e| format!("sync: task failed: {e}"))??;
+    .await??;
 
     crate::modules::vault::drain_save_event(&app);
     crate::modules::vault::drain_auto_lock(&app);
@@ -542,9 +539,7 @@ async fn join_pull(
     let keyfile: SyncKeyfile =
         serde_json::from_slice(&object.bytes).map_err(|_| NOT_A_KEYFILE.to_string())?;
     let pass = passphrase.to_string();
-    let root = tokio::task::spawn_blocking(move || open_keyfile_root(&keyfile, &pass))
-        .await
-        .map_err(|e| format!("sync: task failed: {e}"))??;
+    let root = blocking(move || open_keyfile_root(&keyfile, &pass)).await??;
     let keys = expand_root(&root)?;
 
     let report = pull(
@@ -639,19 +634,18 @@ pub async fn sync_join(app: AppHandle, args: SyncJoinArgs) -> Result<SyncJoinRes
     } = joined;
     let task_app = app.clone();
     let master_password = args.master_password.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    blocking(move || -> Result<(), String> {
         let vault_state = task_app.state::<VaultState>();
         install_new_vault(&vault_state, &dir, &master_password, payload)
     })
-    .await
-    .map_err(|e| format!("sync: task failed: {e}"))??;
+    .await??;
 
     app.state::<SyncState>().set(Some(SyncSession {
         keys: Arc::new(keys),
         provider: Arc::clone(&provider),
         prefix: args.config.prefix.clone(),
         device,
-    }))?;
+    }));
 
     Ok(SyncJoinResult {
         remote: "existing".to_string(),
@@ -696,7 +690,7 @@ mod tests {
     fn the_conditional_write_setting_reaches_the_provider() {
         // The Settings switch has to survive the whole path: `SyncConfigArg`
         // from the webview, through `provider_config`'s JSON, into the
-        // provider's own `Caps`.
+        // provider's own `cas`.
         let creds = SyncCredentialsArg {
             access_key_id: Some("ak".into()),
             secret_access_key: Some("sk".into()),
@@ -709,7 +703,7 @@ mod tests {
                 provider_config(&arg, &creds).expect("an s3 configuration"),
             )
             .expect("the provider builds");
-            assert_eq!(built.capabilities().cas, cas);
+            assert_eq!(built.cas(), cas);
         }
     }
     #[tokio::test]

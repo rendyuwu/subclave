@@ -19,7 +19,7 @@ use std::sync::{LazyLock, Mutex};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
-use crate::modules::lockext::LockExt as _;
+use crate::modules::lockext::lock_or_recover;
 use crate::modules::prefs;
 use crate::modules::vault::{resolve_field, vault_dir, VaultState};
 
@@ -33,18 +33,18 @@ static CLIPBOARD: LazyLock<Mutex<Option<arboard::Clipboard>>> =
 ///
 /// BLOCKING - call only from a blocking thread.
 fn handle() -> Result<&'static Mutex<Option<arboard::Clipboard>>, String> {
-    if CLIPBOARD.lock_or_recover().is_none() {
+    if lock_or_recover(&CLIPBOARD).is_none() {
         // Retry once per call: a transient failure (no display yet) must not
         // stick for the rest of the process.
         let fresh = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-        *CLIPBOARD.lock_or_recover() = Some(fresh);
+        *lock_or_recover(&CLIPBOARD) = Some(fresh);
     }
     Ok(&CLIPBOARD)
 }
 
 /// BLOCKING - call only from a blocking thread.
-pub(crate) fn read_text() -> Result<String, String> {
-    let mut guard = handle()?.lock_or_recover();
+fn read_text() -> Result<String, String> {
+    let mut guard = lock_or_recover(handle()?);
     let clipboard = guard
         .as_mut()
         .ok_or_else(|| "clipboard: no clipboard handle".to_string())?;
@@ -62,7 +62,7 @@ pub(crate) fn read_text() -> Result<String, String> {
 /// `x-kde-passwordManagerHint=secret`.
 pub(crate) fn write_text(text: &str) -> Result<(), String> {
     let clipboard = handle()?;
-    let mut clipboard = clipboard.lock_or_recover();
+    let mut clipboard = lock_or_recover(clipboard);
     let clipboard = clipboard
         .as_mut()
         .ok_or_else(|| "clipboard: no clipboard handle".to_string())?;
@@ -157,18 +157,14 @@ pub(crate) fn clip_copy_field_inner(
     let clears_at = crate::modules::vault::lock::boot_now_ms() + secs * 1000;
     // A copy that arrived while a timer was pending replaces the slot: the
     // newest copy is the one the clear must match.
-    *PENDING_CLEAR.lock_or_recover() = Some(PendingClear {
+    *lock_or_recover(&PENDING_CLEAR) = Some(PendingClear {
         value: value.clone(),
         clears_at,
     });
     // The returned epoch ms comes from the wall clock, fresh here: the timer
     // comparison itself stays on the boot clock.
-    let now_epoch_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     Ok(ClearResult {
-        clears_at: Some(now_epoch_ms + secs * 1000),
+        clears_at: Some(crate::modules::vault::state::now_ms() + secs * 1000),
     })
 }
 
@@ -179,7 +175,7 @@ pub(crate) fn clear_tick() {
     // The due check and the take are ONE lock acquisition: a copy landing
     // between a separate check and take would otherwise be cleared the
     // instant it was written, without its own timer ever running.
-    let mut slot = PENDING_CLEAR.lock_or_recover();
+    let mut slot = lock_or_recover(&PENDING_CLEAR);
     let due = matches!(slot.as_ref(), Some(pending) if pending.clears_at <= now);
     let pending = if due { slot.take() } else { None };
     drop(slot);
@@ -190,7 +186,7 @@ pub(crate) fn clear_tick() {
 
 /// Same compare-then-clear, at exit. Called from `RunEvent::Exit`.
 pub(crate) fn clear_on_exit() {
-    let slot = PENDING_CLEAR.lock_or_recover().take();
+    let slot = lock_or_recover(&PENDING_CLEAR).take();
     if let Some(pending) = slot {
         compare_and_clear(&pending.value);
     }
@@ -204,7 +200,7 @@ fn compare_and_clear(value: &str) {
         return;
     }
     let Ok(clipboard) = handle() else { return };
-    let mut guard = clipboard.lock_or_recover();
+    let mut guard = lock_or_recover(clipboard);
     if let Some(clipboard) = guard.as_mut() {
         let _ = clipboard.clear();
     }

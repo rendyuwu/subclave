@@ -72,14 +72,10 @@ pub fn run() {
     #[cfg(all(desktop, not(debug_assertions)))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
         if let Some(window) = app.get_webview_window("main") {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
+            windows::reveal(&window);
         }
     }));
 
-    // Updater is desktop-only; the plugin does not compile on android/ios.
-    #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     builder

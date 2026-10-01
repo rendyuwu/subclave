@@ -6,7 +6,7 @@
  */
 import { check } from "../report";
 
-import { kindsOf, linesOf, SYM } from "./support";
+import { kindsOf, linesOf } from "./support";
 
 /**
  * A `/* *\/ block whose citations sit on its third and fourth lines.
@@ -75,8 +75,8 @@ const C_CSS_BLOCK_LINES = [
  *
  * COVERED EXHAUSTIVELY AND NOT BY SAMPLE, because sampling is what left the gap.
  * When this section held four fixtures they cited three spellings between them
- * and exercised two detectors; the other five must-be-zero kinds, and the
- * bounded one, had no line control at all. The two that did were the two those
+ * and exercised two detectors; the other must-be-zero kinds, and the bounded
+ * one, had no line control at all. The two that did were the two those
  * three spellings happen to exercise, which is not a reason.
  *
  * Every fixture keeps the section's convention: the comment opens on file line 2
@@ -111,39 +111,6 @@ const C_BARE_LINE_TWICE = [
   " * nothing citable on this line",
   " * the other constructor is at `:1183`",
   " * and its only caller is at `:204`",
-  " */",
-  "",
-].join("\n");
-
-/** Two bare tracker numbers, neither naming a project. MUST report 4 and 5. */
-const C_TRACKER_TWICE = [
-  "const a = 1;",
-  "/*",
-  " * nothing citable on this line",
-  " * pinned above other apps (#33)",
-  " * and torn again on resume (#34)",
-  " */",
-  "",
-].join("\n");
-
-/** Two pinned crates in citation position, neither completing its triple. MUST report 4 and 5. */
-const C_DEP_FORM_TWICE = [
-  "const a = 1;",
-  "/*",
-  " * nothing citable on this line",
-  ` * (\`tauri\`, \`${SYM}\`) is consulted first`,
-  ` * then (\`tauri-plugin-window-state\`, \`${SYM}\`) decides`,
-  " */",
-  "",
-].join("\n");
-
-/** Two triples crediting no crate at all. MUST report 4 and 5. */
-const C_DEP_UNCREDITED_TWICE = [
-  "const a = 1;",
-  "/*",
-  " * nothing citable on this line",
-  ` * (2.11.5, \`${SYM}\`) is consulted first`,
-  ` * then (2.4.1, \`${SYM}\`) decides`,
   " */",
   "",
 ].join("\n");
@@ -230,9 +197,6 @@ export function runLineControls(): void {
 
   twoOnTwoLines("named citations", "c.ts", C_NAMED_TWICE, "named");
   twoOnTwoLines("bare line references", "c.ts", C_BARE_LINE_TWICE, "bare-line");
-  twoOnTwoLines("bare tracker numbers", "c.ts", C_TRACKER_TWICE, "bare-tracker");
-  twoOnTwoLines("malformed dependency citations", "c.ts", C_DEP_FORM_TWICE, "dep-form");
-  twoOnTwoLines("uncredited triples", "c.ts", C_DEP_UNCREDITED_TWICE, "dep-uncredited");
   twoOnTwoLines("dead paths", "src/x.ts", C_DEAD_PATH_TWICE, "dead-path");
   twoOnTwoLines(
     "self-resolving bare names",

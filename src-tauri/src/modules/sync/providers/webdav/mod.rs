@@ -20,12 +20,12 @@
 //! HTTP shell they all send through is shared in
 //! `src-tauri/src/modules/sync/providers/http.rs`.
 //!
-//! NO CONDITIONAL `PUT`, AND ONE OPPORTUNISTIC CREATE. `capabilities` answers
-//! `cas: false` as a CONSTANT rather than as a configuration field, because
-//! there is no protocol guarantee here for a user to know the answer to: a
-//! WebDAV server may or may not honour a conditional write and nothing in the
-//! protocol says which. The trait's own contract makes that safe to express by
-//! omission - a backend that cannot honour `if_match` degrades to
+//! NO CONDITIONAL `PUT`, AND ONE OPPORTUNISTIC CREATE. The trait's `cas` method
+//! is left at its `false` default rather than answered from a configuration
+//! field, because there is no protocol guarantee here for a user to know the
+//! answer to: a WebDAV server may or may not honour a conditional write and
+//! nothing in the protocol says which. The trait's own contract makes that safe
+//! to express by omission - a backend that cannot honour `if_match` degrades to
 //! last-write-wins - so `put` takes the argument and binds it to `_`, and no
 //! request builder behind it accepts an etag at all.
 //!
@@ -72,7 +72,7 @@ use std::pin::Pin;
 use serde::Deserialize;
 
 use super::http;
-use crate::modules::sync::provider::{Caps, Entry, Object, ProviderError, SyncProvider};
+use crate::modules::sync::provider::{Entry, Object, ProviderError, SyncProvider};
 
 mod build;
 mod classify;
@@ -181,13 +181,6 @@ impl SyncProvider for WebDavProvider {
         "webdav"
     }
 
-    /// A CONSTANT, not a stored toggle. The other backend asks the user because
-    /// the servers behind it disagree and only the user knows which one they
-    /// run; here there is no protocol guarantee for the user to report.
-    fn capabilities(&self) -> Caps {
-        Caps { cas: false }
-    }
-
     fn get<'a>(
         &'a self,
         key: &'a str,
@@ -217,7 +210,7 @@ impl SyncProvider for WebDavProvider {
     }
 
     /// `_if_match` is taken and dropped. See [`build_put`]: this backend cannot
-    /// express a condition, reports that through its capabilities, and degrades
+    /// express a condition, reports that through `cas`, and degrades
     /// to last-write-wins rather than failing a caller that passes one.
     fn put<'a>(
         &'a self,

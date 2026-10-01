@@ -28,12 +28,13 @@ export function visibleEntries(input: {
   entries: EntrySummary[];
   scope: string;
   tagFilter: string[];
-  searchIds: Set<string> | null;
+  searchIds: readonly string[] | null;
   now: number;
 }): EntrySummary[] {
   const { entries, scope, tagFilter, searchIds } = input;
+  const ids = searchIds === null ? null : new Set(searchIds);
   const rows = entries.filter((entry) => {
-    if (searchIds !== null && !searchIds.has(entry.id)) return false;
+    if (ids !== null && !ids.has(entry.id)) return false;
     if (tagFilter.length > 0) {
       const tags = entry.tags.map((tag) => tag.toLowerCase());
       if (!tagFilter.every((key) => tags.includes(key))) return false;

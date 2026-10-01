@@ -59,65 +59,23 @@ export type ThemeColors = {
   sidebarAccentForeground: string;
   /** Icon color when the AI / extension is actively working (spinner). */
   iconWorking: string;
-  /** Icon color in idle state. */
-  iconIdle: string;
-  /** Icon color when blocked / awaiting approval. */
-  iconBlocked: string;
-  /** Icon color for a finished-but-unacknowledged run (the breathing badge
-   *  that clears on focus). Distinct from `iconIdle`, which means "nothing
-   *  happened here". */
-  iconDone: string;
-  /** Git branch glyph, wherever a branch NAME is shown: the Source Control
-   *  header, the branch switcher, a pane's branch line in Workspaces. Its own
-   *  token rather than a reuse of the icon triad, which means AI/CLI activity -
-   *  a branch is not a status. The status bar deliberately does NOT read it;
-   *  that row is monochrome by design. */
-  iconBranch: string;
   /** Semantic green for diff additions, "+N" stats, success indicators. */
   diffAdded: string;
-  /** Semantic red for diff removals, "-N" stats. Distinct from `destructive`
-   *  which targets actionable danger UI (delete buttons, error text). */
-  diffRemoved: string;
   /** Semantic sky/cyan for "info" pills, renamed/copied SCM rows, neutral
    *  status notifications. */
   info: string;
-  /**
-   * Focus / accent stripe color painted on the active tab in the top
-   * tab bar, per tab kind. The stripe is the 3px vertical bar near the
-   * left edge of the active tab; it also signals which kind of content
-   * lives inside (terminal vs editor vs preview).
-   */
-  tabAccentTerminal: string;
-  tabAccentSsh: string;
-  tabAccentEditor: string;
-  tabAccentPreview: string;
-  tabAccentAiDiff: string;
-  tabAccentGitDiff: string;
   /** Color of the drag-to-resize divider between split panes. */
   resizeHandle: string;
   /**
-   * Full ANSI 16-colour palette painted by the terminal. The first eight
-   * are the "standard" colours; the latter eight are the "bright" set.
-   * xterm.js consumes these as `theme.black`, `theme.red`, ...,
-   * `theme.brightWhite`. Themable so each preset can ship a matched
-   * terminal palette instead of inheriting a generic one.
+   * ANSI accent palette the entry / group colour picker paints with, so a
+   * preset ships matched entry colours instead of inheriting a generic set.
    */
-  ansiBlack: string;
   ansiRed: string;
   ansiGreen: string;
   ansiYellow: string;
   ansiBlue: string;
   ansiMagenta: string;
   ansiCyan: string;
-  ansiWhite: string;
-  ansiBrightBlack: string;
-  ansiBrightRed: string;
-  ansiBrightGreen: string;
-  ansiBrightYellow: string;
-  ansiBrightBlue: string;
-  ansiBrightMagenta: string;
-  ansiBrightCyan: string;
-  ansiBrightWhite: string;
 };
 
 export type ThemeBackground = {
