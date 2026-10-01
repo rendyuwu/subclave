@@ -1,15 +1,26 @@
 import { useState } from "react";
 import { CreateVaultScreen } from "./CreateVaultScreen";
+import { JoinSyncScreen } from "./JoinSyncScreen";
 
 /**
- * First run: no vault file exists yet. Two cards, one live. Joining a synced
- * vault arrives with sync, so that card is a disabled placeholder rather than a
- * dead button.
+ * First run: no vault file exists yet. Two cards, each swapping to its own
+ * screen through the local-state pattern below.
  */
 export function FirstRunScreen() {
   const [creating, setCreating] = useState(false);
+  const [joining, setJoining] = useState(false);
 
   if (creating) return <CreateVaultScreen />;
+  if (joining) {
+    return (
+      <JoinSyncScreen
+        onCreateInstead={() => {
+          setJoining(false);
+          setCreating(true);
+        }}
+      />
+    );
+  }
 
   return (
     <div className="flex h-full items-center justify-center p-6">
@@ -33,12 +44,12 @@ export function FirstRunScreen() {
           </button>
           <button
             type="button"
-            disabled
-            className="border-border/60 bg-card text-muted-foreground flex cursor-not-allowed flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left opacity-60"
+            onClick={() => setJoining(true)}
+            className="border-border/60 bg-card hover:bg-muted/50 flex cursor-pointer flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-colors"
           >
             <span className="text-sm font-medium">Join a synced vault</span>
             <span className="text-muted-foreground text-xs">
-              Sync arrives in a later milestone.
+              Open the vault another device already syncs, using the same storage and passphrase.
             </span>
           </button>
         </div>

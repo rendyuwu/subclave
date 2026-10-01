@@ -2,6 +2,7 @@ import { UpdaterPill } from "@/modules/updater";
 import { ALL_SCOPE, groupCounts } from "@/modules/vault/list/derive";
 import { useVaultStore } from "@/modules/vault/store";
 import { useEffect, useState } from "react";
+import { SyncPill } from "./SyncPill";
 
 /** One status-bar group. The hairline that separates it from the group before
  *  it is drawn by `.sb-group` in globals.css, which hides an empty group and
@@ -82,6 +83,9 @@ export function StatusBar() {
     <footer className="border-border/60 bg-card/60 flex h-8 shrink-0 items-center justify-between gap-2 border-t px-3 text-[11px]">
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <LockGroup />
+        <Group>
+          <SyncPill />
+        </Group>
         <EntryCountGroup />
       </div>
       <Group>

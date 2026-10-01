@@ -6,6 +6,7 @@ pub mod generator;
 pub mod lockext;
 pub mod prefs;
 pub mod strength;
+pub mod sync;
 pub mod totp;
 pub mod tray;
 pub mod vault;

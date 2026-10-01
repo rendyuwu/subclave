@@ -690,8 +690,14 @@ pub fn run() {
             modules::totp::totp_preview,
             modules::generator::gen_password,
             modules::strength::gen_strength,
+            modules::sync::engine::sync_configure,
+            modules::sync::engine::sync_disable,
+            modules::sync::engine::sync_pull,
+            modules::sync::engine::sync_push,
+            modules::sync::engine::sync_join,
         ])
         .manage(modules::vault::VaultState::default())
+        .manage(modules::sync::engine::SyncState::default())
         .on_window_event(|window, event| {
             // Mirror main-window minimize/restore onto the settings child.
             // Owner-window semantics handle this on Windows; the explicit
@@ -776,6 +782,12 @@ pub fn run() {
                             let _ = w.close();
                         }
                     }
+                }
+                // The webview owns the pull rate limit; this only says the user
+                // came back. The `label != "main"` guard above is what keeps
+                // the settings window's own focus out of it.
+                tauri::WindowEvent::Focused(true) => {
+                    let _ = window.emit(modules::events::SYNC_FOCUSED, ());
                 }
                 _ => {}
             }
