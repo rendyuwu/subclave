@@ -22,14 +22,17 @@ use chrono::DateTime;
 /// mistaken for expired. If a real server is ever found emitting one, this is
 /// additive.
 ///
-/// THE CALENDAR IS `chrono`'S, and the gate in front of it does the two jobs
+/// THE CALENDAR IS `chrono`'S, and the gate in front of it does the three jobs
 /// `chrono` cannot do here. It fixes the zone: the format's only zone is
 /// `GMT`, where an RFC 2822 parser also reads a numeric offset or one of the
-/// obsolete American ones. And it drops the day name before parsing, because
-/// the name is redundant with the date beside it and this must not refuse a
-/// row over a server that got the name wrong, where `chrono` checks the two
-/// against each other. The seconds field is bounded here as well: the general
-/// format allows a leap second and the count below has no room for one.
+/// obsolete American ones. It drops the day name before parsing, because the
+/// name is redundant with the date beside it and this must not refuse a row
+/// over a server that got the name wrong, where `chrono` checks the two against
+/// each other. And it holds the month to the exact capitalized three-letter
+/// form, because the RFC 2822 parser is case-insensitive and would otherwise
+/// accept `nov` where the old literal match required `Nov`. The seconds field
+/// is bounded here as well: the general format allows a leap second and the
+/// count below has no room for one.
 pub fn parse_http_date(s: &str) -> Option<u64> {
     let s = s.trim();
     let b = s.as_bytes();
@@ -46,6 +49,25 @@ pub fn parse_http_date(s: &str) -> Option<u64> {
         || b[25] != b' '
         || &s[26..] != "GMT"
     {
+        return None;
+    }
+    if !matches!(
+        s.get(8..11),
+        Some(
+            "Jan"
+                | "Feb"
+                | "Mar"
+                | "Apr"
+                | "May"
+                | "Jun"
+                | "Jul"
+                | "Aug"
+                | "Sep"
+                | "Oct"
+                | "Nov"
+                | "Dec"
+        )
+    ) {
         return None;
     }
     let num = |from: usize, to: usize| -> Option<u32> {
@@ -84,6 +106,14 @@ mod tests {
             parse_http_date("Mon, 12 Jan 1998 09:25:56 GMT"),
             Some(884_597_156_000)
         );
+    }
+
+    #[test]
+    fn a_lowercase_month_name_is_refused() {
+        // `chrono`'s RFC 2822 parser is case-insensitive, so the gate in front
+        // of it is what keeps the accepted set to the capitalized form the old
+        // literal match required.
+        assert_eq!(parse_http_date("Sun, 06 nov 1994 08:49:37 GMT"), None);
     }
 
     #[test]

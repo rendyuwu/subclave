@@ -32,8 +32,8 @@ const PROJECT_NAMES = ["xterm.js"];
  * `.github/` with its workflows and shell scripts, and every checked-in dotfile
  * with them, so a citation of any of those reads as dead. Measured while
  * building this: that rule alone produced six findings against a checked-in
- * formatter config. The two dotted directories skipped here are skipped because
- * they hold no source the rule governs and a citation into either is forbidden
+ * formatter config. The dotted directories skipped here are skipped because
+ * they hold no source the rule governs and a citation into any is forbidden
  * by the rule anyway.
  */
 const SKIP_DIRS = new Set([

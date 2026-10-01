@@ -39,7 +39,8 @@ export function AboutSection() {
   const [name, setName] = useState("Subclave");
   const [build] = useState(initialBuildLabel);
   const [updateOpen, setUpdateOpen] = useState(false);
-  const updater = useUpdater();
+  // Click-only here: the main window's pill owns the 8s/6h sweeps.
+  const updater = useUpdater({ autoCheck: false });
   const UpdateIcon = updaterIcon(updater.state);
 
   useEffect(() => {
@@ -108,10 +109,21 @@ export function AboutSection() {
       </SettingsCard>
 
       <div className="flex flex-wrap gap-2">
-        {/* Same button behaviour and copy as the status-bar UpdaterPill: it
-            opens the shared dialog, which owns the check/download/restart flow
-            and the detailed copy. */}
-        <Button size="sm" onClick={() => setUpdateOpen(true)} className="gap-1.5">
+        {/* Same button copy as the status-bar UpdaterPill and the same shared
+            dialog, but the check is click-only: opening Settings must not hit
+            GitHub, so this button starts the check the way the old About-only
+            state machine did. A check already in flight is left alone. */}
+        <Button
+          size="sm"
+          onClick={() => {
+            const k = updater.state.kind;
+            if (k !== "checking" && k !== "downloading") {
+              void updater.checkForUpdate();
+            }
+            setUpdateOpen(true);
+          }}
+          className="gap-1.5"
+        >
           <UpdateIcon size={12} strokeWidth={1.75} />
           {updaterLabel(updater.state)}
         </Button>

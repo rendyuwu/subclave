@@ -59,7 +59,13 @@ export async function fetchLinuxRelease(): Promise<ManualUpdateInfo | null> {
   return info;
 }
 
-export function useUpdater() {
+/** `autoCheck: false` keeps the shared state machine and the click handlers but
+ *  drops the unattended sweeps below. The Settings window mounts this hook for
+ *  the About button's copy and dialog, and the PRD allows exactly two kinds of
+ *  network traffic (sync, and the main window's 6-hourly check), so opening
+ *  Settings must not add a GitHub round trip nobody asked for. */
+export function useUpdater(opts?: { autoCheck?: boolean }) {
+  const autoCheck = opts?.autoCheck ?? true;
   const [state, setState] = useState<UpdaterState>({ kind: "idle" });
   const updateRef = useRef<Update | null>(null);
 
@@ -167,15 +173,17 @@ export function useUpdater() {
 
   // First check 8s after mount so it doesn't compete with first paint. One-shot.
   useEffect(() => {
+    if (!autoCheck) return;
     const first = window.setTimeout(() => {
       if (stateKindRef.current === "idle") {
         void checkForUpdate({ silent: true });
       }
     }, 8_000);
     return () => window.clearTimeout(first);
-  }, [checkForUpdate]);
+  }, [checkForUpdate, autoCheck]);
 
   useEffect(() => {
+    if (!autoCheck) return;
     const interval = window.setInterval(() => {
       const k = stateKindRef.current;
       if (k === "idle" || k === "error") {
@@ -183,7 +191,7 @@ export function useUpdater() {
       }
     }, CHECK_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [checkForUpdate]);
+  }, [checkForUpdate, autoCheck]);
 
   return {
     state,

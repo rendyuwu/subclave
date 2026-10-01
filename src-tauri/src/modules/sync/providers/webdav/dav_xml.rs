@@ -1,26 +1,18 @@
 //! The DAV XML scan: a multi-status body.
 
-use quick_xml::events::Event;
-use quick_xml::name::QName;
-use quick_xml::Reader;
-
 use super::super::http::normalize_etag;
+use super::super::xml_tree::{tree, Element};
 use super::dav_time::parse_http_date;
 use crate::modules::sync::provider::{Entry, ProviderError};
 
 // --- the scan -------------------------------------------------------------
 //
-// READ WITH `quick-xml`, whose event stream is walked once into a small tree, so
-// a lookup by element name can be made from anywhere in the document.
+// The document walk is shared plumbing, in
+// `src-tauri/src/modules/sync/providers/xml_tree.rs`; what stays here is the
+// lookup, which is DAV's own.
 //
-// A SECOND COPY OF THE OTHER BACKEND'S, and kept rather than shared for the
-// reason the `unescape` it replaces was: the two sit behind a boundary whose
-// whole stated property is that a backend is one file reachable through one
-// dispatch arm, and a helper reaching across that boundary would be the first
-// thing to make adding a third backend touch a second one.
-//
-// IT MATCHES ON THE LOCAL NAME, which is the one thing that cannot be copied
-// from the other backend. That protocol's listing carries no namespace
+// IT MATCHES ON THE LOCAL NAME, which is the one thing that cannot be shared
+// with the other backend. That protocol's listing carries no namespace
 // prefixes, so searching for a literal `<Key>` is exact; a multi-status body
 // has prefixes and the server picks them - one common server emits `D:href`
 // and `lp1:getetag` in the same document, others emit `d:href`, and a body
@@ -31,140 +23,6 @@ use crate::modules::sync::provider::{Entry, ProviderError};
 // multi-status body that is not a shape any server produces, and closing it
 // properly means a namespace-resolving parser, for namespaces neither this
 // provider nor the other one draws anything from.
-
-/// The local name of an element: everything after the last `:` of its
-/// qualified name.
-///
-/// Cannot fail: the reader borrows the document from a `&str`, so every name it
-/// reports is UTF-8.
-fn local_name<'a>(name: &QName<'a>) -> &'a str {
-    std::str::from_utf8(name.local_name().into_inner())
-        .expect("the reader reported a non-UTF-8 name")
-}
-
-/// A parse failure of any kind, in the taxonomy's own terms: the body came from
-/// the remote and a listing this client cannot read is not an empty listing.
-fn malformed<E: std::fmt::Display>(e: E) -> ProviderError {
-    ProviderError::Malformed(format!("the listing did not parse: {e}"))
-}
-
-/// One element of a body, with the text inside it and its children.
-///
-/// A self-closing element yields the empty string rather than being skipped, so
-/// a property the server declined to supply is visible as empty rather than as
-/// absent - which is the distinction the status gate in [`prop_of`] is built
-/// on.
-struct Element {
-    /// The LOCAL name, so the server's choice of prefix reaches no caller.
-    name: String,
-    /// The character data between this element's tags, with the predefined
-    /// entities and any character references resolved. Nested elements are in
-    /// `children` and their text is NOT folded in here.
-    text: String,
-    children: Vec<Element>,
-}
-
-impl Element {
-    fn new(name: &str) -> Self {
-        Element {
-            name: name.to_string(),
-            text: String::new(),
-            children: Vec::new(),
-        }
-    }
-
-    /// The first element with this local name, at or below this one.
-    fn find(&self, name: &str) -> Option<&Element> {
-        if self.name == name {
-            return Some(self);
-        }
-        self.children.iter().find_map(|child| child.find(name))
-    }
-
-    /// Every element with this local name below this one, in document order.
-    fn all(&self, name: &str) -> Vec<&Element> {
-        let mut out = Vec::new();
-        self.collect(name, &mut out);
-        out
-    }
-
-    fn collect<'a>(&'a self, name: &str, out: &mut Vec<&'a Element>) {
-        for child in &self.children {
-            if child.name == name {
-                out.push(child);
-            }
-            child.collect(name, out);
-        }
-    }
-}
-
-/// Walk `body`'s event stream into one element per node.
-///
-/// The text of an element is the text of the events between its tags, so a
-/// self-closing element and `<x></x>` both come out empty, and text after a
-/// nested element belongs to the nested one.
-fn tree(body: &str) -> Result<Vec<Element>, ProviderError> {
-    let mut reader = Reader::from_str(body);
-    let mut roots = Vec::new();
-    let mut open: Vec<Element> = Vec::new();
-    loop {
-        match reader.read_event().map_err(malformed)? {
-            Event::Start(e) => open.push(Element::new(local_name(&e.name()))),
-            Event::Empty(e) => {
-                let element = Element::new(local_name(&e.name()));
-                attach(&mut open, &mut roots, element);
-            }
-            Event::End(_) => {
-                if let Some(element) = open.pop() {
-                    attach(&mut open, &mut roots, element);
-                }
-            }
-            Event::Text(t) => {
-                if let Some(element) = open.last_mut() {
-                    element.text.push_str(&t.decode().map_err(malformed)?);
-                }
-            }
-            Event::GeneralRef(r) => {
-                if let Some(element) = open.last_mut() {
-                    // A character reference resolves on its own; the five names
-                    // XML defines without a DTD are spelled out; an entity no
-                    // DTD defines is left as it was written rather than
-                    // refused.
-                    match r.resolve_char_ref().map_err(malformed)? {
-                        Some(c) => element.text.push(c),
-                        None => {
-                            let name = r.decode().map_err(malformed)?;
-                            match name.as_ref() {
-                                "amp" => element.text.push('&'),
-                                "lt" => element.text.push('<'),
-                                "gt" => element.text.push('>'),
-                                "quot" => element.text.push('"'),
-                                "apos" => element.text.push('\''),
-                                other => {
-                                    element.text.push('&');
-                                    element.text.push_str(other);
-                                    element.text.push(';');
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    Ok(roots)
-}
-
-/// A finished element lands in its parent, or among the roots when there is no
-/// open parent left.
-fn attach(open: &mut [Element], roots: &mut Vec<Element>, element: Element) {
-    match open.last_mut() {
-        Some(parent) => parent.children.push(element),
-        None => roots.push(element),
-    }
-}
 
 /// The path half of an `href`, which a server may spell as a whole URL or as an
 /// absolute path.
@@ -608,5 +466,53 @@ mod tests {
              <d:status>HTTP/1.1 200 OK</d:status></d:propstat>\
              </d:response></d:multistatus>";
         assert!(matches!(parse(body), Err(ProviderError::Malformed(_))));
+    }
+
+    // --- tolerance --------------------------------------------------------
+    //
+    // The reader is loosened where the hand scanners this replaced scanned text
+    // and could not fail on well-formedness, so a body the server emits with
+    // one bad byte still yields its rows rather than failing the whole pull.
+    // One test per class of bad byte.
+
+    #[test]
+    fn a_dangling_ampersand_still_yields_the_rows() {
+        let body = "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"><d:response>\
+             <d:href>/remote.php/dav/files/rendi/vault/v1/obj/ab12</d:href>\
+             <d:propstat><d:prop><d:getetag>\"a&b\"</d:getetag></d:prop>\
+             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+        let entries = parse(body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "vault/v1/obj/ab12");
+        assert_eq!(entries[0].etag, "a&b");
+    }
+
+    #[test]
+    fn a_mismatched_end_tag_still_yields_the_rows() {
+        let body = "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"><d:response>\
+             <d:href>/remote.php/dav/files/rendi/vault/v1/obj/ab12</d:href>\
+             <d:propstat><d:prop><d:getetag>\"x\"</d:getetag></d:prop>\
+             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:responseX>\
+             </d:multistatus>";
+        let entries = parse(body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "vault/v1/obj/ab12");
+    }
+
+    #[test]
+    fn a_stray_end_tag_still_yields_the_rows() {
+        let body = format!(
+            "{}</nothing>",
+            fixture(
+                "d",
+                &[file(
+                    "/remote.php/dav/files/rendi/vault/v1/obj/ab12",
+                    "\"x\""
+                )]
+            )
+        );
+        let entries = parse(&body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "vault/v1/obj/ab12");
     }
 }

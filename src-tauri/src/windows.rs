@@ -110,12 +110,23 @@ pub(crate) fn enforce_configured_min_size(config: &tauri::Config, window: &tauri
     let size = size.to_logical::<f64>(scale);
     // A saved size that already clears the floor is left alone - the clamp
     // exists to raise a stale size, not to normalize a larger one.
-    if size.width < min_width || size.height < min_height {
-        let _ = window.set_size(tauri::LogicalSize::new(
-            size.width.max(min_width),
-            size.height.max(min_height),
-        ));
+    if let Some(raised) = clamp_to_floor(size, tauri::LogicalSize::new(min_width, min_height)) {
+        let _ = window.set_size(raised);
     }
+}
+
+/// Raise each axis of `size` to `floor`, or `None` when it already clears it.
+///
+/// Pure, so the boundary test below exercises the production clamp rather than
+/// a copy of it: "exactly at the floor" must stay `None`, because a `<=` here
+/// resizes the window on every launch.
+fn clamp_to_floor(
+    size: tauri::LogicalSize<f64>,
+    floor: tauri::LogicalSize<f64>,
+) -> Option<tauri::LogicalSize<f64>> {
+    (size.width < floor.width || size.height < floor.height).then(|| {
+        tauri::LogicalSize::new(size.width.max(floor.width), size.height.max(floor.height))
+    })
 }
 
 /// The main window's `on_window_event` handler, kept out of the builder chain
@@ -211,9 +222,10 @@ pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::Window
 
 #[cfg(test)]
 mod min_size_tests {
-    /// The clamp `enforce_configured_min_size` applies to a restored size,
-    /// mirrored here because the production path needs a live window. The
-    /// `tauri-plugin-window-state` plugin restores a saved size with a bare
+    use super::clamp_to_floor;
+
+    /// The clamp `enforce_configured_min_size` applies to a restored size.
+    /// The `tauri-plugin-window-state` plugin restores a saved size with a bare
     /// `set_size`, which Windows does not check against the window minimum, so
     /// a profile saved at the old 420x280 floor comes back at 420x280 under a
     /// 640x480 config; the clamp raises each axis to the floor and leaves a
@@ -222,10 +234,7 @@ mod min_size_tests {
     /// otherwise regress to a resize on every launch.
     #[test]
     fn only_a_size_below_the_floor_is_raised() {
-        let (fw, fh) = (640.0, 480.0);
-        let corrected = |size: (f64, f64)| {
-            (size.0 < fw || size.1 < fh).then(|| (size.0.max(fw), size.1.max(fh)))
-        };
+        let floor = tauri::LogicalSize::new(640.0, 480.0);
         let cases = [
             ((420.0, 280.0), Some((640.0, 480.0))),
             ((900.0, 280.0), Some((900.0, 480.0))),
@@ -234,7 +243,9 @@ mod min_size_tests {
             ((640.0, 480.0), None),
         ];
         for (size, want) in cases {
-            assert_eq!(corrected(size), want, "size {size:?} against floor 640x480");
+            let got = clamp_to_floor(tauri::LogicalSize::new(size.0, size.1), floor)
+                .map(|s| (s.width, s.height));
+            assert_eq!(got, want, "size {size:?} against floor 640x480");
         }
     }
 }

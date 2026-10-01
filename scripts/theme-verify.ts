@@ -54,7 +54,19 @@ const customThemeSrc =
 // names.
 const mapBody = /const COLOR_VAR_MAP[\s\S]*?\n};/.exec(customThemeSrc)?.[0] ?? "";
 const appVars = new Set([...mapBody.matchAll(/"(--[a-z0-9-]+)"/g)].map((m) => m[1]));
-check("COLOR_VAR_MAP parsed", appVars.size > 30, appVars.size);
+
+// Parse-failure tripwire, same shape as the globals.css one below: the quoted
+// scan above is what every later check runs on, so it must see every name the
+// map mentions. The map body is read again with the quote requirement dropped
+// and a wider name class, and the two name sets must agree: a dropped quote, an
+// entry quoted differently or a name the lowercase class rejects then shows up
+// on one side only. A fixed floor cannot do this job - the old `> 30` silently
+// tolerated eight more names disappearing once ThemeColors shrank.
+const appVarsAnywhere = new Set([...mapBody.matchAll(/(--[a-zA-Z0-9-]+)/g)].map((m) => m[1]));
+check("COLOR_VAR_MAP parsed", appVars.size > 0 && appVars.size === appVarsAnywhere.size, {
+  quoted: appVars.size,
+  anyPosition: appVarsAnywhere.size,
+});
 
 // Vars that are NOT colours a theme should own: layout/typography knobs and
 // values derived at runtime from other tokens.
@@ -71,7 +83,22 @@ const NON_THEMABLE = new Set([
 ]);
 
 const declared = new Set([...css.matchAll(/^\s*(--subclave-[a-z0-9-]+)\s*:/gm)].map((m) => m[1]));
-check("globals.css vars parsed", declared.size > 10, declared.size);
+
+// Parse-failure tripwire: the anchored scan above is what every check below
+// runs on, so it has to see every declaration in the file. The same text is
+// scanned once more with an unanchored pattern and a wider name class, and the
+// two name sets must agree: a broken anchored regex (lost `m` flag, a
+// declaration no longer starting its line) or a name the anchored class rejects
+// then shows up on one side only. A fixed floor cannot do this job - the old
+// `> 30` silently tolerated seven more declarations disappearing once
+// ThemeColors shrank.
+const declaredAnywhere = new Set(
+  [...css.matchAll(/(--subclave-[a-zA-Z0-9-]+)\s*:/g)].map((m) => m[1]),
+);
+check("globals.css vars parsed", declared.size > 0 && declared.size === declaredAnywhere.size, {
+  anchored: declared.size,
+  anyPosition: declaredAnywhere.size,
+});
 
 for (const v of declared) {
   if (NON_THEMABLE.has(v)) continue;
