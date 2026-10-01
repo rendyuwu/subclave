@@ -102,6 +102,10 @@ pub fn run() {
             if let Err(e) = modules::tray::build(app.handle()) {
                 log::error!("subclave: could not build the tray icon: {e}");
             }
+            // Browser integration: the local socket the native messaging host
+            // relays to, then the manifest refresh (AppImage copy included).
+            modules::browser::start(app.handle().clone());
+            modules::browser::startup_refresh(app.handle());
             // macOS: rebuild a menu without the Cmd+W "Close Window" item (see
             // the fn docs).
             #[cfg(target_os = "macos")]
@@ -161,8 +165,15 @@ pub fn run() {
             modules::sync::engine::sync_pull,
             modules::sync::engine::sync_push,
             modules::sync::engine::sync_join,
+            modules::browser::browser_integration_status,
+            modules::browser::browser_integration_set,
+            modules::browser::browser_clients_list,
+            modules::browser::browser_client_rename,
+            modules::browser::browser_client_revoke,
+            modules::browser::browser_pairing_respond,
         ])
         .manage(modules::vault::VaultState::default())
+        .manage(modules::browser::BrowserState::default())
         .manage(modules::sync::engine::SyncState::default())
         .on_window_event(windows::on_main_window_event)
         .build(tauri::generate_context!())

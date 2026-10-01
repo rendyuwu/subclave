@@ -19,6 +19,9 @@ src-tauri/target
 src-tauri/gen
 .tauri
 
+# Staged native messaging sidecar (built by scripts/build-sidecar.mjs).
+src-tauri/binaries/
+
 # Editor / OS
 .vscode
 .idea

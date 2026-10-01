@@ -13,6 +13,12 @@ pnpm install
 pnpm tauri:dev   # own bundle id and data dir; never touches an installed Subclave
 ```
 
+A bare `cargo build`/`cargo test` (instead of `pnpm tauri:dev` or `pnpm tauri
+build`) needs the native messaging sidecar staged first: `tauri-build` resolves
+`bundle.externalBin` at compile time, so `pnpm build:sidecar:dev` must run
+before it or the build fails with `ResourcePathNotFound`. The staged file
+(`src-tauri/binaries/`) is gitignored, and `pnpm tauri:dev` stages it for you.
+
 ## Before a PR
 
 CI runs all of these:

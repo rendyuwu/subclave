@@ -56,3 +56,22 @@
     RMDir /r "${SUBCLAVE_DATA_BACKUP}"
   subclave_postinstall_no_restore:
 !macroend
+
+; On uninstall:
+;   * Remove the native messaging registry keys and the manifest JSON files
+;     the app wrote. The four key paths are spelled identically to the Rust
+;     writer in `manifests.rs`; `scripts/browser-verify.ts` compares the two
+;     sets, so a drift here is a red build rather than a leftover key.
+
+!macro NSIS_HOOK_PREUNINSTALL
+  ; --- browser integration cleanup -----------------------------------------
+  DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\dev.rendy.subclave"
+  DeleteRegKey HKCU "Software\Chromium\NativeMessagingHosts\dev.rendy.subclave"
+  DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\dev.rendy.subclave"
+  DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\dev.rendy.subclave"
+  ; The JSON files under the app data dir; rmdir is idempotent when absent.
+  IfFileExists "${SUBCLAVE_DATA_DIR}\browser-hosts\*.*" 0 subclave_preuninstall_done
+    nsExec::ExecToLog 'cmd /c rmdir /s /q "${SUBCLAVE_DATA_DIR}\browser-hosts" >nul 2>&1'
+    Pop $0
+  subclave_preuninstall_done:
+!macroend

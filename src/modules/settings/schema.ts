@@ -56,6 +56,18 @@ export type Preferences = {
   closeToTray: boolean;
   /** Last-used password-generator settings, reused by the browser extension. */
   generator: GeneratorOptions;
+  /**
+   * Browser-integration switches, one per native-messaging family. Rust reads
+   * the same `browser` object from `subclave-settings.json` at startup, so this
+   * value must stay the on-disk one.
+   */
+  browser: BrowserPrefs;
+};
+
+/** The two native-messaging families the app writes manifests for. */
+export type BrowserPrefs = {
+  chromium: boolean;
+  firefox: boolean;
 };
 
 export const BRAND_COLOR_DEFAULT = "#0057fe";
@@ -111,6 +123,10 @@ export const DEFAULT_PREFERENCES: Preferences = {
     symbols: true,
     excludeAmbiguous: false,
   },
+  browser: {
+    chromium: false,
+    firefox: false,
+  },
 };
 
 export type PrefKey = keyof Preferences;
@@ -136,6 +152,7 @@ export const PREF_STORE_KEYS = {
   lockOnMinimize: "lockOnMinimize",
   closeToTray: "closeToTray",
   generator: "generator",
+  browser: "browser",
 } satisfies Record<PrefKey, string>;
 
 export function clampOpacity(value: number): number {
@@ -168,6 +185,18 @@ export function normalizeGeneratorOptions(value: unknown): GeneratorOptions {
     digits: bool(raw.digits, fallback.digits),
     symbols: bool(raw.symbols, fallback.symbols),
     excludeAmbiguous: bool(raw.excludeAmbiguous, fallback.excludeAmbiguous),
+  };
+}
+
+/**
+ * Fill in a half-written `browser` object from the defaults. A wrong-typed or
+ * absent field falls back to `false`, matching `prefs.rs` on the Rust side.
+ */
+export function normalizeBrowserPrefs(value: unknown): BrowserPrefs {
+  const raw = (value ?? {}) as Partial<Record<keyof BrowserPrefs, unknown>>;
+  return {
+    chromium: typeof raw.chromium === "boolean" ? raw.chromium : false,
+    firefox: typeof raw.firefox === "boolean" ? raw.firefox : false,
   };
 }
 

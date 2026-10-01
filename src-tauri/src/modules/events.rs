@@ -16,6 +16,10 @@ pub const VAULT_CHANGED: &str = "subclave:vault-changed";
 pub const SYNC_FOCUSED: &str = "subclave:sync-focused";
 /// Vault write failed, or `null` when a retry succeeded.
 pub const VAULT_SAVE_FAILED: &str = "subclave:vault-save-failed";
+/// A browser extension asked to pair (payload:
+/// `{ requestId, browser, profileName, code }`). The main webview shows the
+/// pairing dialog and answers through `browser_pairing_respond`.
+pub const PAIRING_REQUEST: &str = "subclave:pairing-request";
 
 /// Rust -> main webview: the app was asked to quit while a write is still
 /// pending. Payload: `null`. The webview owns the confirmation dialog and

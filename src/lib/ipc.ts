@@ -27,6 +27,11 @@ export const IPC_EVENTS = {
   VAULT_LOCKED: "subclave:vault-locked",
   /** Vault content changed (payload: `{ ids: string[], origin: "local" }`). */
   VAULT_CHANGED: "subclave:vault-changed",
+  /**
+   * Rust -> main webview: a browser extension asked to pair. Payload:
+   * `{ requestId: string, browser: string, profileName: string, code: string }`.
+   */
+  PAIRING_REQUEST: "subclave:pairing-request",
   /** Vault write failed, or `null` when a retry succeeded. */
   VAULT_SAVE_FAILED: "subclave:vault-save-failed",
   /**

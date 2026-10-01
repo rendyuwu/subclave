@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use crate::modules::generator::GeneratorOptions;
+
 /// File name under the app data dir, matching the Settings store's writer.
 pub const SETTINGS_FILE_NAME: &str = "subclave-settings.json";
 
@@ -17,7 +19,7 @@ const MAX_CLIPBOARD_CLEAR_SECONDS: u64 = 600;
 
 /// The preferences the Rust side reads at use time. The field docs name the
 /// on-disk key.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     /// `autoLockMinutes`, 0 to 1440. 0 = never.
     pub auto_lock_minutes: u64,
@@ -27,6 +29,13 @@ pub struct Prefs {
     pub lock_on_minimize: bool,
     /// `closeToTray`.
     pub close_to_tray: bool,
+    /// `browser.chromium`: the Chromium-family native messaging switch.
+    pub browser_chromium: bool,
+    /// `browser.firefox`: the Firefox native messaging switch.
+    pub browser_firefox: bool,
+    /// `generator`, the password generator options the browser's
+    /// `generate-password` shares with the app's popover.
+    pub generator: GeneratorOptions,
 }
 
 impl Default for Prefs {
@@ -36,6 +45,9 @@ impl Default for Prefs {
             clipboard_clear_seconds: 30,
             lock_on_minimize: false,
             close_to_tray: true,
+            browser_chromium: false,
+            browser_firefox: false,
+            generator: GeneratorOptions::default(),
         }
     }
 }
@@ -60,6 +72,21 @@ fn flag(value: &serde_json::Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
+/// The generator options from the `generator` object, each key falling back to
+/// the generator's own default and clamped to its limits, so the browser's
+/// `generate-password` and the app's popover always agree.
+fn generator_options(value: &serde_json::Value, fallback: &GeneratorOptions) -> GeneratorOptions {
+    let object = value.get("generator").unwrap_or(&serde_json::Value::Null);
+    GeneratorOptions {
+        length: number(object, "length", u64::from(fallback.length), 128).max(8) as u32,
+        lower: flag(object, "lower", fallback.lower),
+        upper: flag(object, "upper", fallback.upper),
+        digits: flag(object, "digits", fallback.digits),
+        symbols: flag(object, "symbols", fallback.symbols),
+        exclude_ambiguous: flag(object, "excludeAmbiguous", fallback.exclude_ambiguous),
+    }
+}
+
 /// Read the preferences for `dir`, falling back per key.
 pub(crate) fn read(dir: &Path) -> Prefs {
     let fallback = Prefs::default();
@@ -69,6 +96,7 @@ pub(crate) fn read(dir: &Path) -> Prefs {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return fallback;
     };
+    let browser = value.get("browser").unwrap_or(&serde_json::Value::Null);
     Prefs {
         auto_lock_minutes: number(
             &value,
@@ -84,6 +112,9 @@ pub(crate) fn read(dir: &Path) -> Prefs {
         ),
         lock_on_minimize: flag(&value, "lockOnMinimize", fallback.lock_on_minimize),
         close_to_tray: flag(&value, "closeToTray", fallback.close_to_tray),
+        browser_chromium: flag(browser, "chromium", fallback.browser_chromium),
+        browser_firefox: flag(browser, "firefox", fallback.browser_firefox),
+        generator: generator_options(&value, &fallback.generator),
     }
 }
 
@@ -169,7 +200,51 @@ mod tests {
                 clipboard_clear_seconds: 45,
                 lock_on_minimize: true,
                 close_to_tray: false,
+                browser_chromium: false,
+                browser_firefox: false,
+                generator: GeneratorOptions::default(),
             }
         );
+    }
+
+    #[test]
+    fn browser_flags_are_read_from_the_browser_object() {
+        let dir = TempDir::new("browser");
+        write_settings(&dir, r#"{"browser":{"chromium":true,"firefox":false}}"#);
+        let prefs = read(&dir.0);
+        assert!(prefs.browser_chromium);
+        assert!(!prefs.browser_firefox);
+
+        // A half-written or wrongly typed object falls back to false.
+        write_settings(&dir, r#"{"browser":{"chromium":"yes"}}"#);
+        let prefs = read(&dir.0);
+        assert!(!prefs.browser_chromium);
+        write_settings(&dir, r#"{"browser":1}"#);
+        assert!(!read(&dir.0).browser_chromium);
+    }
+
+    #[test]
+    fn generator_options_round_trip_and_clamp() {
+        let dir = TempDir::new("generator");
+        write_settings(
+            &dir,
+            r#"{"generator":{"length":32,"lower":false,"upper":false,"digits":true,"symbols":true,"excludeAmbiguous":true}}"#,
+        );
+        let prefs = read(&dir.0);
+        assert_eq!(prefs.generator.length, 32);
+        assert!(!prefs.generator.lower);
+        assert!(!prefs.generator.upper);
+        assert!(prefs.generator.digits);
+        assert!(prefs.generator.symbols);
+        assert!(prefs.generator.exclude_ambiguous);
+
+        // Out-of-range numbers clamp to the generator's own limits.
+        write_settings(&dir, r#"{"generator":{"length":500}}"#);
+        assert_eq!(read(&dir.0).generator.length, 128);
+        write_settings(&dir, r#"{"generator":{"length":2}}"#);
+        assert_eq!(read(&dir.0).generator.length, 8);
+        // A missing object keeps every default.
+        write_settings(&dir, "{}");
+        assert_eq!(read(&dir.0).generator, GeneratorOptions::default());
     }
 }

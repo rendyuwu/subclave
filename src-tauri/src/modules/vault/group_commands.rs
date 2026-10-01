@@ -132,7 +132,7 @@ pub(crate) fn vault_group_delete_inner(
     state.ensure_writable()?;
     // The reserved groups are load-bearing: trash is the restore source,
     // browser is the sync-stable save-login target, root is the fallback
-    // parent. Entries point at them by id, and M3 sync would propagate a
+    // parent. Entries point at them by id, and sync would propagate a
     // tombstone for a shared reserved id.
     if [ROOT_ID, TRASH_ID, BROWSER_ID].contains(&id.as_str()) {
         return Err("vault: reserved group".to_string());

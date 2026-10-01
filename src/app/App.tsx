@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Toaster } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { PairingDialog } from "@/modules/browser/PairingDialog";
 import { CommandPalette } from "@/modules/commandPalette/CommandPalette";
 import { Header } from "@/modules/header/Header";
 import { openSettingsWindow } from "@/modules/settings/openSettingsWindow";
@@ -66,6 +67,7 @@ export default function App() {
           </main>
           <StatusBar />
           <QuitConfirmDialog />
+          <PairingDialog />
           <Toaster />
           <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
         </div>

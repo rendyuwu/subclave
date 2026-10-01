@@ -1,16 +1,20 @@
 import { emit } from "@tauri-apps/api/event";
+import { browserIntegrationSet } from "@/modules/browser/ipc";
 import type { KeyBinding, ShortcutId } from "@/modules/shortcuts/shortcuts";
 import type { GeneratorOptions } from "@/modules/vault/types";
 import { io } from "./load";
+import { usePreferencesStore } from "./preferences";
 import {
   AUTO_LOCK_MINUTES_MAX,
   CLIPBOARD_CLEAR_SECONDS_MAX,
   clampOpacity,
   clampPref,
   DEFAULT_PREFERENCES,
+  normalizeBrowserPrefs,
   normalizeGeneratorOptions,
   PREF_STORE_KEYS,
   PREFS_CHANGED_EVENT,
+  type BrowserPrefs,
   type ThemePref,
 } from "./schema";
 import type { CustomTheme } from "./theme/model";
@@ -92,4 +96,25 @@ export async function setCloseToTray(value: boolean): Promise<void> {
 
 export async function setGenerator(value: GeneratorOptions): Promise<void> {
   await writePref(PREF_STORE_KEYS.generator, normalizeGeneratorOptions(value));
+}
+
+/**
+ * Flip one browser family's switch, then write (or remove) that family's native
+ * messaging manifests.
+ *
+ * The preference lands FIRST: the Rust side reads `browser` from the settings
+ * file, so a later startup refresh re-writes the manifests for every enabled
+ * family. The command's own rejection propagates, because the manifest write is
+ * what the user asked for and the Settings tab reports it.
+ */
+export async function setBrowserFamily(
+  family: keyof BrowserPrefs,
+  enabled: boolean,
+): Promise<void> {
+  const current = usePreferencesStore.getState().browser;
+  await writePref(
+    PREF_STORE_KEYS.browser,
+    normalizeBrowserPrefs({ ...current, [family]: enabled }),
+  );
+  await browserIntegrationSet(family, enabled);
 }

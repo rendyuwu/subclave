@@ -1,3 +1,9 @@
+[workspace]
+# `subclave-proxy` is the native messaging host built as a sidecar; keeping the
+# `[profile.*]` tables in this root manifest applies them to the member.
+members = ["subclave-proxy"]
+resolver = "2"
+
 [package]
 name = "subclave"
 version = "0.1.0"
@@ -110,12 +116,27 @@ hex = "0.4"
 # a poison rather than unwrapping one.
 parking_lot = "0.12"
 # The sync providers' async runtime surface: `spawn_blocking` for the KDF and
-# the vault writes, `sync` for the engine's own primitives.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# the vault writes, `sync` for the engine's own primitives. `net` and `io-util`
+# are the browser socket server's Unix listener and its async frame reads.
+tokio = { version = "1", features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+	"net",
+	"io-util",
+] }
 # Base32 for TOTP secrets.
 data-encoding = "2"
 # URL parsing for TOTP otpauth URIs and entry host extraction.
 url = "2"
+# Registrable-domain lookup for the browser matcher's `match: "domain"` mode.
+# Compiles Mozilla's list including the private section, so `a.github.io` and
+# `b.github.io` are different registrable domains.
+psl = "2"
+# The native messaging sidecar, plus its frame codec and socket path, which the
+# app's browser module shares so the wire format has one definition.
+subclave-proxy = { path = "subclave-proxy" }
 # `wayland-data-control` is not a default and is kept for wlroots and COSMIC,
 # where it is the only clipboard path. arboard tries Wayland when
 # `WAYLAND_DISPLAY` is set, warns on failure and falls back to X11.
@@ -132,11 +153,13 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = [
 	"Win32_Foundation",
 	"Win32_Security",
+	"Win32_Security_Authorization",
 	"Win32_Security_Cryptography",
 	"Win32_Storage_FileSystem",
 	"Win32_System_Console",
 	"Win32_System_Diagnostics_ToolHelp",
 	"Win32_System_JobObjects",
+	"Win32_System_Registry",
 	"Win32_System_SystemInformation",
 	"Win32_System_Threading",
 	"Win32_Graphics_Dwm",
