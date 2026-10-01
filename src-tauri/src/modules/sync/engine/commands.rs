@@ -851,6 +851,7 @@ mod tests {
                     root_key: Some(B64.encode(*root)),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..Default::default()
         };

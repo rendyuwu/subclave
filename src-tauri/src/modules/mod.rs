@@ -1,4 +1,5 @@
 pub mod aesgcm;
+pub mod browser;
 pub mod clipboard;
 pub mod events;
 pub mod fs;

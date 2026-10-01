@@ -37,6 +37,10 @@ pub(crate) fn emit_locked(app: &AppHandle, reason: LockReason) {
     // Every lock reason (idle, manual, minimize, tray) drops the in-memory
     // sync session; the next unlock reopens it from the stored root key.
     crate::modules::sync::session_closed(app);
+    // The browser channel carries credentials inside the payload, so every
+    // live connection is dropped with it; the extension reconnects and finds
+    // the locked state on its next request.
+    crate::modules::browser::close_all(app);
     let _ = app.emit(
         events::VAULT_LOCKED,
         serde_json::json!({ "reason": reason }),

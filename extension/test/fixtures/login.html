@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Login</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      window.__events = {
+        "username:input": 0,
+        "username:change": 0,
+        "password:input": 0,
+        "password:change": 0,
+      };
+      for (const id of ["username", "password"]) {
+        for (const type of ["input", "change"]) {
+          document.getElementById(id).addEventListener(type, () => {
+            window.__events[`${id}:${type}`] += 1;
+          });
+        }
+      }
+    </script>
+  </body>
+</html>

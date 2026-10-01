@@ -56,6 +56,31 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   registry is a stack; only the command palette's own chord is exempt, and only
   while the palette is topmost.
 
+### Extension (`extension/`)
+
+- Three entry points, built one Vite invocation each (`scripts/build.mjs`):
+  `src/popup/popup.html` -> `popup.{html,js,css}`, `src/entry.ts` ->
+  `background.js`, `src/content/index.ts` -> `content.js`. A shared chunk
+  between the service worker and the content script is what MV3 forbids, so
+  the three are never one multi-entry build; the two script entries are IIFE.
+- One manifest per target, copied to `manifest.json`: `manifest.chrome.json`
+  (service worker, pinned `key`) and `manifest.firefox.json` (background
+  scripts, `browser_specific_settings`, no `key`). `dist/<target>` is generated
+  and gitignored.
+- `chrome.storage` is read and written only in the service worker
+  (`src/background.ts`). The popup and the content script talk to it over
+  `chrome.runtime` messages (`src/lib/messages.ts`).
+- The content script never computes a URL match. Matching, credential release
+  and every write happen in Rust
+  (`src-tauri/src/modules/browser/matching.rs`,
+  `src-tauri/src/modules/browser/actions.rs`); the extension's job is UI,
+  transport and DOM fill.
+- `src/lib/protocol.ts` and `src/lib/auth.ts` mirror
+  `src-tauri/src/modules/browser/protocol.rs`,
+  `src-tauri/subclave-proxy/src/frame.rs` and
+  `src-tauri/src/modules/browser/auth.rs` literal for literal; the browser
+  verify script pins the agreement.
+
 ## Workflow
 
 - CI (`.github/workflows/ci.yml`) runs, frontend job: `pnpm run lint:imports`,
@@ -86,3 +111,10 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
 - The Settings window is denylisted from `tauri-plugin-window-state`, and
   `VISIBLE` is stripped from the restored state flags so the main window can
   call `show()` after first paint instead of flashing a transparent shadow.
+- `bundle.externalBin` names the `subclave-proxy` sidecar, and `tauri-build`
+  checks that `src-tauri/binaries/subclave-proxy-<triple>` exists while the
+  build script runs, so a bare `cargo` invocation fails with
+  `ResourcePathNotFound` until `pnpm build:sidecar` has staged it (see
+  CONTRIBUTING). The sidecar's profile must match the app's: a debug app
+  resolves the `.dev` socket name, so `build:sidecar:dev` is what `tauri dev`
+  and `tauri build --debug` need.

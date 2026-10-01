@@ -9,6 +9,7 @@ import {
   CLIPBOARD_CLEAR_SECONDS_MAX,
   DEFAULT_PREFERENCES,
   normalizeBrandColor,
+  normalizeBrowserPrefs,
   normalizeGeneratorOptions,
   PREF_STORE_KEYS,
   PREFS_CHANGED_EVENT,
@@ -97,6 +98,7 @@ export async function loadPreferences(): Promise<Preferences> {
       get<boolean>(PREF_STORE_KEYS.lockOnMinimize) ?? DEFAULT_PREFERENCES.lockOnMinimize,
     closeToTray: get<boolean>(PREF_STORE_KEYS.closeToTray) ?? DEFAULT_PREFERENCES.closeToTray,
     generator: normalizeGeneratorOptions(get<unknown>(PREF_STORE_KEYS.generator)),
+    browser: normalizeBrowserPrefs(get<unknown>(PREF_STORE_KEYS.browser)),
   };
 }
 

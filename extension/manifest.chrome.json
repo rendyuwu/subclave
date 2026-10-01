@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Subclave",
+  "version": "0.1.0",
+  "description": "Fill logins from your local Subclave vault.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtLmxM8kp4Q1xQTEvVoEvVHEjkzgKtqR/8OX9mufwWPXh3n6ag1eC7pBP/E5Cm1cmyXfhHGoSx/AiaUmPq4OqpKbTI6p5Ujo1aHzLZWKpYQezxJ4zkGsAtIgWUnzb05NvwJfvtgH0bcYlaktzc5hwvLAlkOQMNeIBPyLe0EMeGMamo5XkQytUtlMXNniRBuwBjQofHx1mVwg0mAcxLmhG9Cd/pChzd8osdDjYAKzErPsq+mcriJgOdyxJIJWlwIowW5OCUPbRWzg7mdFFFucxx/zpJfwkZFPE5o7tlDI4lfHlJTWX+/fMC+zsFIUEQ/3aLIXuIOPlX48FIC4wLzMn6QIDAQAB",
+  "permissions": ["nativeMessaging", "storage", "activeTab", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "commands": {
+    "fill-login": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+L",
+        "mac": "Command+Shift+L"
+      },
+      "description": "Fill login"
+    }
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
+}

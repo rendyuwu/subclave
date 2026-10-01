@@ -12,6 +12,28 @@ use serde::{Deserialize, Serialize};
 pub struct DeviceState {
     #[serde(default)]
     pub sync: SyncDevice,
+    /// Browsers paired with this installation. Like `sync`, this is
+    /// device-local and arrives with `#[serde(default)]`, so a vault written
+    /// before it landed opens unchanged.
+    #[serde(default)]
+    pub browser_clients: Vec<BrowserClient>,
+}
+
+/// One paired browser extension. `secret` is the HMAC key both sides prove
+/// possession of during `hello`/`auth`; it never leaves the payload except to
+/// the extension during pairing.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserClient {
+    pub id: String,
+    pub name: String,
+    /// `"chromium"` or `"firefox"`. A plain string rather than an enum: the
+    /// webview mirrors it and a value from a newer build must not fail the
+    /// vault open.
+    pub family: String,
+    pub secret: String,
+    pub paired_at: u64,
+    pub last_seen_at: Option<u64>,
 }
 
 /// Sync state owned by this device: what remote it is joined to, the root key
@@ -53,5 +75,40 @@ impl SyncDevice {
     /// Forget the remote, the root key, the credentials and the tracking maps.
     pub fn clear(&mut self) {
         *self = SyncDevice::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_payload_without_browser_clients_still_opens() {
+        let state: DeviceState = serde_json::from_str(r#"{"sync":{}}"#).unwrap();
+        assert!(state.browser_clients.is_empty());
+
+        let empty: DeviceState = serde_json::from_str("{}").unwrap();
+        assert!(empty.browser_clients.is_empty());
+    }
+
+    #[test]
+    fn browser_clients_round_trip_camel_case() {
+        let state = DeviceState {
+            sync: SyncDevice::default(),
+            browser_clients: vec![BrowserClient {
+                id: "c1".into(),
+                name: "Chrome".into(),
+                family: "chromium".into(),
+                secret: "s".into(),
+                paired_at: 5,
+                last_seen_at: Some(9),
+            }],
+        };
+        let text = serde_json::to_string(&state).unwrap();
+        assert!(text.contains("\"browserClients\""));
+        assert!(text.contains("\"pairedAt\""));
+        assert!(text.contains("\"lastSeenAt\""));
+        let back: DeviceState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, state);
     }
 }

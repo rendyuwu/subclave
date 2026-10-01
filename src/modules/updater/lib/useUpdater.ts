@@ -61,7 +61,7 @@ export async function fetchLinuxRelease(): Promise<ManualUpdateInfo | null> {
 
 /** `autoCheck: false` keeps the shared state machine and the click handlers but
  *  drops the unattended sweeps below. The Settings window mounts this hook for
- *  the About button's copy and dialog, and the PRD allows exactly two kinds of
+ *  the About button's copy and dialog, and the app allows exactly two kinds of
  *  network traffic (sync, and the main window's 6-hourly check), so opening
  *  Settings must not add a GitHub round trip nobody asked for. */
 export function useUpdater(opts?: { autoCheck?: boolean }) {

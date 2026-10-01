@@ -10,7 +10,7 @@ mod drafts;
 mod records;
 mod views;
 
-pub use device::{DeviceState, SyncDevice};
+pub use device::{BrowserClient, DeviceState, SyncDevice};
 pub use drafts::{normalize_tags, stamp_next, DraftCustomField, EntryDraft, GroupDraft};
 pub(crate) use records::seed_reserved_groups;
 pub use records::{

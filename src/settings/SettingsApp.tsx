@@ -10,6 +10,7 @@ import { usePreferencesStore } from "@/modules/settings/preferences";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { type ComponentType, lazy, Suspense, useEffect, useState } from "react";
 import {
+  Globe,
   Info,
   Keyboard,
   Palette,
@@ -35,6 +36,9 @@ const ThemeSection = lazy(() =>
 const ShortcutsSection = lazy(() =>
   import("./sections/ShortcutsSection").then((m) => ({ default: m.ShortcutsSection })),
 );
+const BrowserSection = lazy(() =>
+  import("./sections/BrowserSection").then((m) => ({ default: m.BrowserSection })),
+);
 const AboutSection = lazy(() =>
   import("./sections/AboutSection").then((m) => ({ default: m.AboutSection })),
 );
@@ -50,6 +54,7 @@ const TABS: {
   { id: "sync", label: "Sync", icon: RefreshCw, component: SyncSection },
   { id: "theme", label: "Theme", icon: Palette, component: ThemeSection },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard, component: ShortcutsSection },
+  { id: "browser", label: "Browser", icon: Globe, component: BrowserSection },
   { id: "about", label: "About", icon: Info, component: AboutSection },
 ];
 

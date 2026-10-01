@@ -155,7 +155,8 @@ impl VaultPayload {
             }
         }
         // The sync credentials are secrets too: a locked process must not
-        // keep the root key or the storage passwords in memory.
+        // keep the root key or the storage passwords in memory. The paired
+        // browser secrets ride the same payload and go with them.
         self.device.sync.root_key.take();
         self.device.sync.s3_access_key_id.take();
         self.device.sync.s3_secret_access_key.take();
@@ -163,6 +164,7 @@ impl VaultPayload {
         self.device.sync.webdav_password.take();
         self.device.sync.etags.clear();
         self.device.sync.dirty.clear();
+        self.device.browser_clients.clear();
     }
 }
 
@@ -273,6 +275,17 @@ mod tests {
             .etags
             .insert("entry:e1".into(), "etag".into());
         payload.device.sync.dirty.insert("entry:e1".into());
+        payload
+            .device
+            .browser_clients
+            .push(super::super::device::BrowserClient {
+                id: "c1".into(),
+                name: "Chrome".into(),
+                family: "chromium".into(),
+                secret: "paired-secret".into(),
+                paired_at: 1,
+                last_seen_at: None,
+            });
         payload.wipe();
         let e = &payload.entries[0];
         assert_eq!(e.password, "");
@@ -286,6 +299,10 @@ mod tests {
             payload.device.sync,
             SyncDevice::default(),
             "the sync credentials and maps are scrubbed"
+        );
+        assert!(
+            payload.device.browser_clients.is_empty(),
+            "the paired browser secret is scrubbed"
         );
         assert_eq!(e.title, "Site", "metadata is not scrubbed");
     }

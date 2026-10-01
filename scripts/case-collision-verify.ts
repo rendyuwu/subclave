@@ -6,7 +6,8 @@
  * macOS and Windows check this repository out on a case-insensitive filesystem,
  * and the CI bundle matrix builds it there. Two tracked paths that differ only
  * in case are two entries in git and one file on those runners: the checkout
- * keeps whichever came last and the other is gone. That is how M2 reached CI:
+ * keeps whichever came last and the other is gone. That is how this bug first
+ * reached CI:
  * `GroupTree.tsx` and an all-lowercase sibling helper were both checked in, the
  * bundle job kept one of them, `import { Chip } from "./GroupTree"` resolved to
  * the surviving `.ts`, and all four bundle jobs failed on a component nobody
