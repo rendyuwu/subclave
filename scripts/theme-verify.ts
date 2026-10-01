@@ -2,11 +2,11 @@
  * Self-check for the theme system.
  * Run: `npx tsx scripts/theme-verify.ts`.
  *
- * The failure this exists for is silent and was real: `--subclave-icon-done` was
- * added to globals.css with a hard-coded blue and no `ThemeColors` key, so the
- * "finished" badge stayed blue under EVERY preset and no error was raised
- * anywhere. Any themable colour var must be reachable from a theme, and any
- * theme key must be editable in Settings, or it silently stops being a theme.
+ * The failure this exists for is silent and was real: a colour var was added to
+ * globals.css with a hard-coded value and no `ThemeColors` key, so it stayed
+ * that same colour under EVERY preset and no error was raised anywhere. Any
+ * themable colour var must be reachable from a theme, and any theme key must be
+ * editable in Settings, or it silently stops being a theme.
  *
  * Checks:
  *   - every `--subclave-*` COLOUR var declared in globals.css is written by the
@@ -15,8 +15,8 @@
  *     colour picker in Settings can never be a knob that moves nothing
  *     (the button token was exactly that until the neutral button started
  *     reading it),
- *   - every non-ANSI key is editable in the Settings colour editor (the ANSI 16
- *     have no settings surface yet),
+ *   - every non-ANSI key is editable in the Settings colour editor (the ANSI
+ *     accents have no settings surface yet),
  *   - preset names are unique.
  */
 import { readdirSync, readFileSync } from "node:fs";
@@ -25,8 +25,8 @@ import { dirname, join } from "node:path";
 
 import { THEME_PRESETS } from "../src/modules/settings/themePresets";
 import { COLOR_FIELDS } from "../src/settings/sections/theme/colorFields";
+import { contrastRatio } from "../src/lib/color";
 import {
-  contrastRatio,
   ensureVisibleButtonFace,
   MIN_FACE_CONTRAST,
   MIN_FACE_TEXT_CONTRAST,
@@ -46,14 +46,27 @@ function check(name: string, ok: boolean, detail?: unknown): void {
 }
 
 const css = read("src/styles/globals.css");
-const customThemeSrc = read("src/modules/settings/customTheme.ts");
+const customThemeSrc =
+  read("src/modules/settings/theme/apply.ts") + read("src/modules/settings/theme/model.ts");
 
-// COLOR_VAR_MAP is source-scanned rather than imported: customTheme.ts touches
-// `document` at module scope through its Tauri imports, and this only needs the
-// var names.
+// COLOR_VAR_MAP is source-scanned rather than imported: apply.ts touches
+// `document` and imports Tauri at module scope, and this only needs the var
+// names.
 const mapBody = /const COLOR_VAR_MAP[\s\S]*?\n};/.exec(customThemeSrc)?.[0] ?? "";
 const appVars = new Set([...mapBody.matchAll(/"(--[a-z0-9-]+)"/g)].map((m) => m[1]));
-check("COLOR_VAR_MAP parsed", appVars.size > 30, appVars.size);
+
+// Parse-failure tripwire, same shape as the globals.css one below: the quoted
+// scan above is what every later check runs on, so it must see every name the
+// map mentions. The map body is read again with the quote requirement dropped
+// and a wider name class, and the two name sets must agree: a dropped quote, an
+// entry quoted differently or a name the lowercase class rejects then shows up
+// on one side only. A fixed floor cannot do this job - the old `> 30` silently
+// tolerated eight more names disappearing once ThemeColors shrank.
+const appVarsAnywhere = new Set([...mapBody.matchAll(/(--[a-zA-Z0-9-]+)/g)].map((m) => m[1]));
+check("COLOR_VAR_MAP parsed", appVars.size > 0 && appVars.size === appVarsAnywhere.size, {
+  quoted: appVars.size,
+  anyPosition: appVarsAnywhere.size,
+});
 
 // Vars that are NOT colours a theme should own: layout/typography knobs and
 // values derived at runtime from other tokens.
@@ -70,7 +83,22 @@ const NON_THEMABLE = new Set([
 ]);
 
 const declared = new Set([...css.matchAll(/^\s*(--subclave-[a-z0-9-]+)\s*:/gm)].map((m) => m[1]));
-check("globals.css vars parsed", declared.size > 30, declared.size);
+
+// Parse-failure tripwire: the anchored scan above is what every check below
+// runs on, so it has to see every declaration in the file. The same text is
+// scanned once more with an unanchored pattern and a wider name class, and the
+// two name sets must agree: a broken anchored regex (lost `m` flag, a
+// declaration no longer starting its line) or a name the anchored class rejects
+// then shows up on one side only. A fixed floor cannot do this job - the old
+// `> 30` silently tolerated seven more declarations disappearing once
+// ThemeColors shrank.
+const declaredAnywhere = new Set(
+  [...css.matchAll(/(--subclave-[a-zA-Z0-9-]+)\s*:/g)].map((m) => m[1]),
+);
+check("globals.css vars parsed", declared.size > 0 && declared.size === declaredAnywhere.size, {
+  anchored: declared.size,
+  anyPosition: declaredAnywhere.size,
+});
 
 for (const v of declared) {
   if (NON_THEMABLE.has(v)) continue;
@@ -95,8 +123,8 @@ function collectSources(dir: string): { path: string; body: string }[] {
     const p = join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...collectSources(p));
-    } else if (/\.(css|ts|tsx)$/.test(entry.name) && !p.endsWith("customTheme.ts")) {
-      // customTheme.ts is excluded: it is the WRITER, so counting it would make
+    } else if (/\.(css|ts|tsx)$/.test(entry.name) && !p.endsWith(join("theme", "apply.ts"))) {
+      // apply.ts is excluded: it is the WRITER, so counting it would make
       // every token look read.
       out.push({ path: p, body: readFileSync(p, "utf8") });
     }
@@ -115,7 +143,7 @@ const rawHits = sources.flatMap((s) =>
 );
 check("no raw Tailwind hues in components", rawHits.length === 0, rawHits.slice(0, 8));
 
-// Editable in Settings > Theme, except the ANSI 16, which no surface edits yet.
+// Editable in Settings > Theme, except the ANSI accents, which no surface edits yet.
 const editable = new Set(COLOR_FIELDS.map((f) => f.key));
 const sample = THEME_PRESETS[0].dark;
 for (const key of Object.keys(sample)) {

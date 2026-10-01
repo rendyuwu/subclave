@@ -4,7 +4,7 @@ import { SHORTCUTS, matchBinding, type ShortcutId } from "../shortcuts";
 import { registerCommand, unregisterCommand } from "./commandRegistry";
 import { COMMAND_PALETTE_MODAL, isModalOpen, isTopModal } from "./modalRegistry";
 
-export type ShortcutHandler = (e: KeyboardEvent) => void;
+export type ShortcutHandler = () => void;
 export type ShortcutHandlers = Partial<Record<ShortcutId, ShortcutHandler>>;
 
 /**
@@ -75,7 +75,7 @@ export function useGlobalShortcuts(handlers: ShortcutHandlers): void {
         if (!h) return;
         e.preventDefault();
         e.stopImmediatePropagation();
-        h(e);
+        h();
         return;
       }
     };
@@ -93,7 +93,7 @@ export function useGlobalShortcuts(handlers: ShortcutHandlers): void {
     const ids = Object.keys(latest.current.handlers) as ShortcutId[];
     const invokers = new Map<ShortcutId, ShortcutHandler>();
     for (const id of ids) {
-      const invoke: ShortcutHandler = (e) => latest.current.handlers[id]?.(e);
+      const invoke: ShortcutHandler = () => latest.current.handlers[id]?.();
       invokers.set(id, invoke);
       registerCommand(id, invoke);
     }

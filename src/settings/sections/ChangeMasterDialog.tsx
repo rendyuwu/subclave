@@ -12,12 +12,12 @@ import { Spinner } from "@/components/ui/spinner";
 import { toast } from "@/components/ui/toast";
 import { StrengthMeter } from "@/modules/vault/editor/StrengthMeter";
 import { describeVaultError } from "@/modules/vault/errors";
-import { genStrength, vaultChangeMaster } from "@/modules/vault/ipc";
-import { useEffect, useState } from "react";
+import { vaultChangeMaster } from "@/modules/vault/ipc";
+import { useState } from "react";
 import { Label } from "../components/Label";
 
 const MIN_LENGTH = 8;
-/** Below this the meter's warning is repeated as a line the user cannot miss. */
+/** Below this score the meter's warning is repeated as a line the user cannot miss. */
 const WEAK_SCORE = 3;
 
 export function ChangeMasterDialog({
@@ -46,21 +46,8 @@ export function ChangeMasterDialog({
     onOpenChange(false);
   };
 
-  // The meter owns the bar and label; this probe is only for the explicit
-  // warning line below it, and is debounced the same way.
-  useEffect(() => {
-    if (!open || next.length === 0) {
-      setScore(null);
-      return;
-    }
-    const timer = setTimeout(() => {
-      void genStrength(next)
-        .then((s) => setScore(s.score))
-        .catch(() => setScore(null));
-    }, 200);
-    return () => clearTimeout(timer);
-  }, [open, next]);
-
+  // The score comes from the meter's own probe, so the warning line below it
+  // never disagrees with the bar.
   const canSubmit =
     !busy && current.length > 0 && [...next].length >= MIN_LENGTH && next === confirm;
 
@@ -105,7 +92,7 @@ export function ChangeMasterDialog({
               value={next}
               onChange={(e) => setNext(e.target.value)}
             />
-            <StrengthMeter value={next} />
+            <StrengthMeter value={next} onScore={setScore} />
             {score !== null && score < WEAK_SCORE ? (
               <span className="text-destructive text-[10.5px]">
                 This password is weak. Use a longer one.

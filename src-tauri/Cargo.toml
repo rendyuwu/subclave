@@ -42,11 +42,11 @@ tauri-build = { version = "2", features = [] }
 # bursty, fragmented workloads, so a heavy-output burst inflates the process
 # commit to multiple GB and it never recedes. mimalloc decommits freed segments
 # back to the OS on its purge timer, turning that high-watermark back into
-# transient peaks. See the `#[global_allocator]` in lib.rs.
+# transient peaks. See the `#[global_allocator]` in allocator.rs.
 mimalloc = "0.1"
 # Already in the tree as mimalloc's own dependency; taken directly for
 # `mi_collect`, which is what actually hands freed commit back to the OS. See
-# `purge_allocator` in lib.rs.
+# `purge_allocator` in allocator.rs.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
@@ -85,6 +85,23 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # `ring` is the provider the rest of the graph already builds rustls with, so
 # this adds no crate to the build.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# The sync providers' dates. `chrono` is the calendar under `amz_date` and the
+# two strict parsers in `src-tauri/src/modules/sync/providers/sigv4.rs` and
+# `src-tauri/src/modules/sync/providers/webdav/dav_time.rs`. `alloc` is the
+# only feature on: neither parser reads the system clock (`amz_date` takes the
+# instant as an argument), so `clock` is off, and `wasmbind` exists for a
+# target this app does not build for.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# The two listing scans, in `src-tauri/src/modules/sync/providers/s3/list_xml.rs`
+# and `src-tauri/src/modules/sync/providers/webdav/dav_xml.rs`. Already in the
+# tree through plist and wayland-scanner. Its default feature set is empty; the
+# one feature it has, `encoding`, would pull a charset converter for a body the
+# caller has already decoded from UTF-8.
+quick-xml = "0.41"
+# Hex, for the two folds it replaces: `hex` in
+# `src-tauri/src/modules/sync/providers/sigv4.rs` and `object_name` in
+# `src-tauri/src/modules/sync/crypto.rs`. Already in the tree through zbus.
+hex = "0.4"
 # Already in the tree through tauri, so taking it directly adds no crate to the
 # build. The sync engine's test fake locks and immediately unwraps, where a
 # poisoning error path is pure ceremony; `[dev-dependencies]` is not available

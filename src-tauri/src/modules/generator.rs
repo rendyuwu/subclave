@@ -5,7 +5,7 @@
 //! drive it with a seeded deterministic generator and no trait is needed.
 //! Production passes the OS CSPRNG.
 
-use crate::modules::vault::model::GeneratorOptions;
+use serde::{Deserialize, Serialize};
 
 /// Characters removed by `exclude_ambiguous`: I, l, 1, O, 0. Symbols are
 /// never filtered.
@@ -14,7 +14,33 @@ const AMBIGUOUS: [char; 5] = ['I', 'l', '1', 'O', '0'];
 /// Not a protocol constant, just a product choice; this is the one const to change.
 pub const SYMBOLS: &str = "!@#$%^&*()-_=+[]{};:,.?/";
 
-pub fn charset(options: &GeneratorOptions) -> Result<Vec<char>, String> {
+/// The webview's password-generator settings, deserialized camelCase from the
+/// `gen_password` command argument.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratorOptions {
+    pub length: u32,
+    pub lower: bool,
+    pub upper: bool,
+    pub digits: bool,
+    pub symbols: bool,
+    pub exclude_ambiguous: bool,
+}
+
+impl Default for GeneratorOptions {
+    fn default() -> Self {
+        Self {
+            length: 20,
+            lower: true,
+            upper: true,
+            digits: true,
+            symbols: true,
+            exclude_ambiguous: false,
+        }
+    }
+}
+
+fn charset(options: &GeneratorOptions) -> Result<Vec<char>, String> {
     let mut set: Vec<char> = Vec::new();
     if options.lower {
         set.extend('a'..='z');
@@ -141,18 +167,7 @@ pub async fn gen_password(options: GeneratorOptions) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    /// xorshift64* deterministic fill, seeded per test.
-    fn xorshift(seed: u64) -> impl FnMut(&mut [u8]) {
-        let mut state = seed | 1;
-        move |buf: &mut [u8]| {
-            for slot in buf.iter_mut() {
-                state ^= state >> 12;
-                state ^= state << 25;
-                state ^= state >> 27;
-                *slot = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
-            }
-        }
-    }
+    use crate::modules::test_rng::xorshift;
 
     fn defaults() -> GeneratorOptions {
         GeneratorOptions::default()

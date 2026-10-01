@@ -1,14 +1,9 @@
 import { emit, listen } from "@tauri-apps/api/event";
 
 import { createFileKeyValueStore } from "./fileKeyValueStore";
-import {
-  recoverStoreFile,
-  snapshotStoreFile,
-  tauriStoreFileIo,
-  type StoreFileIo,
-  type StoreFileState,
-  type StoreRecovery,
-} from "./storeRecovery";
+import { tauriStoreFileIo } from "./storeFileIo";
+import type { StoreFileIo } from "./storeFileState";
+import { recoverStoreFile, snapshotStoreFile, type StoreRecovery } from "./storeRecovery";
 
 // A JSON store file with crash recovery in front of it, parameterised.
 //
@@ -119,18 +114,6 @@ export type RecoveredStoreIo = {
    */
   ensureLoaded(): Promise<StoreRecovery | null>;
   /**
-   * What the recovery pass found, once it has run. Never drains anything.
-   *
-   * Separate from {@link RecoveredStoreIo.ensureLoaded} because the two have
-   * different audiences and only one of them may consume the notice: the UI
-   * tells the user once, and a store layer deciding whether it is safe to write
-   * a default over the file must be able to ask the same question without
-   * racing that toast away. A store layer that seeds a default when its list
-   * comes back empty is the caller: doing that over a file that was merely
-   * unreadable is how saved records get blanked.
-   */
-  fileState(): Promise<{ found: StoreFileState; recovered: boolean }>;
-  /**
    * The recovery notice, returned ONCE so a caller can toast it exactly once.
    * `src/lib` cannot import a toast, so the notice travels instead of the
    * dependency. Prefer {@link RecoveredStoreIo.ensureLoaded} at startup: this is
@@ -165,7 +148,7 @@ function reason(e: unknown): string {
  * Exported as well as used below so a store layer that assembles its own
  * {@link RecoveredStoreIo} gets the real thing rather than a fourth copy of it.
  */
-export function createWriteQueue(): <T>(op: () => Promise<T>) => Promise<T> {
+function createWriteQueue(): <T>(op: () => Promise<T>) => Promise<T> {
   let queue: Promise<unknown> = Promise.resolve();
   return <T>(op: () => Promise<T>): Promise<T> => {
     const run = queue.then(op, op);
@@ -189,9 +172,6 @@ export function createRecoveredStore(
 
   let notice: StoreRecovery | null = null;
   let ready: Promise<void> | undefined;
-  /** The recovery verdict, kept whether or not there was anything to say. The
-   *  notice slot cannot serve this: it is emptied by the first taker. */
-  let verdict: { found: StoreFileState; recovered: boolean } = { found: "ok", recovered: false };
 
   /**
    * Recover, load, snapshot - once, and without ever rejecting.
@@ -202,7 +182,6 @@ export function createRecoveredStore(
    */
   async function initialize(): Promise<void> {
     const recovery = await recoverStoreFile(spec.path, files);
-    verdict = { found: recovery.found, recovered: recovery.recovered };
     const notes = recovery.note ? [recovery.note] : [];
 
     // Subscribe BEFORE the first load, so the subscription exists before
@@ -367,10 +346,6 @@ export function createRecoveredStore(
     async ensureLoaded(): Promise<StoreRecovery | null> {
       await settle();
       return takeRecoveryNotice();
-    },
-    async fileState(): Promise<{ found: StoreFileState; recovered: boolean }> {
-      await settle();
-      return verdict;
     },
     takeRecoveryNotice,
   };

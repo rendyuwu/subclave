@@ -5,16 +5,23 @@
 //! a backend is a new file here plus one arm there and touches nothing else.
 //! `src-tauri/src/modules/sync/providers/sigv4.rs` is shared signing rather
 //! than a backend of its own: any other service speaking the same signature
-//! scheme would use it without a second copy.
+//! scheme would use it without a second copy. The two backends are directory
+//! modules; `src-tauri/src/modules/sync/providers/http.rs` holds the HTTP shell
+//! they share, since a request already decided is a request whichever protocol
+//! built it, and `src-tauri/src/modules/sync/providers/xml_tree.rs` holds the
+//! XML scan they share, since the walk does not depend on the element names the
+//! two look up.
 //!
 //! THE SSRF GUARD LIVES HERE rather than in a module of its own, because its
 //! only callers are the two backends below: a file whose whole contents are one
 //! guard three files away is indirection for its own sake. Both providers call
 //! it from the guard that runs before their first request.
 
+pub mod http;
 pub mod s3;
 pub mod sigv4;
 pub mod webdav;
+pub mod xml_tree;
 
 /// Install the process-wide TLS crypto provider, once.
 ///

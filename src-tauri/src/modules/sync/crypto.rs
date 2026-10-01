@@ -29,13 +29,13 @@
 //! same name for the same record.
 //!
 //! NO PATHS HERE. The layout `<prefix>/v1/keyfile` and
-//! `<prefix>/v1/obj/<name>` belongs to `src-tauri/src/modules/sync/engine.rs`,
-//! the sync layer above the provider, which composes the key a provider
-//! receives; this module produces the `<name>` half and the keyfile struct and
-//! builds no path. A provider in `src-tauri/src/modules/sync/provider.rs` sees
-//! keys and bytes and has no idea what a record is, so the `v1` segment (the
-//! wire format's version expressed in the object namespace) cannot be its
-//! business.
+//! `<prefix>/v1/obj/<name>` belongs to
+//! `src-tauri/src/modules/sync/engine/layout.rs`, the sync layer above the
+//! provider, which composes the key a provider receives; this module produces
+//! the `<name>` half and the keyfile struct and builds no path. A provider in
+//! `src-tauri/src/modules/sync/provider.rs` sees keys and bytes and has no idea
+//! what a record is, so the `v1` segment (the wire format's version expressed in
+//! the object namespace) cannot be its business.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ring::{
@@ -296,7 +296,8 @@ pub fn open_record(keys: &SyncKeys, sealed: &SealedRecord) -> Result<Zeroizing<V
 /// can list the storage.
 ///
 /// Hex rather than base64 because the result is a path segment, and base64's
-/// alphabet includes `/`. The encoding is one fold, not a dependency.
+/// alphabet includes `/`. The encoding is the `hex` crate's, which
+/// `sigv4::hex` in `src-tauri/src/modules/sync/providers/sigv4.rs` also calls.
 ///
 /// The `:` is a real separator only because NO `kind` CONTAINS ONE. The two in
 /// use are `entry` and `group`, and both live in
@@ -305,11 +306,7 @@ pub fn open_record(keys: &SyncKeys, sealed: &SealedRecord) -> Result<Zeroizing<V
 pub fn object_name(keys: &SyncKeys, kind: &str, id: &str) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, &keys.name[..]);
     let tag = hmac::sign(&key, format!("{kind}:{id}").as_bytes());
-    tag.as_ref().iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    hex::encode(tag.as_ref())
 }
 
 #[cfg(test)]

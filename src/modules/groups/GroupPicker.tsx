@@ -3,7 +3,8 @@
 // draft that names it) and neither is anything the caller excludes.
 
 import { Combobox, type ComboboxOption } from "@/modules/vault/editor/Combobox";
-import { ROOT_ID, TRASH_ID, groupPath } from "./groupTreeModel";
+import { ROOT_ID, groupPath } from "./groupTreeModel";
+import { TRASH_SCOPE } from "@/modules/vault/list/derive";
 import { useVaultStore } from "@/modules/vault/store";
 
 export function GroupPicker({
@@ -22,7 +23,7 @@ export function GroupPicker({
   const excluded = new Set(exclude ?? []);
   const options: ComboboxOption[] = [{ value: ROOT_ID, label: "Root", search: "root" }];
   for (const group of groups) {
-    if (group.id === ROOT_ID || group.id === TRASH_ID || excluded.has(group.id)) continue;
+    if (group.id === ROOT_ID || group.id === TRASH_SCOPE || excluded.has(group.id)) continue;
     const path = groupPath(group.id, byId);
     options.push({ value: group.id, label: path, search: `${path} ${group.id}` });
   }

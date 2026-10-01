@@ -40,9 +40,6 @@ Thumbs.db
 .agents
 .local/
 
-# react-doctor: local-only scan config (rule policy kept off the repo)
-react-doctor.config.json
-
 # Project-local working files
 /icon.png
 # Both cases on purpose. Ignore patterns are matched case-SENSITIVELY, so the
@@ -52,3 +49,5 @@ TODO.MD
 todo.md
 # Exported theme files are personal / test artifacts, not repo content.
 *.subclave
+
+.omc

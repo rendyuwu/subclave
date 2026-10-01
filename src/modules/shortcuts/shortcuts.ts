@@ -37,9 +37,6 @@ export type Shortcut = {
    * A returned false skips this chord and lets the loop try the next one.
    */
   when?: (e: KeyboardEvent) => boolean;
-  /** List in settings but disable recorder + reset. For component-hardcoded
-   *  keys (e.g. textarea Enter) shown for documentation. */
-  readOnly?: boolean;
 };
 
 /**
@@ -154,8 +151,11 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = ["General", "Entries", "Vault", 
  * `e.code` is stable across layouts (`KeyT`, `Digit5`, `BracketLeft`).
  * For everything else (punctuation, function/navigation/named keys) fall
  * back to `e.key`. Same hybrid VS Code and CodeMirror use.
+ *
+ * Exported for the recorder, which stores this key so a binding recorded
+ * with Option held or on a non-Latin layout still matches on replay.
  */
-function canonicalKey(e: KeyboardEvent): string {
+export function canonicalKey(e: KeyboardEvent): string {
   const code = e.code;
   // KeyA..KeyZ -> "a".."z"
   if (code.length === 4 && code.startsWith("Key")) {
@@ -182,76 +182,6 @@ export function matchBinding(e: KeyboardEvent, binding: KeyBinding): boolean {
     !!e.altKey === !!binding.alt &&
     !!e.metaKey === !!binding.meta
   );
-}
-
-/**
- * Recorder counterpart. Returns the canonical key so bindings recorded with
- * Option held or on non-Latin layouts still match on replay.
- */
-export function canonicalKeyFromEvent(e: KeyboardEvent): string {
-  return canonicalKey(e);
-}
-
-/**
- * Parses an extension's `contributes.keybindings[].key` string
- * (e.g. "Mod+Shift+E", "Ctrl+K", "Alt+Shift+ArrowLeft") into a `KeyBinding`.
- * VS Code grammar:
- *   `Mod` is `meta` on macOS, `ctrl` elsewhere (matches `MOD_PROP`).
- *   Modifiers (case-insensitive): ctrl/control, shift, alt/option/opt,
- *   meta/cmd/command/win/super, mod. Separated by `+`. Trailing token is the key.
- *   Single chars are lowercased; named keys pass through.
- * Returns `null` when input is empty or has no key token. Unknown modifiers
- * are skipped silently.
- */
-export function parseKeybindingString(input: string): KeyBinding | null {
-  if (typeof input !== "string") return null;
-  const parts = input
-    .split("+")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-  if (parts.length === 0) return null;
-  const binding: KeyBinding = { key: "" };
-  for (let i = 0; i < parts.length; i++) {
-    const token = parts[i];
-    const isLast = i === parts.length - 1;
-    const lower = token.toLowerCase();
-    if (!isLast) {
-      switch (lower) {
-        case "ctrl":
-        case "control":
-          binding.ctrl = true;
-          break;
-        case "shift":
-          binding.shift = true;
-          break;
-        case "alt":
-        case "option":
-        case "opt":
-          binding.alt = true;
-          break;
-        case "meta":
-        case "cmd":
-        case "command":
-        case "win":
-        case "super":
-          binding.meta = true;
-          break;
-        case "mod":
-          // VS Code alias: Cmd on Mac, Ctrl elsewhere. Aligns with `MOD_PROP`.
-          binding[MOD_PROP] = true;
-          break;
-        default:
-          // Unknown modifier: drop it so a single typo doesn't kill the binding.
-          break;
-      }
-      continue;
-    }
-    // Last token is the key. Lowercase single chars so `matchBinding`'s
-    // canonical comparison matches regardless of manifest casing.
-    binding.key = token.length === 1 ? token.toLowerCase() : token;
-  }
-  if (!binding.key) return null;
-  return binding;
 }
 
 /** Display tokens for a binding (platform-specific glyphs on macOS). */

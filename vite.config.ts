@@ -30,15 +30,6 @@ export default defineConfig(async ({ mode }) => ({
         main: path.resolve(__dirname, "index.html"),
         settings: path.resolve(__dirname, "settings.html"),
       },
-      output: {
-        manualChunks(id: string) {
-          if (!id.includes("node_modules")) return;
-
-          if (id.includes("/react-dom/") || id.includes("/react/") || id.includes("/scheduler/"))
-            return "react";
-          if (id.includes("@radix-ui/") || id.includes("/radix-ui/")) return "radix";
-        },
-      },
     },
   },
   clearScreen: false,

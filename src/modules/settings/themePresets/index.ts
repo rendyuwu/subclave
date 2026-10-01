@@ -7,7 +7,7 @@
  * Adding one: copy the closest family file, adjust, export it here. Every field
  * is required - `scripts/theme-verify.ts` fails on a preset that misses one.
  */
-import type { CustomTheme } from "../customTheme";
+import type { CustomTheme } from "../theme/model";
 import { DARK_COLORS, EMPTY_BG, LIGHT_COLORS } from "./base";
 import { TOKYO_NIGHT } from "./tokyoNight";
 import { NORD } from "./nord";

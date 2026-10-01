@@ -1,6 +1,6 @@
 /**
  * Whole-app transparency applier. The OS window is already created transparent
- * (see src-tauri/src/lib.rs); the app only looks solid because surfaces paint
+ * (see src-tauri/src/windows.rs); the app only looks solid because surfaces paint
  * opaque colours. Lowering app opacity fades the canvas + surfaces toward the
  * wallpaper image (or the desktop when none is set) for an Arch-terminal look.
  *
@@ -9,8 +9,9 @@
  * settings dialog) is the live feedback while dragging the slider.
  */
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { readShadow as readStored, writeShadow as writeStoredShadow } from "@/lib/fastPath";
 import { isSecondaryWindow } from "@/lib/platform";
-import { APP_OPACITY_DEFAULT, clampOpacity } from "./store";
+import { APP_OPACITY_DEFAULT, clampOpacity } from "./schema";
 
 const FAST_PATH_KEY = "subclave-app-opacity-shadow";
 // Transient live-drag channel: the settings slider broadcasts each step so the
@@ -21,17 +22,8 @@ const PREVIEW_EVENT = "subclave://app-opacity-preview";
 const GLASS_EPSILON = 0.999;
 
 function readShadow(): number {
-  if (typeof window === "undefined") return APP_OPACITY_DEFAULT;
-  const raw = window.localStorage.getItem(FAST_PATH_KEY);
+  const raw = readStored(FAST_PATH_KEY);
   return clampOpacity(raw === null ? APP_OPACITY_DEFAULT : Number(raw));
-}
-
-function writeShadow(value: number): void {
-  try {
-    window.localStorage.setItem(FAST_PATH_KEY, String(value));
-  } catch {
-    // ignore: localStorage may be unavailable in some embeddings.
-  }
 }
 
 /**
@@ -57,7 +49,7 @@ export function applyAppOpacity(opacity: number): void {
   // Persist the fast-path shadow before the settings-window opt-out so the
   // next-boot first paint reflects the committed value regardless of which
   // window wrote it.
-  writeShadow(value);
+  writeStoredShadow(FAST_PATH_KEY, String(value));
   applyOpacityCss(value);
 }
 

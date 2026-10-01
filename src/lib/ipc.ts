@@ -15,7 +15,8 @@ export type FsReadResult =
  * Names of Tauri events emitted by the RUST process and listened to on the TS
  * side. Magic strings on both sides drift silently (a typo just never fires),
  * so every TS listener references these constants. Mirror = the `emit(...)`
- * calls in src-tauri/src/lib.rs.
+ * calls on the Rust side (`src-tauri/src/commands.rs`,
+ * `src-tauri/src/windows.rs`, the vault modules).
  */
 export const IPC_EVENTS = {
   /** Rust -> Settings webview: focus a settings tab (payload: tab id string). */

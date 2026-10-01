@@ -10,11 +10,7 @@ const LABELS: Record<string, string> = {
   totp: "Code",
 };
 
-export function copyToastText(
-  kind: "password" | "username" | "totp" | string,
-  clearsAt: number | null,
-  now: number,
-): string {
+export function copyToastText(kind: string, clearsAt: number | null, now: number): string {
   const message = `${LABELS[kind] ?? kind} copied.`;
   if (clearsAt === null) return message;
   const seconds = Math.max(0, Math.ceil((clearsAt - now) / 1000));

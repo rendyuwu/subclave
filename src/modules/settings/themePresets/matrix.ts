@@ -1,4 +1,4 @@
-import type { CustomTheme, ThemeColors } from "../customTheme";
+import type { CustomTheme, ThemeColors } from "../theme/model";
 import { DARK_COLORS, EMPTY_BG, LIGHT_COLORS } from "./base";
 
 // Matrix family (dark green phosphor + a "light" inverted variant).
@@ -30,37 +30,16 @@ const MATRIX_DARK: ThemeColors = {
   sidebarAccent: "#008f11",
   sidebarAccentForeground: "#000000",
   iconWorking: "#39ff14",
-  iconIdle: "#3f8f3f",
-  iconBlocked: "#ff003c",
-  iconDone: "#00d4ff",
-  iconBranch: "#aaff00",
   diffAdded: "#00ff41",
-  diffRemoved: "#ff003c",
   info: "#00d4ff",
-  tabAccentTerminal: "#00ff41",
-  tabAccentSsh: "#00ffaa",
-  tabAccentEditor: "#39ff14",
-  tabAccentPreview: "#00d4ff",
-  tabAccentAiDiff: "#aaff00",
-  tabAccentGitDiff: "#ffd700",
   resizeHandle: "#0d2f0d",
-  // Matrix ANSI 16 - green-dominant phosphor palette.
-  ansiBlack: "#003b00",
+  // Matrix ANSI accents - green-dominant phosphor palette.
   ansiRed: "#ff003c",
   ansiGreen: "#00ff41",
   ansiYellow: "#ffd700",
   ansiBlue: "#00d4ff",
   ansiMagenta: "#aaff00",
   ansiCyan: "#00ffaa",
-  ansiWhite: "#00cc33",
-  ansiBrightBlack: "#0d2f0d",
-  ansiBrightRed: "#ff003c",
-  ansiBrightGreen: "#39ff14",
-  ansiBrightYellow: "#ffd700",
-  ansiBrightBlue: "#00ffaa",
-  ansiBrightMagenta: "#aaff00",
-  ansiBrightCyan: "#00ffea",
-  ansiBrightWhite: "#00ff41",
 };
 const MATRIX_LIGHT: ThemeColors = {
   ...LIGHT_COLORS,
@@ -90,39 +69,18 @@ const MATRIX_LIGHT: ThemeColors = {
   sidebarAccent: "#a6e3a1",
   sidebarAccentForeground: "#003b00",
   iconWorking: "#0a8a0a",
-  iconIdle: "#006400",
-  iconBlocked: "#c2185b",
-  iconDone: "#1976d2",
-  iconBranch: "#5a8f00",
   diffAdded: "#006400",
-  diffRemoved: "#c2185b",
   info: "#1976d2",
-  tabAccentTerminal: "#006400",
-  tabAccentSsh: "#0a8a8a",
-  tabAccentEditor: "#0a6a0a",
-  tabAccentPreview: "#1976d2",
-  tabAccentAiDiff: "#5a8f00",
-  tabAccentGitDiff: "#b58900",
   resizeHandle: "#bfd9bf",
   // Matrix "light" inverts the phosphor look: dark greens on a pale-green page.
   // Generic blue ANSI would clash, so use a dark-green-dominant set that reads
   // on #f4fff4 and keeps the Matrix identity.
-  ansiBlack: "#003b00",
   ansiRed: "#c2185b",
   ansiGreen: "#006400",
   ansiYellow: "#8a6d00",
   ansiBlue: "#1565c0",
   ansiMagenta: "#5a8f00",
   ansiCyan: "#0a7a6a",
-  ansiWhite: "#2c722c",
-  ansiBrightBlack: "#0a4d0a",
-  ansiBrightRed: "#c2185b",
-  ansiBrightGreen: "#008000",
-  ansiBrightYellow: "#a07a00",
-  ansiBrightBlue: "#1976d2",
-  ansiBrightMagenta: "#6a9f00",
-  ansiBrightCyan: "#0a8a76",
-  ansiBrightWhite: "#003b00",
 };
 
 export const MATRIX: CustomTheme = {

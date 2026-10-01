@@ -7,6 +7,7 @@ import {
   InputGroupButton,
   InputGroupInput,
 } from "@/components/ui/input-group";
+import { groupDigits } from "@/lib/format";
 import { totpPreview } from "@/modules/vault/ipc";
 import { describeVaultError } from "@/modules/vault/errors";
 import type { TotpCode } from "@/modules/vault/types";
@@ -16,10 +17,6 @@ import { totpUriFromInput } from "./draft";
 // The editor's TOTP row. It accepts either an `otpauth://` URI or a bare base32
 // secret (wrapped by `totpUriFromInput`) and previews the code before anything
 // is saved, so a bad URI is reported here rather than on Save.
-
-function groupDigits(code: string): string {
-  return code.replace(/(.{3})(?=.)/g, "$1 ");
-}
 
 export function TotpField({
   value,

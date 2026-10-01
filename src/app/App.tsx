@@ -10,12 +10,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Toaster } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { CommandPalette } from "@/modules/commandPalette";
-import { Header } from "@/modules/header";
+import { CommandPalette } from "@/modules/commandPalette/CommandPalette";
+import { Header } from "@/modules/header/Header";
 import { openSettingsWindow } from "@/modules/settings/openSettingsWindow";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { useGlobalShortcuts } from "@/modules/shortcuts";
-import { StatusBar } from "@/modules/statusbar";
+import { StatusBar } from "@/modules/statusbar/StatusBar";
 import { startSync } from "@/modules/sync";
 import { ThemeProvider } from "@/modules/theme";
 import { QuitConfirmDialog } from "@/modules/vault/QuitConfirmDialog";

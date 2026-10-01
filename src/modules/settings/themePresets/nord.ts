@@ -1,4 +1,4 @@
-import type { CustomTheme, ThemeColors } from "../customTheme";
+import type { CustomTheme, ThemeColors } from "../theme/model";
 import { DARK_COLORS, EMPTY_BG, LIGHT_COLORS } from "./base";
 
 // Nord family.
@@ -30,31 +30,16 @@ const NORD_DARK: ThemeColors = {
   sidebarAccent: "#3f577a",
   sidebarAccentForeground: "#eceff4",
   iconWorking: "#ebcb8b",
-  iconIdle: "#a3be8c",
-  iconBlocked: "#bf616a",
-  iconDone: "#81a1c1",
-  iconBranch: "#b48ead",
   diffAdded: "#a3be8c",
-  diffRemoved: "#bf616a",
   info: "#81a1c1",
   resizeHandle: "#4c566a",
-  // Nord ANSI 16.
-  ansiBlack: "#3b4252",
+  // Nord ANSI accents.
   ansiRed: "#bf616a",
   ansiGreen: "#a3be8c",
   ansiYellow: "#ebcb8b",
   ansiBlue: "#81a1c1",
   ansiMagenta: "#b48ead",
   ansiCyan: "#88c0d0",
-  ansiWhite: "#e5e9f0",
-  ansiBrightBlack: "#4c566a",
-  ansiBrightRed: "#bf616a",
-  ansiBrightGreen: "#a3be8c",
-  ansiBrightYellow: "#ebcb8b",
-  ansiBrightBlue: "#81a1c1",
-  ansiBrightMagenta: "#b48ead",
-  ansiBrightCyan: "#8fbcbb",
-  ansiBrightWhite: "#eceff4",
 };
 const NORD_LIGHT: ThemeColors = {
   ...LIGHT_COLORS,
@@ -84,34 +69,19 @@ const NORD_LIGHT: ThemeColors = {
   sidebarAccent: "#88c0d0",
   sidebarAccentForeground: "#2e3440",
   iconWorking: "#d08770",
-  iconIdle: "#a3be8c",
-  iconBlocked: "#bf616a",
-  iconDone: "#5e81ac",
-  iconBranch: "#8a5d80",
   diffAdded: "#a3be8c",
-  diffRemoved: "#bf616a",
   info: "#5e81ac",
   resizeHandle: "#d8dee9",
   // Nord has no official light terminal palette; the standard Nord ANSI is
   // tuned for dark surfaces (green/yellow/cyan wash out on #eceff4). These are
   // the same Nord hues deepened to read on the light background while keeping
-  // the Frost/Aurora character. Brights restore the canonical Nord tones.
-  ansiBlack: "#2e3440",
+  // the Frost/Aurora character.
   ansiRed: "#99313b",
   ansiGreen: "#4f6a43",
   ansiYellow: "#9a7227",
   ansiBlue: "#5e81ac",
   ansiMagenta: "#8a5d80",
   ansiCyan: "#3b7e8e",
-  ansiWhite: "#4c566a",
-  ansiBrightBlack: "#434c5e",
-  ansiBrightRed: "#bf616a",
-  ansiBrightGreen: "#5e7a50",
-  ansiBrightYellow: "#b58a3a",
-  ansiBrightBlue: "#5e81ac",
-  ansiBrightMagenta: "#a3789a",
-  ansiBrightCyan: "#4f93a3",
-  ansiBrightWhite: "#2e3440",
 };
 
 export const NORD: CustomTheme = {

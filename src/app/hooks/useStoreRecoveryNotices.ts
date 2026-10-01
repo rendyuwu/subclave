@@ -5,7 +5,7 @@ import {
   ensureLoaded as ensureSettingsLoaded,
   onSettingsStoreChanged,
   takeRecoveryNotice as takeSettingsRecoveryNotice,
-} from "@/modules/settings/store";
+} from "@/modules/settings/load";
 import {
   announceRecovery,
   drainRecovery,

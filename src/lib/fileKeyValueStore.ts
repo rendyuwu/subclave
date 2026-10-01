@@ -1,5 +1,5 @@
 import type { KeyValueStore } from "./recoveredStore";
-import { storeFilePaths, type StoreFileIo, type StoreFileRead } from "./storeRecovery";
+import { storeFilePaths, type StoreFileIo, type StoreFileRead } from "./storeFileState";
 
 // A store file read and written whole, in place of `tauri-plugin-store`.
 //

@@ -1,35 +1,25 @@
-import "./lib/tauri-browser-shim";
-
+import { bootWindow } from "@/lib/boot";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/700.css";
-import "./styles/globals.css";
 
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactDOM from "react-dom/client";
 import App from "./app/App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { USE_CUSTOM_WINDOW_CONTROLS } from "./lib/platform";
-import { applyBrandColorFastPath } from "@/modules/settings/brandColor";
-import { applyCustomThemeFastPath } from "@/modules/settings/customTheme";
 import { applyAppOpacityFastPath } from "@/modules/settings/appOpacity";
 import { installFocusRestore } from "./lib/focusRestore";
 
-if (USE_CUSTOM_WINDOW_CONTROLS) {
-  document.documentElement.dataset.chrome = "borderless";
-}
+const root = bootWindow({ rootId: "root" });
 
-applyBrandColorFastPath();
-// Custom theme overrides brand color when active. Run after the brand fast
-// path so its CSS variables win on first paint.
-applyCustomThemeFastPath();
 // Whole-app glass: fade the canvas toward the desktop on first paint so there
-// is no opaque flash before hydration re-applies the stored value.
+// is no opaque flash before hydration re-applies the stored value. Main window
+// only - the settings window stays solid.
 applyAppOpacityFastPath();
+
 // Alt-Tab can leave the webview with focus on <body>, stranding the caret.
 // Put it back where the user left it.
 installFocusRestore();
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+ReactDOM.createRoot(root).render(
   <ErrorBoundary
     fallback={(error, reset) => (
       <div className="bg-background text-foreground flex h-screen w-screen flex-col items-center justify-center gap-3 p-6">
@@ -59,15 +49,3 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <App />
   </ErrorBoundary>,
 );
-
-// Window starts hidden (per tauri.conf.json) so users never see a transparent
-// shadow-only frame before React paints. Use setTimeout - rAF is throttled
-// while the window is hidden and would never fire.
-const showWindow = () => {
-  getCurrentWindow()
-    .show()
-    .catch((e) => console.error("window.show failed:", e));
-};
-setTimeout(showWindow, 50);
-// Safety net: if the first show somehow fails to take effect, force again.
-setTimeout(showWindow, 500);

@@ -127,7 +127,7 @@ pub fn code(t: &TotpUri, unix_seconds: u64) -> String {
 }
 
 /// Seconds until the current code expires.
-pub fn remaining(t: &TotpUri, unix_seconds: u64) -> u32 {
+fn remaining(t: &TotpUri, unix_seconds: u64) -> u32 {
     t.period - (unix_seconds % u64::from(t.period)) as u32
 }
 
@@ -185,10 +185,7 @@ pub async fn totp_preview(uri: String) -> Result<TotpCode, String> {
 
 /// The current code and its remaining seconds, from the wall clock.
 fn code_now(parsed: &TotpUri) -> TotpCode {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::modules::vault::state::now_ms() / 1000;
     TotpCode {
         code: code(parsed, now),
         period: parsed.period,

@@ -69,10 +69,9 @@ function CommandPaletteImpl({ open, onOpenChange }: Props) {
   const items = useMemo(() => {
     const groups = new Map<string, Shortcut[]>();
     for (const s of SHORTCUTS) {
-      // Skip commands that can't be run from a list: readOnly ones are
-      // documentation-only key hints with no handler; commandPalette.open is
+      // Skip commands that can't be run from a list: commandPalette.open is
       // this palette itself.
-      if (s.readOnly || s.id === "commandPalette.open") continue;
+      if (s.id === "commandPalette.open") continue;
       // Nothing owns this id right now (for example the vault workspace is
       // unmounted while the vault is locked), so there is no command to list.
       if (!hasCommand(s.id)) continue;

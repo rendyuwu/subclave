@@ -4,13 +4,14 @@
 //! WHAT IS NOT HERE, and is not an oversight. No trigger and no scheduler: the
 //! webview owns when a pull or a push happens (see `src/modules/sync/`), and
 //! this module owns every decision and every write. No settings surface either:
-//! `sync_configure` in `src-tauri/src/modules/sync/engine.rs` is handed a
+//! `sync_configure` in `src-tauri/src/modules/sync/engine/commands.rs` is handed a
 //! passphrase and a provider configuration, and never goes looking for them.
 //! `SyncState` there is empty on every launch and nothing persists it, so every
 //! other command answers "no configuration" until a caller has opened one.
 //!
-//! `engine.rs` is where an object key is composed, which `crypto.rs` and
-//! `provider.rs` both decline for their own reasons.
+//! `src-tauri/src/modules/sync/engine/layout.rs` is where an object key is
+//! composed, which `crypto.rs` and `provider.rs` both decline for their own
+//! reasons.
 //!
 //! `src-tauri/src/modules/sync/model.rs` and
 //! `src-tauri/src/modules/sync/crypto.rs` are pure, and so is every decision in
