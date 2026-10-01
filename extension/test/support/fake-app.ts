@@ -16,6 +16,9 @@ export const CREDENTIALS_KEY = "subclave.credentials";
 /** How many authenticated actions to answer `not-associated` before honouring
  * them, simulating `close_all` dropping the socket while the port lives on. */
 export const DROP_AUTH_KEY = "subclaveE2E.dropAuth";
+/** Milliseconds `get-credential` waits before answering, so a spec can
+ * navigate the tab between a pick and its fill. */
+export const CREDENTIAL_DELAY_KEY = "subclaveE2E.credentialDelay";
 
 export type FakeMode = "locked" | "unpaired" | "ok" | "absent" | "no-fields";
 
@@ -32,6 +35,8 @@ export const FAKE_SECRET_BYTES: Bytes = new Uint8Array(32).fill(1);
 export const FAKE_SECRET_B64 = bytesToBase64(FAKE_SECRET_BYTES);
 export const FAKE_PASSWORD = "s3cret";
 export const FAKE_GENERATED = "generated-1";
+
+export const FAKE_DOMAIN = "github.com";
 
 export const FAKE_ENTRIES: LoginSummary[] = [
   { id: "entry-1", title: "Example Account", username: "alice", group: "Root", lastUsedAt: 100 },
@@ -172,9 +177,16 @@ export function createFakeTransport(): Transport {
         );
         return valid ? ok({}) : error("auth-failed", "Bad proof");
       }
-      case "get-logins":
-        return ok({ entries: mode === "no-fields" ? [] : FAKE_ENTRIES, otherMatches: 0 });
+      case "get-logins": {
+        const hostScope = stringParam(params, "scope") === "host";
+        if (mode === "no-fields") {
+          return ok({ entries: [], otherMatches: hostScope ? 1 : 0, domain: FAKE_DOMAIN });
+        }
+        return ok({ entries: FAKE_ENTRIES, otherMatches: hostScope ? 2 : 0, domain: FAKE_DOMAIN });
+      }
       case "get-credential": {
+        const delay = await readNumber(CREDENTIAL_DELAY_KEY);
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
         const id = stringParam(params, "id");
         const entry = FAKE_ENTRIES.find((candidate) => candidate.id === id) ?? FAKE_ENTRIES[0];
         return ok({ username: entry.username, password: FAKE_PASSWORD });

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: layout shift</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      // Moves the login form, and with it the picker's anchor, 40 px down.
+      window.__shift = () => {
+        const spacer = document.createElement("div");
+        spacer.style.height = "40px";
+        document.body.prepend(spacer);
+      };
+    </script>
+  </body>
+</html>

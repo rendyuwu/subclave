@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fields vanish at the pick</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+    </form>
+    <script>
+      // Hides both fields the moment the user clicks, through an adopted
+      // stylesheet: no DOM mutation, so detection never notices and the picker
+      // stays open while the fill finds its field gone.
+      window.__vanishOnClick = () => {
+        window.addEventListener(
+          "click",
+          () => {
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync("#username, #password { visibility: hidden; }");
+            document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+          },
+          { capture: true, once: true },
+        );
+      };
+    </script>
+  </body>
+</html>

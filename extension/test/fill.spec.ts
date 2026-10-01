@@ -1,7 +1,6 @@
 import { expect, test } from "@playwright/test";
-import type { BrowserContext, Page, Worker } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import {
-  CONNECTS_KEY,
   CREDENTIALS_KEY,
   DROP_AUTH_KEY,
   FAKE_CLIENT_ID,
@@ -9,89 +8,37 @@ import {
   FAKE_GENERATED,
   FAKE_PASSWORD,
   FAKE_SECRET_B64,
-  LOG_KEY,
-  MODE_KEY,
   type FakeMode,
-  type LogEntry,
 } from "./support/fake-app";
-import { FIXTURE_ORIGIN, launchExtension, openPopup, serviceWorker } from "./support/harness";
-
-declare global {
-  interface Window {
-    __events: Record<string, number>;
-  }
-}
-
-type Harness = { context: BrowserContext; worker: Worker; extensionId: string };
+import {
+  FIXTURE_ORIGIN,
+  FIXTURE_PORT,
+  openFixture as harnessOpenFixture,
+  openPopup,
+  readConnects as harnessReadConnects,
+  readLog as harnessReadLog,
+  setMode as harnessSetMode,
+  startHarness,
+  type Harness,
+} from "./support/harness";
 
 let harness: Harness;
 
 test.beforeEach(async ({}, testInfo) => {
-  const context = await launchExtension(testInfo.project.name, testInfo.outputPath("profile"));
-  const worker = await serviceWorker(context);
-  harness = { context, worker, extensionId: new URL(worker.url()).host };
-  // The fake app's mode, log and connect count all live in storage because an
-  // MV3 worker can be suspended between steps; the credentials are seeded so the
-  // browser starts out paired, which every non-pairing test wants.
-  await worker.evaluate(
-    async (seed) => {
-      await chrome.storage.local.clear();
-      await chrome.storage.local.set({
-        [seed.modeKey]: "ok",
-        [seed.logKey]: [],
-        [seed.connectsKey]: 0,
-        [seed.credentialsKey]: seed.credentials,
-        "subclave.showInLoginFields": true,
-      });
-    },
-    {
-      modeKey: MODE_KEY,
-      logKey: LOG_KEY,
-      connectsKey: CONNECTS_KEY,
-      credentialsKey: CREDENTIALS_KEY,
-      credentials: { clientId: FAKE_CLIENT_ID, secret: FAKE_SECRET_B64 },
-    },
-  );
+  harness = await startHarness(testInfo);
 });
 
 test.afterEach(async () => {
   if (harness) await harness.context.close();
 });
 
-async function openFixture(name: string): Promise<Page> {
-  const page = await harness.context.newPage();
-  await page.goto(`${FIXTURE_ORIGIN}/${name}`);
-  await page.bringToFront();
-  return page;
-}
+const openFixture = (name: string): Promise<Page> => harnessOpenFixture(harness, name);
+const setMode = (mode: FakeMode) => harnessSetMode(harness, mode);
+const readLog = () => harnessReadLog(harness);
+const readConnects = () => harnessReadConnects(harness);
 
 async function openPopupPage(): Promise<Page> {
   return openPopup(harness.context, harness.extensionId);
-}
-
-async function setMode(mode: FakeMode): Promise<void> {
-  await harness.worker.evaluate(({ key, value }) => chrome.storage.local.set({ [key]: value }), {
-    key: MODE_KEY,
-    value: mode,
-  });
-}
-
-async function readLog(): Promise<LogEntry[]> {
-  const raw: unknown = await harness.worker.evaluate(async (key) => {
-    const stored = await chrome.storage.local.get([key]);
-    return stored[key];
-  }, LOG_KEY);
-  // The fake app is the only writer of this key and only ever stores its own
-  // entries, so the shape is known.
-  return Array.isArray(raw) ? (raw as LogEntry[]) : [];
-}
-
-async function readConnects(): Promise<number> {
-  const raw: unknown = await harness.worker.evaluate(async (key) => {
-    const stored = await chrome.storage.local.get([key]);
-    return stored[key];
-  }, CONNECTS_KEY);
-  return typeof raw === "number" ? raw : -1;
 }
 
 test("lists every match and fills username and password", async () => {
@@ -346,4 +293,35 @@ test("re-handshakes a replaced connection instead of forcing a re-pair", async (
   expect(log.some((entry) => entry.action === "get-credential" && entry.ok)).toBe(true);
   // A replaced connection costs one reconnect and one silent re-handshake.
   expect(await readConnects()).toBeGreaterThan(before);
+});
+
+test("the content script refuses a fill released for another origin", async () => {
+  const fixture = await openFixture("login.html");
+  // The tab navigated to another origin between the release and the fill: the
+  // message still names the page the credential was released for.
+  const send = (url: string) =>
+    harness.worker.evaluate(async (target) => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = tab?.id;
+      if (tabId === undefined) return null;
+      // A no-op where the declarative copy already runs (one copy per frame).
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      return chrome.tabs.sendMessage(tabId, {
+        type: "subclave:fill",
+        username: "mallory",
+        password: "stolen",
+        url: target,
+        anchored: false,
+      });
+    }, url);
+
+  expect(await send(`http://localhost:${FIXTURE_PORT}/login.html`)).toEqual({
+    username: false,
+    password: false,
+  });
+  await expect(fixture.locator("#username")).toHaveValue("");
+  await expect(fixture.locator("#password")).toHaveValue("");
+
+  expect(await send(`${FIXTURE_ORIGIN}/login.html`)).toEqual({ username: true, password: true });
+  await expect(fixture.locator("#username")).toHaveValue("mallory");
 });

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: overlay that takes the click</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      // A transparent full-viewport popover in a closed root, shown after the
+      // picker so it sits above it. It lets the click through, then turns
+      // pointer-events back on from a capture listener that runs before the
+      // extension's own click handler.
+      window.__overlay = () => {
+        const holder = document.createElement("div");
+        const root = holder.attachShadow({ mode: "closed" });
+        const overlay = document.createElement("div");
+        overlay.setAttribute("popover", "manual");
+        overlay.style.cssText =
+          "position:fixed; inset:0; margin:0; border:0; width:100vw; height:100vh; background:transparent; pointer-events:none";
+        root.append(overlay);
+        document.body.append(holder);
+        overlay.showPopover();
+        window.addEventListener(
+          "click",
+          () => {
+            overlay.style.pointerEvents = "auto";
+          },
+          true,
+        );
+      };
+    </script>
+  </body>
+</html>

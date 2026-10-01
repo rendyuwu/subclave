@@ -73,8 +73,9 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, Failure> {
         .ok_or_else(|| Failure::code(NmError::BadRequest))
 }
 
-/// `get-logins { url, scope }`: the entries whose URL rules match the page.
-/// Never returns a password.
+/// `get-logins { url, scope }`: the entries whose URL rules match the page,
+/// plus `domain`, the page's registrable domain (or its host) for the picker
+/// footer. Never returns a password.
 pub(crate) fn get_logins(vault: &VaultState, params: &Value) -> Result<Value, Failure> {
     let raw_url = required_str(params, "url")?;
     let scope = required_str(params, "scope")?;
@@ -131,7 +132,11 @@ pub(crate) fn get_logins(vault: &VaultState, params: &Value) -> Result<Value, Fa
     } else {
         all.into_iter().map(|(row, _)| row).collect()
     };
-    Ok(json!({ "entries": entries, "otherMatches": other_matches }))
+    let domain = page
+        .host_str()
+        .map(|h| matching::registrable(h).unwrap_or_else(|| h.to_ascii_lowercase()))
+        .unwrap_or_default();
+    Ok(json!({ "entries": entries, "otherMatches": other_matches, "domain": domain }))
 }
 
 /// `get-credential { id, url, via }`: release one credential, stamp its use,
@@ -173,7 +178,9 @@ pub(crate) fn get_credential(
             .find(|e| e.id == id)
             .ok_or_else(|| Failure::code(NmError::NoMatch))?;
 
-        let mut matched: Option<(MatchMode, String)> = None;
+        // First matching URL's mode decides the origin append; the inline
+        // exact-host rule accepts any same-host URL, as `get_logins` does.
+        let mut mode: Option<MatchMode> = None;
         let mut host_match = false;
         for url in &entry.urls {
             let Some(entry_url) = matching::parse_entry(&url.url) else {
@@ -183,17 +190,13 @@ pub(crate) fn get_credential(
                 if matching::same_host(&page, &entry_url) {
                     host_match = true;
                 }
-                if matched.is_none() {
-                    matched = Some((url.match_mode.clone(), url.url.clone()));
+                if mode.is_none() {
+                    mode = Some(url.match_mode.clone());
                 }
             }
         }
-        let (mode, matched_raw) = matched.ok_or_else(|| Failure::code(NmError::NoMatch))?;
-        let Some(matched_url) = matching::parse_entry(&matched_raw) else {
-            return Err(Failure::code(NmError::NoMatch));
-        };
-
-        if inline && !matching::same_host(&page, &matched_url) {
+        let mode = mode.ok_or_else(|| Failure::code(NmError::NoMatch))?;
+        if inline && !host_match {
             return Err(Failure::code(NmError::NoMatch));
         }
 
@@ -762,9 +765,18 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![host_entry.id.as_str()]);
         assert_eq!(scoped["otherMatches"], 1);
+        assert_eq!(scoped["domain"], "github.com");
         // A password never crosses the wire.
         assert!(scoped["entries"][0].get("password").is_none());
         let _ = host;
+
+        // An IP page reports its own host, never a psl guess like "0.1".
+        let ip = actions_get_logins(
+            &vault,
+            &json!({ "url": "http://127.0.0.1:8080/", "scope": "host" }),
+        )
+        .unwrap();
+        assert_eq!(ip["domain"], "127.0.0.1");
 
         // Unknown scope is bad-request.
         assert!(actions_get_logins(
@@ -837,6 +849,18 @@ mod tests {
             .dirty
             .contains(&format!("entry:{}", entry.id)));
         drop(guard);
+
+        // The entry's first URL is still the Domain one, but the appended
+        // same-host URL now satisfies the inline rule.
+        let value = get_credential(
+            &vault,
+            host.as_ref(),
+            &dir.0,
+            &json!({ "id": entry.id, "url": "https://accounts.github.com/login", "via": "inline" }),
+        )
+        .unwrap();
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "pw-1");
 
         assert!(host
             .events()

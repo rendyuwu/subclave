@@ -80,6 +80,16 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   `src-tauri/subclave-proxy/src/frame.rs` and
   `src-tauri/src/modules/browser/auth.rs` literal for literal; the browser
   verify script pins the agreement.
+- The service worker routes by sender (`senderKind` in `src/background.ts`):
+  popup requests only from extension pages, inline requests only from the
+  top-frame content script, answered for the sender's own tab URL at
+  `scope: "host"` and `via: "inline"`.
+- The inline UI (`src/content/inline.ts`) lives in one closed shadow root
+  under `<subclave-inline>`, built with `createElement`/`textContent` (no
+  `innerHTML`). Every fill, generate or update pick passes the six guards in
+  `src/content/guard.ts` first; `test/guard.spec.ts` has one attack fixture
+  per guard. `scripts/build.mjs` fails a build whose `content.js` is over
+  30 KB.
 
 ## Workflow
 

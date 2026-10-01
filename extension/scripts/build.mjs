@@ -1,4 +1,12 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
@@ -50,6 +58,16 @@ for (const entry of ["popup", "background", "content"]) {
     delete process.env.EXT_ENTRY_FILE;
   }
   await build({ configFile: viteConfig, logLevel: "warn" });
+}
+
+// The content script loads on every page, so its size is a hard budget.
+const CONTENT_BUDGET = 30 * 1024;
+const contentSize = statSync(path.join(outDir, "content.js")).size;
+if (contentSize > CONTENT_BUDGET) {
+  console.error(
+    `build: content.js is ${contentSize} bytes, over the ${CONTENT_BUDGET}-byte budget`,
+  );
+  process.exit(1);
 }
 
 const manifest = JSON.parse(readFileSync(path.join(extDir, `manifest.${target}.json`), "utf8"));
