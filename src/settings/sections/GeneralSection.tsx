@@ -1,7 +1,8 @@
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { usePreferencesStore } from "@/modules/settings/preferences";
-import { setRestoreWindowState, type ThemePref } from "@/modules/settings/store";
+import { setRestoreWindowState } from "@/modules/settings/mutations";
+import type { ThemePref } from "@/modules/settings/schema";
 import { useTheme } from "@/modules/theme";
 import { Label } from "../components/Label";
 import { SectionHeader } from "../components/SectionHeader";

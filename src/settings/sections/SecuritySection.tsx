@@ -3,14 +3,13 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import {
-  AUTO_LOCK_MINUTES_MAX,
-  CLIPBOARD_CLEAR_SECONDS_MAX,
   setAutoLockMinutes,
   setAutostart,
   setClipboardClearSeconds,
   setCloseToTray,
   setLockOnMinimize,
-} from "@/modules/settings/store";
+} from "@/modules/settings/mutations";
+import { AUTO_LOCK_MINUTES_MAX, CLIPBOARD_CLEAR_SECONDS_MAX } from "@/modules/settings/schema";
 import { vaultStatus, vaultTouch } from "@/modules/vault/ipc";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { useEffect, useState } from "react";

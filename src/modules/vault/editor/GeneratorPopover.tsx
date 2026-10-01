@@ -6,7 +6,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Slider } from "@/components/ui/slider";
 import { genPassword } from "@/modules/vault/ipc";
-import { setGenerator } from "@/modules/settings/store";
+import { setGenerator } from "@/modules/settings/mutations";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { GeneratorOptions } from "@/modules/vault/types";
 import { ToggleButton } from "./FormControls";

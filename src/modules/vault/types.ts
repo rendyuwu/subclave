@@ -1,5 +1,5 @@
 // Canonical TypeScript mirrors of the vault projections and drafts in
-// `src-tauri/src/modules/vault/model.rs`. Field for field, camelCase, enums
+// `src-tauri/src/modules/vault/model/mod.rs`. Field for field, camelCase, enums
 // lowercase; a rename on one side is a compile error on the other, which is
 // the point.
 

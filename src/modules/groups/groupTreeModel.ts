@@ -1,6 +1,6 @@
-// The read-time shape of the group list as a forest, and the one place that
-// walk lives: `GroupTree.tsx` renders it, and the move-target menu asks for a
-// group's descendants rather than walking `parentId` on its own.
+// The read-time shape of the group list as a forest, and the walks over it:
+// the rows the tree renders, a group's descendants, and where a group is
+// allowed to move to, rather than every caller walking `parentId` on its own.
 //
 // A synced `parentId` can name a group this device deleted, name its own
 // group, or form a cycle. `effectiveParentId` is the read-time tolerance for
@@ -11,6 +11,7 @@
 // pointed at the root, so the forest starts at the root's children and the
 // Trash row is appended by the tree separately.
 
+import { ALL_SCOPE, FAVORITES_SCOPE, TRASH_SCOPE } from "@/modules/vault/list/derive";
 import type { Group } from "@/modules/vault/types";
 
 export const ROOT_ID = "root";
@@ -93,6 +94,109 @@ export function descendantIds(groupId: string, groups: Group[]): Set<string> {
   const ids = new Set<string>();
   if (node) collectIds(node, ids);
   return ids;
+}
+
+/** One rendered row: the two pseudo rows, a group, or the Trash row. */
+export type TreeRow = {
+  id: string;
+  label: string;
+  count: number;
+  level: number;
+  parentId: string | null;
+  hasChildren: boolean;
+  expanded: boolean;
+  group: Group | null;
+};
+
+/**
+ * The rows the tree shows, top to bottom: All, Favourites, every group in the
+ * resolved forest with the expanded ones descending a level, then Trash.
+ */
+export function treeRows(input: {
+  groups: Group[];
+  counts: Map<string, number>;
+  expanded: string[];
+}): TreeRow[] {
+  const { groups, counts, expanded } = input;
+  const tree = buildGroupTree(groups);
+  const trashGroup = groups.find((group) => group.id === TRASH_SCOPE) ?? null;
+  const out: TreeRow[] = [
+    {
+      id: ALL_SCOPE,
+      label: "All",
+      count: counts.get(ALL_SCOPE) ?? 0,
+      level: 0,
+      parentId: null,
+      hasChildren: false,
+      expanded: false,
+      group: null,
+    },
+    {
+      id: FAVORITES_SCOPE,
+      label: "Favourites",
+      count: counts.get(FAVORITES_SCOPE) ?? 0,
+      level: 0,
+      parentId: null,
+      hasChildren: false,
+      expanded: false,
+      group: null,
+    },
+  ];
+  function walk(nodes: GroupNode[], level: number, parentId: string | null): void {
+    for (const node of nodes) {
+      const hasChildren = node.children.length > 0;
+      const isExpanded = expanded.includes(node.group.id);
+      out.push({
+        id: node.group.id,
+        label: node.group.name,
+        count: counts.get(node.group.id) ?? 0,
+        level,
+        parentId,
+        hasChildren,
+        expanded: isExpanded,
+        group: node.group,
+      });
+      if (hasChildren && isExpanded) walk(node.children, level + 1, node.group.id);
+    }
+  }
+  walk(tree, 0, null);
+  out.push({
+    id: TRASH_SCOPE,
+    label: "Trash",
+    count: counts.get(TRASH_SCOPE) ?? 0,
+    level: 0,
+    parentId: null,
+    hasChildren: false,
+    expanded: false,
+    group: trashGroup,
+  });
+  return out;
+}
+
+/** Where a group can move to: the root, plus every group that is not itself,
+ *  one of its own descendants, its current parent, or Trash. */
+export function moveTargets(
+  group: Group,
+  tree: GroupNode[],
+  groups: Group[],
+): { id: string; label: string }[] {
+  const excluded = descendantIds(group.id, groups);
+  const currentParent = group.parentId ?? ROOT_ID;
+  const out: { id: string; label: string }[] = [];
+  if (currentParent !== ROOT_ID) out.push({ id: ROOT_ID, label: "Root" });
+  function walk(nodes: GroupNode[], depth: number): void {
+    for (const node of nodes) {
+      // The current parent is skipped as a target but still descended into:
+      // its other children are the moved group's siblings, and they are legal
+      // targets, so pruning the whole subtree hides them.
+      if (!excluded.has(node.group.id) && node.group.id !== currentParent) {
+        out.push({ id: node.group.id, label: `${"\u00a0\u00a0".repeat(depth)}${node.group.name}` });
+      }
+      walk(node.children, depth + 1);
+    }
+  }
+  walk(tree, 0);
+  return out;
 }
 
 /**

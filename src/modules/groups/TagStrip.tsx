@@ -4,7 +4,7 @@
 // filter outlives its last tagged entry (trashing that entry drops its chip but
 // keeps the list filtered), so the Clear action has to stay reachable.
 
-import { Chip } from "./GroupTree";
+import { Chip } from "./Chip";
 import { tagCounts } from "@/modules/vault/list/derive";
 import { useVaultStore } from "@/modules/vault/store";
 import { X } from "lucide-react";

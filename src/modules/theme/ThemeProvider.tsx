@@ -1,12 +1,11 @@
 import { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { loadPreferences, onPreferencesChange } from "@/modules/settings/load";
 import {
-  loadPreferences,
-  onPreferencesChange,
   setAppOpacity,
   setCustomThemeEnabled,
   setTheme as persistTheme,
-  type ThemePref,
-} from "@/modules/settings/store";
+} from "@/modules/settings/mutations";
+import type { ThemePref } from "@/modules/settings/schema";
 import {
   applyBrandColor,
   applyBrandColorFastPath,
@@ -17,13 +16,9 @@ import {
   applyAppOpacityPreviewCss,
   onAppOpacityPreview,
 } from "@/modules/settings/appOpacity";
-import {
-  applyBackground,
-  applyCustomTheme,
-  normalizeCustomTheme,
-  onWallpaperPreview,
-  type CustomTheme,
-} from "@/modules/settings/customTheme";
+import { applyBackground, applyCustomTheme } from "@/modules/settings/theme/apply";
+import { normalizeCustomTheme, type CustomTheme } from "@/modules/settings/theme/model";
+import { onWallpaperPreview } from "@/modules/settings/theme/preview";
 import { DEFAULT_CUSTOM_THEME } from "@/modules/settings/themePresets";
 
 export type Theme = ThemePref;

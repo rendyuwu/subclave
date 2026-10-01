@@ -1,25 +1,19 @@
 import { useState, type FormEvent } from "react";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Spinner } from "@/components/ui/spinner";
-import { StrengthMeter } from "./editor/StrengthMeter";
-import { describeVaultError } from "./errors";
-import { PasswordField } from "./PasswordField";
-import { useVaultStore } from "./store";
 
-const MIN_PASSWORD_LENGTH = 8;
+import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { describeVaultError } from "./errors";
+import { MasterPasswordFields, useMasterPassword } from "./MasterPasswordFields";
+import { useVaultStore } from "./store";
 
 /** First-run create: master password, confirmation, strength and the no-recovery acknowledgement. */
 export function CreateVaultScreen() {
   const create = useVaultStore((s) => s.create);
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [acknowledged, setAcknowledged] = useState(false);
+  const masterPassword = useMasterPassword();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const longEnough = [...password].length >= MIN_PASSWORD_LENGTH;
-  const canSubmit = longEnough && password === confirm && acknowledged && !busy;
+  const canSubmit = masterPassword.ready && !busy;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -29,7 +23,7 @@ export function CreateVaultScreen() {
     try {
       // `vault_create` leaves the vault unlocked; the store refreshes straight
       // into the workspace, no second unlock.
-      await create(password);
+      await create(masterPassword.password);
     } catch (err) {
       setError(describeVaultError(String(err)));
     } finally {
@@ -47,45 +41,7 @@ export function CreateVaultScreen() {
           </p>
         </div>
 
-        <PasswordField
-          id="create-password"
-          label="Master password"
-          value={password}
-          onChange={setPassword}
-          autoComplete="new-password"
-          autoFocus
-        />
-        <div className="flex flex-col gap-1.5">
-          <PasswordField
-            id="create-confirm"
-            label="Confirm master password"
-            value={confirm}
-            onChange={setConfirm}
-            autoComplete="new-password"
-          />
-          <StrengthMeter value={password} />
-        </div>
-
-        <div className="flex items-start gap-2">
-          <Checkbox
-            id="create-acknowledge"
-            checked={acknowledged}
-            onCheckedChange={(checked) => setAcknowledged(checked === true)}
-            className="mt-0.5"
-          />
-          <label
-            htmlFor="create-acknowledge"
-            className="text-muted-foreground cursor-pointer text-xs leading-relaxed"
-          >
-            I understand there is no recovery if I forget this password.
-          </label>
-        </div>
-
-        {error ? (
-          <p role="alert" className="text-destructive text-xs">
-            {error}
-          </p>
-        ) : null}
+        <MasterPasswordFields draft={masterPassword} idPrefix="create" error={error} autoFocus />
 
         <Button type="submit" disabled={!canSubmit}>
           {busy ? <Spinner /> : null}

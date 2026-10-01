@@ -4,7 +4,7 @@
  * `--sidebar-accent` from the brand so soft-fill surfaces stay in family.
  */
 
-import { BRAND_COLOR_DEFAULT, normalizeBrandColor } from "./store";
+import { BRAND_COLOR_DEFAULT, normalizeBrandColor } from "./schema";
 
 const FAST_PATH_KEY = "subclave-brand-color-shadow";
 

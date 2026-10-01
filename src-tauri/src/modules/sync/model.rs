@@ -730,7 +730,7 @@ mod tests {
         // mistyped name would drop out of the skip-list below, and the test
         // would confirm that the field it no longer strips is still present.
         // This literal is what a rename in
-        // `src-tauri/src/modules/vault/model.rs` has to break.
+        // `src-tauri/src/modules/vault/model/records.rs` has to break.
         let expected_gone = ["lastUsedAt"];
         assert_eq!(
             expected_gone.len(),

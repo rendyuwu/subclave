@@ -7,7 +7,7 @@ import ReactDOM from "react-dom/client";
 import { ThemeProvider } from "@/modules/theme";
 import { USE_CUSTOM_WINDOW_CONTROLS } from "@/lib/platform";
 import { applyBrandColorFastPath } from "@/modules/settings/brandColor";
-import { applyCustomThemeFastPath } from "@/modules/settings/customTheme";
+import { applyCustomThemeFastPath } from "@/modules/settings/theme/apply";
 import { SettingsApp } from "./SettingsApp";
 
 if (USE_CUSTOM_WINDOW_CONTROLS) {

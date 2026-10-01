@@ -1,4 +1,4 @@
-import type { CustomTheme, ThemeColors } from "../customTheme";
+import type { CustomTheme, ThemeColors } from "../theme/model";
 import { DARK_COLORS, EMPTY_BG, LIGHT_COLORS } from "./base";
 
 // Catppuccin family (Mocha + Latte).

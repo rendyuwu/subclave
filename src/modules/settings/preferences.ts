@@ -1,11 +1,7 @@
 import { create } from "zustand";
-import { normalizeCustomTheme } from "./customTheme";
-import {
-  DEFAULT_PREFERENCES,
-  loadPreferences,
-  onPreferencesChange,
-  type Preferences,
-} from "./store";
+import { normalizeCustomTheme } from "./theme/model";
+import { loadPreferences, onPreferencesChange } from "./load";
+import { DEFAULT_PREFERENCES, type Preferences } from "./schema";
 
 type State = Preferences & {
   hydrated: boolean;

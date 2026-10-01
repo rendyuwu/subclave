@@ -9,7 +9,7 @@
  * No Tauri imports (the ThemeColors import is type-only) so theme-verify can
  * run the real functions under node.
  */
-import type { ThemeColors } from "./customTheme";
+import type { ThemeColors } from "./theme/model";
 
 /** A button can land on any of these, so the floor applies to the worst one. */
 const SURFACES = ["background", "card", "popover"] as const;

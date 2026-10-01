@@ -46,11 +46,12 @@ function check(name: string, ok: boolean, detail?: unknown): void {
 }
 
 const css = read("src/styles/globals.css");
-const customThemeSrc = read("src/modules/settings/customTheme.ts");
+const customThemeSrc =
+  read("src/modules/settings/theme/apply.ts") + read("src/modules/settings/theme/model.ts");
 
-// COLOR_VAR_MAP is source-scanned rather than imported: customTheme.ts touches
-// `document` at module scope through its Tauri imports, and this only needs the
-// var names.
+// COLOR_VAR_MAP is source-scanned rather than imported: apply.ts touches
+// `document` and imports Tauri at module scope, and this only needs the var
+// names.
 const mapBody = /const COLOR_VAR_MAP[\s\S]*?\n};/.exec(customThemeSrc)?.[0] ?? "";
 const appVars = new Set([...mapBody.matchAll(/"(--[a-z0-9-]+)"/g)].map((m) => m[1]));
 check("COLOR_VAR_MAP parsed", appVars.size > 30, appVars.size);
@@ -95,8 +96,8 @@ function collectSources(dir: string): { path: string; body: string }[] {
     const p = join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...collectSources(p));
-    } else if (/\.(css|ts|tsx)$/.test(entry.name) && !p.endsWith("customTheme.ts")) {
-      // customTheme.ts is excluded: it is the WRITER, so counting it would make
+    } else if (/\.(css|ts|tsx)$/.test(entry.name) && !p.endsWith(join("theme", "apply.ts"))) {
+      // apply.ts is excluded: it is the WRITER, so counting it would make
       // every token look read.
       out.push({ path: p, body: readFileSync(p, "utf8") });
     }

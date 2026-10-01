@@ -212,7 +212,7 @@ pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8
 /// Everything a signature needs that is not the request itself.
 ///
 /// A struct rather than five more parameters on [`authorization_header`],
-/// because the four builders in `src-tauri/src/modules/sync/providers/s3.rs`
+/// because the four builders in `src-tauri/src/modules/sync/providers/s3/build.rs`
 /// each pass the same five values and a positional mix-up between `region` and
 /// `service` would compile.
 ///
@@ -274,7 +274,8 @@ pub fn authorization_header(
 // The name is not `parse_http_date` deliberately: an HTTP date is the RFC 7231
 // form that the `Last-Modified` HEADER carries, which is a different spelling
 // of a different field. That third format has a home now:
-// `parse_http_date` in `src-tauri/src/modules/sync/providers/webdav.rs` reads
+// `parse_http_date` in
+// `src-tauri/src/modules/sync/providers/webdav/dav_time.rs` reads
 // it, because a WebDAV listing spells its modification time that way. It
 // shares [`days_from_civil`] rather than carrying a second copy of the era
 // arithmetic, which is why that one is `pub(super)` where its inverse is not.

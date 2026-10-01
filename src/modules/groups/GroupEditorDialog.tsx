@@ -22,11 +22,15 @@ import { useVaultStore } from "@/modules/vault/store";
 import type { EntryColor, Group } from "@/modules/vault/types";
 import { useEffect, useState } from "react";
 
+/** What the tree asks the editor to open: the group to edit (null to create)
+ *  and the parent to nest under. */
+export type GroupEditorRequest = { group: Group | null; parentId: string | null };
+
 export function GroupEditorDialog({
   request,
   onClose,
 }: {
-  request: { group: Group | null; parentId: string | null } | null;
+  request: GroupEditorRequest | null;
   onClose: () => void;
 }) {
   const [name, setName] = useState("");

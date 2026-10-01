@@ -1,4 +1,4 @@
-import type { ThemeColors } from "../customTheme";
+import type { ThemeColors } from "../theme/model";
 
 export const EMPTY_BG = {
   enabled: false,

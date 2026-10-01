@@ -269,7 +269,7 @@ console.log("\n[wiring] source text: the hook exists, is mounted, and uses the r
     const imported = namedImportsFrom(
       "useStoreRecoveryNotices.ts",
       hook,
-      "@/modules/settings/store",
+      "@/modules/settings/load",
     );
     // The IMPORT, not a call: the hook hands each store's loader to
     // `announceRecovery` as a value rather than calling it here, so a

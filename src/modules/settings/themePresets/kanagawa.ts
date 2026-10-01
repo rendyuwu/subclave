@@ -1,4 +1,4 @@
-import type { CustomTheme, ThemeColors } from "../customTheme";
+import type { CustomTheme, ThemeColors } from "../theme/model";
 import { DARK_COLORS, EMPTY_BG, LIGHT_COLORS } from "./base";
 
 // Kanagawa family (Wave dark + Lotus light), after Katsushika Hokusai's

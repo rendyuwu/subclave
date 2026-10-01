@@ -1,7 +1,7 @@
 // The vocabulary the sync module speaks, and the mirrors of the Rust command
 // payloads.
 //
-// KEPT IN LOCKSTEP BY HAND with `src-tauri/src/modules/sync/engine.rs`, the same
+// KEPT IN LOCKSTEP BY HAND with `src-tauri/src/modules/sync/engine/types.rs`, the same
 // way `src/lib/ipc.ts` mirrors the filesystem payloads: `tsc` cannot see across
 // the IPC boundary, so a field renamed on one side is `undefined` on the other
 // with no error anywhere. Each type below names the Rust type it mirrors.

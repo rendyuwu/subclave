@@ -1,14 +1,9 @@
 import { emit, listen } from "@tauri-apps/api/event";
 
 import { createFileKeyValueStore } from "./fileKeyValueStore";
-import {
-  recoverStoreFile,
-  snapshotStoreFile,
-  tauriStoreFileIo,
-  type StoreFileIo,
-  type StoreFileState,
-  type StoreRecovery,
-} from "./storeRecovery";
+import { tauriStoreFileIo } from "./storeFileIo";
+import { type StoreFileIo, type StoreFileState } from "./storeFileState";
+import { recoverStoreFile, snapshotStoreFile, type StoreRecovery } from "./storeRecovery";
 
 // A JSON store file with crash recovery in front of it, parameterised.
 //

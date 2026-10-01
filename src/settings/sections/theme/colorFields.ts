@@ -1,4 +1,4 @@
-import { type ThemeColors } from "@/modules/settings/customTheme";
+import { type ThemeColors } from "@/modules/settings/theme/model";
 
 /**
  * Every editable APP-CHROME theme color, grouped for the tabbed color editor in

@@ -465,8 +465,10 @@ check('crypto.rs pins the keyfile format "subclave-sync"', crypto.includes('"sub
 const provider = readFile(`${SYNC_RUST}/provider.rs`);
 check("provider.rs declares put_if_absent on the trait", /fn\s+put_if_absent\b/.test(provider));
 
-const engine = readFile(`${SYNC_RUST}/engine.rs`);
-check("engine.rs defines no sync_purge_secrets", !engine.includes("sync_purge_secrets"));
+const engine = filesUnder(`${SYNC_RUST}/engine`)
+  .map((file) => readFile(file))
+  .join("\n");
+check("the sync engine defines no sync_purge_secrets", !engine.includes("sync_purge_secrets"));
 
 const syncTypes = readFile("src/modules/sync/types.ts");
 check(

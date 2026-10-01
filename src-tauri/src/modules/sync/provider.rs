@@ -7,8 +7,8 @@
 //! `src-tauri/src/modules/sync/crypto.rs`.
 //!
 //! NOTHING HERE OPENS A SOCKET. The trait is a shape; the implementations
-//! behind it live in `src-tauri/src/modules/sync/providers/s3.rs` and
-//! `src-tauri/src/modules/sync/providers/webdav.rs`.
+//! behind it live in `src-tauri/src/modules/sync/providers/s3/mod.rs` and
+//! `src-tauri/src/modules/sync/providers/webdav/mod.rs`.
 //!
 //! WHY THE FUTURES ARE BOXED BY HAND. `Arc<dyn SyncProvider>` needs the trait
 //! to be dyn-compatible, and a native `async fn` in a trait is not. The usual

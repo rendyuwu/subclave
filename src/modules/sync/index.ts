@@ -13,7 +13,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 import { createFileKeyValueStore } from "@/lib/fileKeyValueStore";
 import { IPC_EVENTS } from "@/lib/ipc";
-import { tauriStoreFileIo } from "@/lib/storeRecovery";
+import { tauriStoreFileIo } from "@/lib/storeFileIo";
 import { useVaultStore } from "@/modules/vault/store";
 
 import { syncCommands } from "./ipc";

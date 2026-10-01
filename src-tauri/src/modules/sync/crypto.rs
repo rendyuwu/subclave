@@ -29,13 +29,13 @@
 //! same name for the same record.
 //!
 //! NO PATHS HERE. The layout `<prefix>/v1/keyfile` and
-//! `<prefix>/v1/obj/<name>` belongs to `src-tauri/src/modules/sync/engine.rs`,
-//! the sync layer above the provider, which composes the key a provider
-//! receives; this module produces the `<name>` half and the keyfile struct and
-//! builds no path. A provider in `src-tauri/src/modules/sync/provider.rs` sees
-//! keys and bytes and has no idea what a record is, so the `v1` segment (the
-//! wire format's version expressed in the object namespace) cannot be its
-//! business.
+//! `<prefix>/v1/obj/<name>` belongs to
+//! `src-tauri/src/modules/sync/engine/layout.rs`, the sync layer above the
+//! provider, which composes the key a provider receives; this module produces
+//! the `<name>` half and the keyfile struct and builds no path. A provider in
+//! `src-tauri/src/modules/sync/provider.rs` sees keys and bytes and has no idea
+//! what a record is, so the `v1` segment (the wire format's version expressed in
+//! the object namespace) cannot be its business.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ring::{

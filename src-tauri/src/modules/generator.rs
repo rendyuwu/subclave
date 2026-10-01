@@ -5,7 +5,7 @@
 //! drive it with a seeded deterministic generator and no trait is needed.
 //! Production passes the OS CSPRNG.
 
-use crate::modules::vault::model::GeneratorOptions;
+use serde::{Deserialize, Serialize};
 
 /// Characters removed by `exclude_ambiguous`: I, l, 1, O, 0. Symbols are
 /// never filtered.
@@ -13,6 +13,32 @@ const AMBIGUOUS: [char; 5] = ['I', 'l', '1', 'O', '0'];
 
 /// Not a protocol constant, just a product choice; this is the one const to change.
 pub const SYMBOLS: &str = "!@#$%^&*()-_=+[]{};:,.?/";
+
+/// The webview's password-generator settings, deserialized camelCase from the
+/// `gen_password` command argument.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratorOptions {
+    pub length: u32,
+    pub lower: bool,
+    pub upper: bool,
+    pub digits: bool,
+    pub symbols: bool,
+    pub exclude_ambiguous: bool,
+}
+
+impl Default for GeneratorOptions {
+    fn default() -> Self {
+        Self {
+            length: 20,
+            lower: true,
+            upper: true,
+            digits: true,
+            symbols: true,
+            exclude_ambiguous: false,
+        }
+    }
+}
 
 pub fn charset(options: &GeneratorOptions) -> Result<Vec<char>, String> {
     let mut set: Vec<char> = Vec::new();
