@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { DEFAULT_SYNC_CONFIG, type SyncConfig } from "@/modules/sync/types";
+import { SyncBehaviour } from "@/settings/components/SyncBehaviour";
 import { MasterPasswordFields, useMasterPassword } from "./MasterPasswordFields";
 import { PasswordField } from "./PasswordField";
 import { JoinCredentialFields } from "./join/JoinCredentialFields";
@@ -65,6 +66,8 @@ export function JoinSyncScreen({ onCreateInstead }: { onCreateInstead: () => voi
             before they leave this device, so the storage provider never sees them.
           </span>
         </div>
+
+        <SyncBehaviour config={config} onChange={setConfig} />
 
         <MasterPasswordFields
           draft={masterPassword}
