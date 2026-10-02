@@ -61,7 +61,7 @@ export type LoginSummary = {
   lastUsedAt: number | null;
 };
 
-export type GetLoginsResult = { entries: LoginSummary[]; otherMatches: number };
+export type GetLoginsResult = { entries: LoginSummary[]; otherMatches: number; domain: string };
 export type CredentialResult = { username: string; password: string };
 export type SaveLoginResult = { id: string; created: boolean };
 export type GenerateResult = { password: string };

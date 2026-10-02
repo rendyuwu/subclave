@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Nested login fields</title>
+  </head>
+  <body>
+    <div id="shadow-host"></div>
+    <iframe
+      id="frame"
+      style="width: 480px; height: 160px"
+      srcdoc='<form><input id="f-username" type="text" autocomplete="username" /> <input id="f-password" type="password" autocomplete="current-password" /></form>'
+    ></iframe>
+    <script>
+      // The shadow form comes first in document order, so a fill that loses its
+      // anchor lands here instead of in the iframe.
+      const root = document.getElementById("shadow-host").attachShadow({ mode: "open" });
+      const form = document.createElement("form");
+      for (const [id, type, autocomplete] of [
+        ["s-username", "text", "username"],
+        ["s-password", "password", "current-password"],
+      ]) {
+        const input = document.createElement("input");
+        input.id = id;
+        input.type = type;
+        input.autocomplete = autocomplete;
+        form.append(input);
+      }
+      root.append(form);
+    </script>
+  </body>
+</html>

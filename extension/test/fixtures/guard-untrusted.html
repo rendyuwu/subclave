@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: untrusted events</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      // Page script trying to open the picker without a user gesture.
+      window.__syntheticOpen = () => {
+        const field = document.getElementById("username");
+        field.dispatchEvent(
+          new PointerEvent("pointerdown", { button: 0, bubbles: true, composed: true }),
+        );
+        field.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, composed: true }),
+        );
+      };
+    </script>
+  </body>
+</html>

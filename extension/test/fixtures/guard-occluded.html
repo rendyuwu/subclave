@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: occluded picker</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      // An opaque full-viewport popover in a closed root, shown after the picker
+      // so it covers it. pointer-events stays none, so the click still reaches
+      // the hidden picker; only the visibility observer can tell.
+      window.__overlay = () => {
+        const holder = document.createElement("div");
+        const root = holder.attachShadow({ mode: "closed" });
+        const overlay = document.createElement("div");
+        overlay.setAttribute("popover", "manual");
+        overlay.style.cssText =
+          "position:fixed; inset:0; margin:0; border:0; width:100vw; height:100vh; background:#fff; pointer-events:none";
+        overlay.textContent = "Click to continue";
+        root.append(overlay);
+        document.body.append(holder);
+        overlay.showPopover();
+      };
+    </script>
+  </body>
+</html>

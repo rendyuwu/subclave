@@ -53,6 +53,9 @@ fn port_ok(page: &Url, entry: &Url) -> bool {
 /// itself a public suffix (`github.io`), and the caller then compares hosts
 /// exactly.
 pub fn registrable(host: &str) -> Option<String> {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return None;
+    }
     let lower = host.to_ascii_lowercase();
     psl::domain_str(&lower).map(|domain| domain.to_string())
 }
@@ -185,6 +188,12 @@ mod tests {
         assert!(!matches(
             &page("http://localhost:3000/a"),
             &entry("http://localhost:4000/a"),
+            MatchMode::Domain
+        ));
+        assert_eq!(registrable("127.0.0.1"), None);
+        assert!(!matches(
+            &page("https://192.168.0.1"),
+            &entry("https://10.0.0.1"),
             MatchMode::Domain
         ));
     }

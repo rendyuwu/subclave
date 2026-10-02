@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Navigates at the pick</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+    </form>
+    <script>
+      // Sends the tab to another same-origin login page the moment the user
+      // clicks, before the credential comes back.
+      window.__navigateOnClick = () => {
+        window.addEventListener(
+          "click",
+          () => {
+            location.href = "/login.html?navigated";
+          },
+          { capture: true, once: true },
+        );
+      };
+    </script>
+  </body>
+</html>

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Two-step login</title>
+  </head>
+  <body>
+    <form>
+      <div id="step1">
+        <input id="username" type="email" autocomplete="username" />
+        <button id="next" type="button">Next</button>
+      </div>
+      <!-- Step 2 shows a line above the password, as real two-step logins do, so
+           the password never lands where the step 1 username was: the stale
+           username icon cannot pass for the password's own. -->
+      <p id="step2-caption" hidden>Enter your password</p>
+      <input id="password" type="password" autocomplete="current-password" hidden />
+    </form>
+    <script>
+      document.getElementById("next").addEventListener("click", () => {
+        document.getElementById("step1").hidden = true;
+        document.getElementById("step2-caption").hidden = false;
+        document.getElementById("password").hidden = false;
+      });
+    </script>
+  </body>
+</html>

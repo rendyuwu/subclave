@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: faded page, styled host</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      window.__fade = (selector) => {
+        document.querySelector(selector).style.opacity = "0.01";
+      };
+      // Page CSS on the extension's host, as a stylesheet rule (not an
+      // attribute, so the tamper observer has nothing to see): an effect on
+      // the host, and inherited properties that would blank the picker's text.
+      window.__styleHost = () => {
+        const style = document.createElement("style");
+        style.textContent = `subclave-inline {
+          filter: contrast(1) !important;
+          -webkit-text-fill-color: transparent !important;
+          text-indent: -9999px !important;
+          color: transparent !important;
+          zoom: 0.05 !important;
+        }`;
+        document.head.append(style);
+      };
+    </script>
+  </body>
+</html>

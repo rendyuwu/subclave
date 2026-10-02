@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: other top-layer elements</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <div
+      id="promo"
+      popover="manual"
+      style="position: fixed; inset: auto; right: 8px; bottom: 8px; margin: 0"
+    >
+      Limited offer
+    </div>
+    <dialog id="modal">
+      <form>
+        <input id="m-username" type="text" autocomplete="username" />
+        <input id="m-password" type="password" autocomplete="current-password" />
+      </form>
+    </dialog>
+    <script>
+      window.__promo = () => document.getElementById("promo").showPopover();
+      window.__modal = () => document.getElementById("modal").showModal();
+    </script>
+  </body>
+</html>
