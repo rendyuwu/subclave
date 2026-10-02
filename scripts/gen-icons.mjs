@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Rasterise the desktop icon set from `subclave-mark.svg`.
+ * Rasterise every icon from `subclave-mark.svg`: the desktop set, the
+ * webview favicon, the browser extension icons and the repo logo.
  *
  * Run after editing `subclave-mark.svg`:
  *
@@ -116,8 +117,14 @@ buildIcns(
   join(ICONS, "icon.icns"),
 );
 
-// --- repo-level logo -------------------------------------------------------
+// --- webview favicon and repo logo -----------------------------------------
+render(MARK, 750, join(ROOT, "public", "icon.png"));
 render(MARK, 750, join(ROOT, "subclave.png"));
+
+// --- browser extension (both manifests list these four) --------------------
+for (const size of [16, 32, 48, 128]) {
+  render(MARK, size, join(ROOT, "extension", "public", "icons", `${size}.png`));
+}
 
 rmSync(STAGE, { recursive: true, force: true });
 console.log("gen-icons: wrote the icon set from subclave-mark.svg");
