@@ -19,7 +19,10 @@ import { SettingRow } from "../components/SettingRow";
 import { ChangeMasterDialog } from "./ChangeMasterDialog";
 
 /** A whole-number preference row. The value commits on blur or Enter, clamped
- *  to `0..=max`, so a mid-typing value never lands in the store. */
+ *  to `0..=max`, so a mid-typing value never lands in the store. The engine's
+ *  spin buttons are hidden (the webview draws them, not the theme): typing
+ *  sets the value, and the field stays `type="number"` for `min`/`max` and the
+ *  spinbutton role. */
 function NumberRow({
   title,
   description,
@@ -58,7 +61,7 @@ function NumberRow({
           onKeyDown={(e) => {
             if (e.key === "Enter") e.currentTarget.blur();
           }}
-          className="h-8 w-20 text-right tabular-nums"
+          className="h-8 w-20 [appearance:textfield] text-right tabular-nums [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
         />
         <span className="text-muted-foreground text-[10.5px]">{suffix}</span>
       </div>
