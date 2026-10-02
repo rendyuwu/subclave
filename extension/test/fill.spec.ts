@@ -66,21 +66,24 @@ test("lists every match and fills username and password", async () => {
   expect(events["password:change"]).toBe(1);
 });
 
-test("never fills hidden or zero-size password inputs, on any path", async () => {
+test("never fills hidden, zero-size or decoy password inputs, on any path", async () => {
   const fixture = await openFixture("hidden-fields.html");
   const popup = await openPopupPage();
   await fixture.bringToFront();
 
   await popup.getByRole("option").first().click();
+  await expect(fixture.locator("#username")).toHaveValue(FAKE_ENTRIES[0].username);
   await expect(fixture.locator("#password")).toHaveValue(FAKE_PASSWORD);
   await expect(fixture.locator("#hidden-password")).toHaveValue("");
   await expect(fixture.locator("#zero-password")).toHaveValue("");
+  await expect(fixture.locator("#decoy-password")).toHaveValue("");
 
   await fixture.bringToFront();
   await popup.getByRole("button", { name: "New entry" }).click();
   await expect(fixture.locator("#password")).toHaveValue(FAKE_GENERATED);
   await expect(fixture.locator("#hidden-password")).toHaveValue("");
   await expect(fixture.locator("#zero-password")).toHaveValue("");
+  await expect(fixture.locator("#decoy-password")).toHaveValue("");
 
   await fixture.bringToFront();
   // Same missing-openPopup condition as the command test, so the command path
@@ -93,6 +96,7 @@ test("never fills hidden or zero-size password inputs, on any path", async () =>
   await expect(fixture.locator("#password")).toHaveValue(FAKE_PASSWORD);
   await expect(fixture.locator("#hidden-password")).toHaveValue("");
   await expect(fixture.locator("#zero-password")).toHaveValue("");
+  await expect(fixture.locator("#decoy-password")).toHaveValue("");
 
   const events = await fixture.evaluate(() => window.__events);
   expect(events["hidden:input"]).toBe(0);

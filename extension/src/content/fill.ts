@@ -50,15 +50,19 @@ export function inputType(input: HTMLInputElement): string {
   return (input.getAttribute("type") ?? "text").toLowerCase();
 }
 
-/** Laid out at a non-zero size, not hidden by CSS, and not parked at negative
- * page coordinates (an off-screen honeypot): a field the user can scroll to.
- * Detection uses this, so a login form below the fold still gets its icon. */
+/** Laid out at a non-zero size, not hidden by CSS, not parked at negative
+ * page coordinates (an off-screen honeypot), and not a decoy taken out of both
+ * the tab order and the accessibility tree: a field the user can scroll to and
+ * reach. Detection uses this, so a login form below the fold still gets its
+ * icon. */
 export function isRendered(input: HTMLInputElement): boolean {
+  if (input.tabIndex < 0 && input.closest('[aria-hidden="true"]')) return false;
   const rect = input.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return false;
   const style = getComputedStyle(input);
   if (style.visibility === "hidden" || style.display === "none") return false;
-  if (input.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) === false) return false;
+  if (input.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) === false)
+    return false;
   const view = input.ownerDocument.defaultView;
   return !view || (rect.right + view.scrollX > 0 && rect.bottom + view.scrollY > 0);
 }
@@ -116,7 +120,8 @@ export function usernamePartner(
 }
 
 function setValue(input: HTMLInputElement, value: string): void {
-  const proto = input.ownerDocument.defaultView?.HTMLInputElement.prototype ?? HTMLInputElement.prototype;
+  const proto =
+    input.ownerDocument.defaultView?.HTMLInputElement.prototype ?? HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
   if (setter) setter.call(input, value);
   else input.value = value;

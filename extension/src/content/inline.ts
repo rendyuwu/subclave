@@ -21,6 +21,10 @@ const PICKER_MIN_WIDTH = 280;
  * capped so a page that never stops mutating still gets a pass. */
 const DETECT_DEBOUNCE_MS = 250;
 const DETECT_MAX_WAIT_MS = 1000;
+/** How long after `load` a page with no login field keeps watching. Single-page
+ * apps render their form after `load`: Discord, X and Stripe took 1.5 to 2.2 s
+ * when this was measured. */
+const SETTLE_AFTER_LOAD_MS = 5000;
 const DETECT_ATTRIBUTES = ["type", "style", "class", "hidden", "open", "autocomplete"];
 const SVG_NS = "http://www.w3.org/2000/svg";
 const KEY_PATH =
@@ -631,28 +635,31 @@ function createInline(): Inline {
     }
   };
 
-  // A page with no login field by the time it has loaded stops watching for
-  // good; one that ever had a field keeps watching (two-step forms, show/hide
-  // toggles).
+  // A page with no login field a few seconds after it has loaded stops
+  // watching for good; one that ever had a field keeps watching (two-step
+  // forms, show/hide toggles).
   const settle = (): void => {
     if (!running || found) return;
     detector.disconnect();
     idle = true;
     generation += 1;
   };
+  const settleLater = (): void => {
+    setTimeout(settle, SETTLE_AFTER_LOAD_MS);
+  };
 
   watch(document);
   window.addEventListener("resize", queueReflow);
   pass();
   if (document.readyState === "complete") {
-    settle();
+    settleLater();
   } else {
     // `load` waits for subframes, so late same-origin iframes are included.
     window.addEventListener(
       "load",
       () => {
         pass();
-        settle();
+        settleLater();
       },
       { once: true },
     );
