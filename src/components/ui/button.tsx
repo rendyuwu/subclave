@@ -16,7 +16,7 @@ const buttonVariants = cva(
         // normalizeCustomTheme. The base keeps its transparent 1px border so
         // focus-visible still draws without shifting the layout.
         outline:
-          "bg-[var(--tervia-button-face)] text-[color:var(--tervia-button-face-foreground)] hover:bg-[var(--tervia-button-face-hover)] aria-expanded:bg-[var(--tervia-button-face-hover)]",
+          "bg-[var(--subclave-button-face)] text-[color:var(--subclave-button-face-foreground)] hover:bg-[var(--subclave-button-face-hover)] aria-expanded:bg-[var(--subclave-button-face-hover)]",
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/80 aria-expanded:bg-secondary aria-expanded:text-secondary-foreground",
         ghost:

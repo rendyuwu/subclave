@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Formless logins in two documents</title>
+  </head>
+  <body>
+    <!-- Two formless logins, one here and one in a same-origin iframe: neither
+         password makes the other a sign-up form. -->
+    <div>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+    </div>
+    <iframe
+      id="frame"
+      srcdoc='<div><input id="f-username" type="text" autocomplete="username" /><input id="f-password" type="password" autocomplete="current-password" /></div>'
+    ></iframe>
+  </body>
+</html>

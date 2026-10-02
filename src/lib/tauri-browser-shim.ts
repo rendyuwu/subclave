@@ -3,8 +3,7 @@
 // Backs `fs_read_file` / `fs_write_file` with localStorage so every store file
 // behind `lib/recoveredStore.ts` - settings included - persists across reloads.
 // Other native commands resolve to undefined or empty: UI renders but native
-// features (terminal, fs beyond those two commands, scm, ssh, dialog, updater,
-// opener) stay inert.
+// features (fs beyond those two commands, dialog, updater, opener) stay inert.
 
 declare global {
   interface Window {
@@ -50,12 +49,12 @@ if (typeof window !== "undefined" && !window.__TAURI_INTERNALS__) {
   // this, `plugin:path|resolve_directory` fell through to `null` and
   // `storeFilePaths` threw on `null.replace` - which recovery reported as an
   // "unreachable" store, one error toast per recovered store, at every launch.
-  const PREVIEW_APP_DATA_DIR = "/tervia-preview";
+  const PREVIEW_APP_DATA_DIR = "/subclave-preview";
 
   // Backing storage for `fs_read_file` / `fs_write_file`, keyed by the absolute
   // path the caller passes. One bucket, because those two commands are the only
   // way a store file is read or written now.
-  const FS_PREFIX = "tervia:shim:fs:";
+  const FS_PREFIX = "subclave:shim:fs:";
 
   /** `BaseDirectory.AppData`, which is what `appDataDir()` asks for. */
   const BASE_DIRECTORY_APP_DATA = 14;
@@ -63,10 +62,9 @@ if (typeof window !== "undefined" && !window.__TAURI_INTERNALS__) {
   const handlePath = (op: string, args: InvokeArgs): unknown => {
     // Narrowed to the ONE directory the store path needs. `resolve_directory`
     // serves every `BaseDirectory`, so answering it unconditionally would hand
-    // `homeDir()` - which `terminal/lib/agentTodos.ts` and
-    // `app/hooks/useWorkspaceRoot.ts` both call - a confident wrong answer in
-    // place of the null they already handle. A plausible bad path is worse in a
-    // preview than an obvious missing one.
+    // any other caller a confident wrong answer in place of the null they
+    // already handle. A plausible bad path is worse in a preview than an
+    // obvious missing one.
     const a = (args ?? {}) as Record<string, unknown>;
     if (op === "resolve_directory" && a.directory === BASE_DIRECTORY_APP_DATA) {
       return PREVIEW_APP_DATA_DIR;

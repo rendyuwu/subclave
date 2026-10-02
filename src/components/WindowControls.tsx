@@ -5,16 +5,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
 import { Copy, Minus, Square, X } from "lucide-react";
 
-type Props = {
-  /** Render only the close button. Used by the settings window. */
-  closeOnly?: boolean;
-};
-
-export function WindowControls({ closeOnly = false }: Props) {
+export function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
-    if (!USE_CUSTOM_WINDOW_CONTROLS || closeOnly) return;
+    if (!USE_CUSTOM_WINDOW_CONTROLS) return;
     const w = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     void w.isMaximized().then(setMaximized);
@@ -26,7 +21,7 @@ export function WindowControls({ closeOnly = false }: Props) {
         unlisten = un;
       });
     return () => unlisten?.();
-  }, [closeOnly]);
+  }, []);
 
   if (!USE_CUSTOM_WINDOW_CONTROLS) return null;
 
@@ -34,27 +29,19 @@ export function WindowControls({ closeOnly = false }: Props) {
 
   return (
     <div className="flex h-full shrink-0 items-center gap-0.5 pr-1">
-      {!closeOnly && (
-        <>
-          <IconTooltip label="Minimize" side="bottom">
-            <CtlButton ariaLabel="Minimize" onClick={() => void w.minimize()}>
-              <Minus size={12} strokeWidth={2} />
-            </CtlButton>
-          </IconTooltip>
-          <IconTooltip label={maximized ? "Restore" : "Maximize"} side="bottom">
-            <CtlButton
-              ariaLabel={maximized ? "Restore" : "Maximize"}
-              onClick={() => void w.toggleMaximize()}
-            >
-              {maximized ? (
-                <Copy size={12} strokeWidth={2} />
-              ) : (
-                <Square size={12} strokeWidth={2} />
-              )}
-            </CtlButton>
-          </IconTooltip>
-        </>
-      )}
+      <IconTooltip label="Minimize" side="bottom">
+        <CtlButton ariaLabel="Minimize" onClick={() => void w.minimize()}>
+          <Minus size={12} strokeWidth={2} />
+        </CtlButton>
+      </IconTooltip>
+      <IconTooltip label={maximized ? "Restore" : "Maximize"} side="bottom">
+        <CtlButton
+          ariaLabel={maximized ? "Restore" : "Maximize"}
+          onClick={() => void w.toggleMaximize()}
+        >
+          {maximized ? <Copy size={12} strokeWidth={2} /> : <Square size={12} strokeWidth={2} />}
+        </CtlButton>
+      </IconTooltip>
       <IconTooltip label="Close" side="bottom">
         <CtlButton ariaLabel="Close" onClick={() => void w.close()} danger>
           <X size={14} strokeWidth={2} />

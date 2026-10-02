@@ -40,9 +40,9 @@ for (const file of picked) {
   // put node_modules/.bin on PATH). That means the argument goes through the
   // shell's word splitting, so it must stay RELATIVE: an absolute path breaks
   // the moment the checkout lives somewhere with a space in it, which is where
-  // this was first run ("Tervia - remote client" split into two arguments and every
-  // script "failed"). `cwd` is passed to the OS, not the command line, so it
-  // may contain spaces safely.
+  // this was first run (the checkout's own directory name split into two
+  // arguments and every script "failed"). `cwd` is passed to the OS, not the
+  // command line, so it may contain spaces safely.
   // One command STRING, not (command, args): with `shell: true` node concatenates
   // them anyway and warns about it (DEP0190) on every run. `file` comes from a
   // directory listing filtered to `*-verify.ts`, and the quotes cover a name

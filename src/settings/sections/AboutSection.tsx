@@ -1,24 +1,17 @@
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
-import { Spinner } from "@/components/ui/spinner";
-import { formatBytes } from "@/lib/format";
-import { IS_LINUX } from "@/lib/platform";
-import { fetchLinuxRelease } from "@/modules/updater/lib/useUpdater";
-import { ReleaseNotes } from "@/modules/updater/components/ReleaseNotes";
 import { BrandIcon } from "@/components/BrandIcon";
+import { GITHUB_REPO, useUpdater } from "@/modules/updater/lib/useUpdater";
+import { UpdaterDialog } from "@/modules/updater/components/UpdaterDialog";
+import { updaterIcon, updaterLabel } from "@/modules/updater/components/UpdaterPill";
 import { getName, getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { arch, platform } from "@tauri-apps/plugin-os";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { SectionHeader } from "../components/SectionHeader";
 import { SettingsCard } from "../components/SettingsCard";
-import { Download, Globe, RefreshCw } from "lucide-react";
 
-const REPO_URL = "https://github.com/rendyuwu/tervia";
-const UPSTREAM_URL = "https://github.com/IlhamriSKY/TEDI";
-const SITE_URL = "https://tervia.rendy.dev";
+const REPO_URL = `https://github.com/${GITHUB_REPO}`;
+const UPSTREAM_URL = "https://github.com/rendyuwu/tervia";
 
 const PLATFORM_LABEL: Record<string, string> = {
   macos: "macOS",
@@ -41,44 +34,19 @@ function initialBuildLabel(): string {
   }
 }
 
-type CheckState =
-  | { kind: "idle" }
-  | { kind: "checking" }
-  | { kind: "uptodate"; checkedAt: number }
-  | { kind: "available"; version: string; notes: string | null }
-  | { kind: "downloading"; version: string; received: number; total: number | null }
-  | { kind: "ready"; version: string }
-  | { kind: "manual-available"; version: string; releaseUrl: string }
-  | { kind: "error"; message: string };
-
 export function AboutSection() {
   const [version, setVersion] = useState("");
-  const [name, setName] = useState("Tervia");
+  const [name, setName] = useState("Subclave");
   const [build] = useState(initialBuildLabel);
-  const [checkState, setCheckState] = useState<CheckState>({ kind: "idle" });
-  // Held in a ref, not state. The Update handle is non-serialisable and bound
-  // to the plugin's native side; putting it in state would trigger structuredClone
-  // on every render and break the download callback.
-  const updateRef = useRef<Update | null>(null);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  // Click-only here: the main window's pill owns the 8s/6h sweeps.
+  const updater = useUpdater({ autoCheck: false });
+  const UpdateIcon = updaterIcon(updater.state);
 
   useEffect(() => {
     void getVersion().then(setVersion);
     void getName().then(setName);
   }, []);
-
-  const onCheck = () => {
-    void runCheck(setCheckState, updateRef);
-  };
-  const onInstall = () => {
-    void runDownload(setCheckState, updateRef);
-  };
-  const onRestart = () => {
-    void relaunch().catch((e) => {
-      setCheckState({ kind: "error", message: e instanceof Error ? e.message : String(e) });
-    });
-  };
-
-  const busy = checkState.kind === "checking" || checkState.kind === "downloading";
 
   return (
     <div className="flex flex-col gap-6">
@@ -91,7 +59,7 @@ export function AboutSection() {
         <img src="/icon.png" alt="" className="size-12" draggable={false} />
         <div className="flex min-w-0 flex-col">
           <span className="text-[15px] font-semibold tracking-tight">{name}</span>
-          <span className="text-muted-foreground text-[11px]">Terminal Director</span>
+          <span className="text-muted-foreground text-[11px]">A local-first password manager.</span>
           <span className="text-muted-foreground mt-1 font-mono text-[11px]">
             v{version || "-"}
           </span>
@@ -100,7 +68,7 @@ export function AboutSection() {
 
       <SettingsCard
         title="Build details"
-        description="Platform, bundle id, license, website, and source repositories."
+        description="Platform, bundle id, license, and source repositories."
       >
         <dl className="grid grid-cols-[110px_1fr] gap-y-2.5 text-[12px]">
           <dt className="text-muted-foreground">Build</dt>
@@ -109,22 +77,10 @@ export function AboutSection() {
           </dd>
 
           <dt className="text-muted-foreground">Bundle ID</dt>
-          <dd className="font-mono text-[11.5px]">dev.rendy.tervia</dd>
+          <dd className="font-mono text-[11.5px]">dev.rendy.subclave</dd>
 
           <dt className="text-muted-foreground">License</dt>
           <dd>Apache 2.0</dd>
-
-          <dt className="text-muted-foreground">Website</dt>
-          <dd>
-            <button
-              type="button"
-              onClick={() => void openUrl(SITE_URL)}
-              className="hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md text-[12px] underline-offset-2 hover:underline"
-            >
-              <Globe size={12} strokeWidth={1.75} />
-              tervia.rendy.dev
-            </button>
-          </dd>
 
           <dt className="text-muted-foreground">Source code</dt>
           <dd>
@@ -133,8 +89,8 @@ export function AboutSection() {
               onClick={() => void openUrl(REPO_URL)}
               className="hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md text-[12px] underline-offset-2 hover:underline"
             >
-              <BrandIcon brand="github" size={12} />
-              rendyuwu/tervia
+              <BrandIcon size={12} />
+              rendyuwu/subclave
             </button>
           </dd>
 
@@ -145,164 +101,54 @@ export function AboutSection() {
               onClick={() => void openUrl(UPSTREAM_URL)}
               className="hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md text-[12px] underline-offset-2 hover:underline"
             >
-              <BrandIcon brand="github" size={12} />
-              IlhamriSKY/TEDI
+              <BrandIcon size={12} />
+              rendyuwu/tervia
             </button>
           </dd>
         </dl>
       </SettingsCard>
 
-      <div className="flex flex-col gap-2">
-        <p className="text-muted-foreground text-[11px]">{updaterMessage(checkState)}</p>
-
-        {checkState.kind === "downloading" ? (
-          <div className="flex flex-col gap-1.5">
-            <Progress
-              value={
-                checkState.total && checkState.total > 0
-                  ? Math.min(100, (checkState.received / checkState.total) * 100)
-                  : undefined
-              }
-            />
-            <span className="text-muted-foreground text-[11px]">
-              {formatBytes(checkState.received)}
-              {checkState.total ? ` / ${formatBytes(checkState.total)}` : ""}
-            </span>
-          </div>
-        ) : null}
-
-        {checkState.kind === "available" && checkState.notes ? (
-          <div className="border-border/60 bg-muted/40 max-h-64 overflow-auto rounded-md border p-3 text-[12px] leading-relaxed">
-            <ReleaseNotes notes={checkState.notes} />
-          </div>
-        ) : null}
-
-        <div className="flex flex-wrap gap-2">
-          <Button size="sm" onClick={onCheck} disabled={busy} className="gap-1.5">
-            {checkState.kind === "checking" ? (
-              <Spinner className="size-3" />
-            ) : (
-              <RefreshCw size={12} strokeWidth={1.75} />
-            )}
-            Check for updates
-          </Button>
-
-          {checkState.kind === "available" ? (
-            <Button size="sm" onClick={onInstall} className="gap-1.5">
-              <Download size={12} strokeWidth={1.75} />
-              Download & install v{checkState.version}
-            </Button>
-          ) : null}
-
-          {checkState.kind === "manual-available" ? (
-            <Button
-              size="sm"
-              onClick={() => void openUrl(checkState.releaseUrl)}
-              className="gap-1.5"
-            >
-              <Download size={12} strokeWidth={1.75} />
-              Download v{checkState.version}
-            </Button>
-          ) : null}
-
-          {checkState.kind === "ready" ? (
-            <Button size="sm" onClick={onRestart} className="gap-1.5">
-              <RefreshCw size={12} strokeWidth={1.75} />
-              Restart to apply v{checkState.version}
-            </Button>
-          ) : null}
-
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void openUrl(REPO_URL)}
-            className="gap-1.5"
-          >
-            <BrandIcon brand="github" size={12} />
-            View on GitHub
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void openUrl(`${REPO_URL}/issues/new`)}
-          >
-            Report an issue
-          </Button>
-        </div>
+      <div className="flex flex-wrap gap-2">
+        {/* Same button copy as the status-bar UpdaterPill and the same shared
+            dialog, but the check is click-only: opening Settings must not hit
+            GitHub, so this button starts the check the way the old About-only
+            state machine did. A check already in flight is left alone. */}
+        <Button
+          size="sm"
+          onClick={() => {
+            const k = updater.state.kind;
+            if (k !== "checking" && k !== "downloading") {
+              void updater.checkForUpdate();
+            }
+            setUpdateOpen(true);
+          }}
+          className="gap-1.5"
+        >
+          <UpdateIcon size={12} strokeWidth={1.75} />
+          {updaterLabel(updater.state)}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void openUrl(REPO_URL)}
+          className="gap-1.5"
+        >
+          <BrandIcon size={12} />
+          View on GitHub
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => void openUrl(`${REPO_URL}/issues/new`)}>
+          Report an issue
+        </Button>
       </div>
+
+      <UpdaterDialog
+        open={updateOpen}
+        onOpenChange={setUpdateOpen}
+        state={updater.state}
+        onInstall={() => void updater.downloadAndInstall()}
+        onRelaunch={() => void updater.relaunchApp()}
+        onRetry={() => void updater.checkForUpdate()}
+      />
     </div>
   );
-}
-
-async function runCheck(set: (s: CheckState) => void, ref: React.RefObject<Update | null>) {
-  set({ kind: "checking" });
-  ref.current = null;
-  try {
-    if (IS_LINUX) {
-      const info = await fetchLinuxRelease();
-      if (info) {
-        set({
-          kind: "manual-available",
-          version: info.version,
-          releaseUrl: info.releaseUrl,
-        });
-      } else {
-        set({ kind: "uptodate", checkedAt: Date.now() });
-      }
-      return;
-    }
-    const update = await check();
-    if (update) {
-      ref.current = update;
-      set({ kind: "available", version: update.version, notes: update.body ?? null });
-    } else {
-      set({ kind: "uptodate", checkedAt: Date.now() });
-    }
-  } catch (e) {
-    set({ kind: "error", message: e instanceof Error ? e.message : String(e) });
-  }
-}
-
-async function runDownload(set: (s: CheckState) => void, ref: React.RefObject<Update | null>) {
-  const update = ref.current;
-  if (!update) return;
-  let received = 0;
-  let total: number | null = null;
-  set({ kind: "downloading", version: update.version, received: 0, total: null });
-  try {
-    await update.downloadAndInstall((event) => {
-      if (event.event === "Started") {
-        total = event.data.contentLength ?? null;
-        set({ kind: "downloading", version: update.version, received: 0, total });
-      } else if (event.event === "Progress") {
-        received += event.data.chunkLength;
-        set({ kind: "downloading", version: update.version, received, total });
-      } else if (event.event === "Finished") {
-        set({ kind: "ready", version: update.version });
-      }
-    });
-  } catch (e) {
-    set({ kind: "error", message: e instanceof Error ? e.message : String(e) });
-  }
-}
-
-function updaterMessage(state: CheckState): string {
-  switch (state.kind) {
-    case "checking":
-      return "Checking for updates…";
-    case "available":
-      return `v${state.version} is available - download & install below.`;
-    case "downloading":
-      return `Downloading v${state.version}…`;
-    case "ready":
-      return `v${state.version} is installed. Restart Tervia to apply.`;
-    case "manual-available":
-      return `v${state.version} is available - install manually via your package manager.`;
-    case "uptodate":
-      return "You're on the latest version. Auto-update checks every 6 hours.";
-    case "error":
-      return `Couldn't update: ${state.message}`;
-    default:
-      return "Auto-update checks GitHub Releases every 6 hours.";
-  }
 }

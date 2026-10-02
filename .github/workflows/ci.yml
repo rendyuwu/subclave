@@ -28,11 +28,20 @@ env:
   # build never disagree about what is installed.
   #
   # libdbus-1-dev is for `tao` (Tauri's windowing layer) on Linux. The two
-  # libxcb entries were originally added for `xcap`, the browser-screenshot
-  # capture removed in Phase 2c; nothing in the tree is known to link libxcb
-  # any more (x11rb is pure Rust, x11-dl dlopens), but they are kept until a
-  # green build proves them unnecessary. patchelf is required by the AppImage
-  # bundler.
+  # libxcb entries were originally added for `xcap`, a browser-screenshot
+  # capture the app no longer contains; nothing in the tree is known to link
+  # libxcb any more (x11rb is pure Rust, x11-dl dlopens), but they are kept
+  # until a green build proves them unnecessary. patchelf is required by the
+  # AppImage bundler.
+  #
+  # libayatana-appindicator3-dev is for the tray. The -dev package specifically,
+  # not the runtime library: `tauri build` looks the library up with
+  # `pkg-config ayatana-appindicator3-0.1` (falling back to `appindicator3-0.1`)
+  # and panics with "Can't detect any appindicator library" when neither .pc file
+  # is installed, failing the bundle job after the release build has already
+  # succeeded. The compiled app does not link it - libappindicator-sys dlopens
+  # libayatana-appindicator3.so.1 at runtime - so the -dev package is what puts
+  # both the .pc file and the library on the runner.
   LINUX_DEPS: >-
     libwebkit2gtk-4.1-dev
     libgtk-3-dev
@@ -41,6 +50,7 @@ env:
     libdbus-1-dev
     libxcb1-dev
     libxcb-randr0-dev
+    libayatana-appindicator3-dev
     patchelf
 
 jobs:
@@ -89,6 +99,9 @@ jobs:
       - name: Type-check
         run: pnpm exec tsc --noEmit
 
+      - name: Type-check the extension
+        run: pnpm run typecheck:extension
+
       - name: Build frontend
         run: pnpm build
 
@@ -113,45 +126,128 @@ jobs:
           workspaces: ./src-tauri -> target
           cache-on-failure: true
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # `tauri-build` copies every `bundle.externalBin` sidecar during the
+      # build script, so a `cargo check` on a checkout with no
+      # `src-tauri/binaries/subclave-proxy-<triple>` fails with
+      # ResourcePathNotFound before any of our own code is even looked at. The
+      # staged file is gitignored (it is a per-triple binary), so CI has to
+      # produce it here. `build-sidecar.mjs` uses only node builtins, so this
+      # needs no `pnpm install`.
+      - name: Stage the native-messaging sidecar
+        run: |
+          # Fail on a stale lockfile first: the staging build runs cargo without
+          # `--locked` on purpose (it is the same script `tauri dev` and
+          # `tauri build` run), so without this check the later `--locked` steps
+          # would see an already-refreshed lock and pass.
+          cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 > /dev/null
+          node scripts/build-sidecar.mjs
+
       # Cheapest gate first: formatting needs no compilation, so a stray nit
       # fails in seconds instead of waiting behind the clippy/test builds below.
       - name: cargo fmt
         working-directory: src-tauri
         run: cargo fmt --all -- --check
 
+      # `--workspace` so the proxy crate's bins and integration tests are
+      # checked too; without it cargo selects the default members, which is
+      # only the root package.
       - name: cargo check
         working-directory: src-tauri
-        run: cargo check --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
 
-      # --workspace so this also lints tervia-cli (the Windows console-launcher
-      # stub in tervia-cli/), not just the GUI package. Plain `cargo clippy`
-      # would silently skip it: `default-members = ["."]` in Cargo.toml scopes
-      # unqualified invocations to the GUI package alone, on purpose, so the
-      # bundler's own `cargo build` stays fast.
+      # A `cargo check` on Linux never compiles a `cfg(windows)` branch, and the
+      # proxy crate has no C dependency, so checking it for the msvc target is a
+      # cheap, linker-free guard against the Windows-only code (named pipe
+      # client, user-SID lookup) silently rotting. The app crate's own Windows
+      # code is first compiled by the windows-x64 bundle job, because its C
+      # dependencies need a real MSVC toolchain.
+      - name: cargo check (windows proxy)
+        working-directory: src-tauri
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo check -p subclave-proxy --target x86_64-pc-windows-msvc --locked
+
       - name: cargo clippy
         working-directory: src-tauri
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Runs the backend unit tests, including pubkey_constant_decodes which
-      # guards the embedded updater pubkey. The network-hitting live updater test
-      # is #[ignore]d, so the default run stays offline and fast. Deliberately no
-      # count here: it drifted (27 -> 41 -> 43) every time tests were added.
+      # Runs the backend unit tests: the allocator purge behaviour, the window
+      # min-size correction, the atomic-write and file-classification helpers,
+      # and `no_new_sync_tauri_commands`, which guards that every registered
+      # Tauri command is async. Deliberately no count here: it drifted
+      # (27 -> 41 -> 43) every time tests were added.
       #
       # This job is Linux-only. The macOS and Windows `cfg` branches are first
       # compiled by the bundle matrix below, which is the reason that matrix runs
       # on pull requests at all rather than only at tag time.
-      #
-      # --workspace for the same reason as cargo clippy above: without it,
-      # tervia-cli's tests (none today, but the binary itself still needs to
-      # build) are silently excluded.
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --workspace --locked
 
+  # The extension is a separate build with its own toolchain chain (Vite per
+  # entry, web-ext, Playwright), so it gets its own job rather than riding on
+  # the frontend one. Every extension binary is invoked through
+  # `pnpm --filter ... exec`: pnpm's isolated node_modules means a root-level
+  # `pnpm exec web-ext` would not resolve the dependency.
+  extension:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type-check
+        run: pnpm --filter subclave-extension typecheck
+
+      - name: Build (chrome)
+        run: pnpm --filter subclave-extension build --target chrome
+
+      - name: Build (firefox)
+        run: pnpm --filter subclave-extension build --target firefox
+
+      - name: web-ext lint
+        run: pnpm --filter subclave-extension run lint:webext
+
+      # The proxy crate compiles on its own here (no tauri-build), so a
+      # regression in the shared codec or the pipe client is caught even though
+      # the rust job also builds the workspace.
+      - name: Build the native-messaging proxy
+        working-directory: src-tauri
+        run: cargo build -p subclave-proxy
+
+      - name: Install the Playwright Chromium
+        run: pnpm --filter subclave-extension exec playwright install --with-deps chromium
+
+      - name: Run the extension tests
+        run: pnpm --filter subclave-extension test
+
+      - name: Package the zips
+        run: pnpm --filter subclave-extension zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: subclave-extension
+          path: extension/dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
   # Produces the installers a reviewer downloads to smoke-test a branch, so that
-  # verifying SSH / port forwarding / SFTP / backup export never requires a local
-  # release build. Artifacts land under the run's "Artifacts" section as
-  # `tervia-<platform>.zip`.
+  # checking a change never requires a local release build. Artifacts land under
+  # the run's "Artifacts" section as `subclave-<platform>.zip`.
   bundle:
     name: bundle (${{ matrix.id }})
     needs: [frontend, rust]
@@ -212,17 +308,6 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # Same step release.yml runs, and for the same reason: the NSIS hook in
-      # `installer.nsh` `File`s `src-tauri/target/release/tervia.exe` into the
-      # install dir beside the GUI binary, and tauri-action only builds the
-      # binary named by `default-run`. Without this the Windows installer build
-      # fails outright, so the PR bundle would not match the released one.
-      - name: Build tervia console launcher (Windows only)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        working-directory: src-tauri
-        run: cargo build --release -p tervia-cli
-
       # REQUIRED — do not "simplify" this step away. With
       # `createUpdaterArtifacts: true` and a pubkey set, a bundle build with no
       # signing key is a hard failure ("A public key has been found, but no
@@ -279,7 +364,7 @@ jobs:
       - name: Upload bundles
         uses: actions/upload-artifact@v7
         with:
-          name: tervia-${{ matrix.id }}
+          name: subclave-${{ matrix.id }}
           path: |
             ${{ matrix.bundle-root }}/appimage/*.AppImage
             ${{ matrix.bundle-root }}/appimage/*.AppImage.sig

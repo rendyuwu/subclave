@@ -1,95 +1,69 @@
-// The vocabulary the sync module speaks, and the mirrors of the two Rust
-// command payloads.
+// The vocabulary the sync module speaks, and the mirrors of the Rust command
+// payloads.
 //
-// KEPT IN LOCKSTEP BY HAND with `src-tauri/src/modules/sync/engine.rs`, the same
-// way `src/lib/ipc.ts` mirrors the filesystem payloads - and for the same
-// reason: `tsc` cannot see across the IPC boundary, so a field renamed on one
-// side is `undefined` on the other with no error anywhere. Each type below names
-// the Rust type it mirrors.
+// KEPT IN LOCKSTEP BY HAND with `src-tauri/src/modules/sync/engine/types.rs`, the same
+// way `src/lib/ipc.ts` mirrors the filesystem payloads: `tsc` cannot see across
+// the IPC boundary, so a field renamed on one side is `undefined` on the other
+// with no error anywhere. Each type below names the Rust type it mirrors.
 
 /** Where the sync module's own settings live. Its own file, so a contended
- *  write here can never clobber a host or a vault key. */
-export const SYNC_STORE_PATH = "tervia-sync.json";
-
-/** The keychain service the provider credentials and the passphrase go under.
- *  Sync's own, beside `tervia-hosts` and `tervia-vault`. */
-export const SYNC_KEYRING_SERVICE = "tervia-sync";
-
-/**
- * Accounts under {@link SYNC_KEYRING_SERVICE}.
- *
- * ONE SET OF NAMES for the window that writes them and the window that reads
- * them back: the settings section stores what the user typed, and `main`'s
- * scheduler reads them at launch to open a session. A second spelling anywhere
- * would present as sync that silently never configures.
- */
-export const SYNC_PASSPHRASE_ACCOUNT = "passphrase";
-export const SYNC_ACCESS_KEY_ID_ACCOUNT = "accessKeyId";
-export const SYNC_SECRET_ACCESS_KEY_ACCOUNT = "secretAccessKey";
-
-/**
- * WebDAV's own credential pair.
- *
- * ITS OWN ACCOUNTS, not the two above reused as a generic user and password: a
- * device configured for S3 and then switched to WebDAV would send its S3 secret
- * as an HTTP password to a different host. Distinct accounts make that
- * unrepresentable rather than merely unlikely.
- *
- * The username goes in the keychain rather than in {@link SyncConfig} for the
- * same reason both halves of the S3 credential do - it is half of a pair, and
- * splitting a pair across two storage locations is how one half gets left
- * behind.
- */
-export const SYNC_WEBDAV_USERNAME_ACCOUNT = "webdavUsername";
-export const SYNC_WEBDAV_PASSWORD_ACCOUNT = "webdavPassword";
-
-/**
- * Settings asking `main` to do something it is the only window allowed to do.
- *
- * WEBVIEW TO WEBVIEW, so it is not in `src/lib/ipc.ts` - that file mirrors the
- * events the RUST process emits. `pull` also covers "the configuration
- * changed": a new configuration is only observable by reconciling against it,
- * and a second event whose handler was a subset of this one's would be one more
- * thing to keep in step.
- */
-export const SYNC_REQUEST_EVENT = "tervia:sync-request";
-export type SyncRequest = "pull" | "push";
+ *  write here can never clobber a preference or a vault key. */
+export const SYNC_STORE_PATH = "subclave-sync.json";
 
 /** Keys inside {@link SYNC_STORE_PATH}. Separate keys rather than one blob, so a
  *  status write and a config write never contend for the same value. */
 export const SYNC_CONFIG_KEY = "config";
-export const SYNC_ETAGS_KEY = "etags";
-export const SYNC_DIRTY_KEY = "dirty";
 export const SYNC_STATUS_KEY = "status";
+
+/**
+ * Settings asking the main window to do something it is the only window allowed
+ * to do.
+ *
+ * WEBVIEW TO WEBVIEW, so it is not in `src/lib/ipc.ts`: that file mirrors the
+ * events the RUST process emits. The passphrase is typed in the settings window
+ * and the session it opens lives in the Rust process, so the settings window
+ * asks the main window to open one rather than opening one of its own.
+ */
+export const SYNC_REQUEST_EVENT = "subclave:sync-request";
+export type SyncRequest = "pull" | "push";
+
+/** Emitted whenever the recorded status changes, so a second window's pill
+ *  shows the same figures without polling. */
+export const SYNC_STATUS_EVENT = "subclave://sync-status-changed";
+
+/** Emitted whenever the stored configuration changes. A toggle-off writes the
+ *  config but raises no request, so this is what reaches the pill. */
+export const SYNC_CONFIG_EVENT = "subclave://sync-config-changed";
 
 /**
  * How long an edit waits for its neighbours before a push goes out.
  *
- * Five seconds, because the unit a user produces is a burst: an editor save
- * writes one record and the same hand often writes two or three more. Per-edit
- * pushes would make that three round trips where one would do.
+ * Five seconds, because the unit a user produces is a burst: saving one entry is
+ * often followed by two or three more. Per-edit pushes would make that three
+ * round trips where one would do.
  */
 export const PUSH_DEBOUNCE_MS = 5000;
 
 /**
  * The floor between two focus-driven pulls.
  *
- * Without it, alt-tabbing is a poll loop wearing an event's clothes -
- * `CONTRIBUTING.md` rejects exactly that shape - and each iteration is a LIST
- * against the user's storage.
+ * Without it, alt-tabbing is a poll loop wearing an event's clothes, and each
+ * iteration is a LIST against the user's storage.
  */
 export const FOCUS_INTERVAL_MS = 60_000;
+
+/** A pass over the remote, as the status bar renders it. */
+export type SyncPhase = "idle" | "syncing";
 
 /**
  * The non-secret half of a sync configuration.
  *
- * WHAT IS NOT HERE: the passphrase and either half of whichever provider
- * credential is in use. Those go to the keychain under
- * {@link SYNC_KEYRING_SERVICE}, because this file sits in the app data directory
- * in plain JSON beside the host list.
+ * WHAT IS NOT HERE: the passphrase and whichever provider credential is in use.
+ * Those live in the vault payload's device state, sealed with the rest of the
+ * vault, because this file sits in the app data directory in plain JSON.
  *
- * `enabled` off means NO NETWORK, checked before anything is invoked rather
- * than inside the Rust commands - see `KNOWN-LIMITS.md` for what that costs.
+ * `enabled` off means NO NETWORK, checked before anything is invoked rather than
+ * inside the Rust commands.
  */
 export type SyncConfig = {
   enabled: boolean;
@@ -106,38 +80,73 @@ export type SyncConfig = {
   /** Where in the remote storage this device's inventory lives. May be empty. */
   prefix: string;
   /** Whether the endpoint honours a conditional write. A STORED USER TOGGLE and
-   *  never a probe - see `Caps` in `src-tauri/src/modules/sync/provider.rs`. Not
-   *  sent to a provider that has no conditional write to offer, which is why the
-   *  settings section renders no switch for one. */
+   *  never a probe, see `cas` in `src-tauri/src/modules/sync/provider.rs`. Not
+   *  sent to a provider that has no conditional write to offer, which is why
+   *  `SyncBehaviour` renders no switch for one. */
   cas: boolean;
-  /**
-   * Whether private key bodies travel at all.
-   *
-   * ONE TOGGLE, BOTH DIRECTIONS. Off means this device neither publishes a body
-   * nor accepts one. A send-only reading would break the published opt-in and,
-   * worse, make the keychain comparison asymmetric: only the local side's
-   * `secrets` would ever be populated, so `secretsChanged` would be true on
-   * every pull and every pull would rewrite the whole secrets file.
-   */
-  carrySecrets: boolean;
 };
 
-/** The fields that say WHICH REMOTE a configuration names. `region` is how the
- *  same bucket is addressed, `cas` and `carrySecrets` are behaviour, `enabled`
- *  is a switch - none of them is an address. */
-const REMOTE_IDENTITY_FIELDS = ["provider", "endpoint", "bucket", "prefix"] as const;
+/**
+ * The provider-facing subset of {@link SyncConfig}, exactly the fields Rust's
+ * `SyncConfigArg` declares.
+ *
+ * `enabled` is left out because that struct denies unknown fields, so a stray
+ * one is a hard error at configure time rather than a key nobody reads. Both the
+ * scheduler and the settings form build their configure arguments through
+ * {@link configSubset} so neither can drift from the other.
+ */
+export type SyncConfigArg = {
+  provider: string;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  prefix: string;
+  cas: boolean;
+};
 
 /**
- * Whether two configurations name the same place.
+ * The providers `build` in `src-tauri/src/modules/sync/provider.rs` dispatches
+ * on, with the label each form shows.
  *
- * A change of address is a change of etag map: its keys are `kind:id`, not
- * object names, so a map filled against the old remote supplies an `If-Match`
- * for objects that never existed on the new one - a whole first pass refused as
- * stale on a conditional-write provider, reported as conflicts that did not
- * happen.
+ * A list rather than a constant pair because the id is STORED and the label is
+ * not, and the two must not drift apart. Declared once because both forms that
+ * configure a provider render it: an id added to that match and missed here
+ * would be unreachable from the UI.
  */
-export function namesTheSameRemote(a: SyncConfig, b: SyncConfig): boolean {
-  return REMOTE_IDENTITY_FIELDS.every((field) => a[field] === b[field]);
+export const SYNC_PROVIDERS: { id: string; label: string }[] = [
+  { id: "s3", label: "S3-compatible" },
+  { id: "webdav", label: "WebDAV (Nextcloud, ownCloud)" },
+];
+
+/** The five provider fields plus `cas`, without `enabled`. */
+export function configSubset(config: SyncConfig): SyncConfigArg {
+  return {
+    provider: config.provider,
+    endpoint: config.endpoint,
+    region: config.region,
+    bucket: config.bucket,
+    prefix: config.prefix,
+    cas: config.cas,
+  };
+}
+
+/**
+ * Whether the fields a provider actually needs are filled in.
+ *
+ * SHARED WITH `scripts/sync-verify.ts`, and that is the point: this is the one
+ * boolean in the join form that can make a whole provider unusable while the
+ * form still looks complete, so it lives where a check can drive it rather than
+ * inside a component.
+ *
+ * REGION AND BUCKET ARE S3'S ALONE. A WebDAV configuration refuses unknown
+ * fields, so demanding them for a WebDAV server would make the form impossible
+ * to submit.
+ */
+export function connectionFieldsReady(config: SyncConfig, credentialsReady: boolean): boolean {
+  if (config.endpoint.trim().length === 0) return false;
+  if (!credentialsReady) return false;
+  if (config.provider === "webdav") return true;
+  return config.region.trim().length > 0 && config.bucket.trim().length > 0;
 }
 
 /** A device with sync never configured. Off, and naming nothing. */
@@ -147,18 +156,17 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   endpoint: "",
   region: "",
   bucket: "",
-  prefix: "",
+  prefix: "subclave",
   cas: false,
-  carrySecrets: false,
 };
 
 /**
- * What the settings window renders, written by `main` and read by settings.
+ * What the status bar and the settings window render, written by the main
+ * window and read by settings.
  *
- * IN THE STORE RATHER THAN IN A COMMAND, because neither number is reachable
- * from Rust: the apply runs in `main`'s TypeScript, so a Rust-side status could
- * see neither the pending count nor the quarantine list. That is why there is no
- * `sync_status` command.
+ * IN THE STORE RATHER THAN IN A COMMAND, because neither the pending count nor
+ * the quarantine list is reachable from Rust alone: the settings window has no
+ * session, so it reads what the main window learned.
  */
 export type SyncStatus = {
   lastPullAt: number | null;
@@ -168,9 +176,12 @@ export type SyncStatus = {
   /** Remote objects this device could not read, by their opaque names. */
   quarantine: { name: string; reason: string }[];
   /** Records this device holds that the remote has no object for and that are
-   *  older than the tombstone window - reported, never deleted. */
+   *  older than the tombstone window: reported, never deleted. */
   stale: { kind: string; id: string }[];
   lastError: string | null;
+  /** True while the vault is locked, so every trigger is dropped rather than
+   *  opening a session against a locked vault. */
+  paused: boolean;
 };
 
 export const EMPTY_SYNC_STATUS: SyncStatus = {
@@ -180,114 +191,79 @@ export const EMPTY_SYNC_STATUS: SyncStatus = {
   quarantine: [],
   stale: [],
   lastError: null,
+  paused: false,
 };
 
 /**
- * Mirrors Rust `Envelope` (`src-tauri/src/modules/sync/model.rs`).
+ * The provider credential pair, whatever the provider calls its halves.
  *
- * `device` is OPTIONAL here and never set on this side: `sync_push` stamps it
- * over whatever arrives, because the prune deletes remote objects on the
- * strength of it. So an inbound envelope carries one and an outbound envelope
- * does not, and this side never has to ask what this device is called.
+ * Never stored in this module's file: it travels as an argument, and Rust puts
+ * it in the vault payload.
  */
-export type Envelope = {
-  v: number;
-  kind: string;
-  id: string;
-  updatedAt?: number;
-  device?: string;
-  deleted: boolean;
-  record: unknown;
-  secrets?: Record<string, string>;
+export type SyncCredentialsArg = {
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  username?: string;
+  password?: string;
 };
 
-/** [`WIRE_VERSION`] in that same file. A value check on both sides, never an
- *  assumption. */
-export const WIRE_VERSION = 1;
-
-/** Mirrors Rust `Reconciled` + `Outcome`, which serialize flattened into one
- *  object tagged by `outcome`. */
-export type Reconciled = { kind: string; id: string } & (
-  | {
-      outcome: "merged";
-      envelope: Envelope;
-      /** Drives the STORE write. */
-      changed: boolean;
-      /** Drives the KEYCHAIN write, which the carry toggle gates. */
-      secretsChanged: boolean;
-      /** Whether the remote object still has to be brought up to the winner. */
-      republish: boolean;
-    }
-  | { outcome: "remoteOnly"; envelope: Envelope }
-  | { outcome: "localOnly"; stale: boolean }
-);
-
-/** Mirrors Rust `PullReport`. */
-export type PullReport = {
-  records: Reconciled[];
-  /** `kind:id` to etag. Keyed so this side can compute it without an object
-   *  name, which is an HMAC under a key this side never holds. */
-  etags: Record<string, string>;
-  quarantined: { name: string; reason: string }[];
-  pruned: number;
-  pending: number;
-};
-
-/** Mirrors Rust `PushFailure`. Named because the scheduler routes these back
- *  into the dirty set and out of the etag map, and needs to say so in a type. */
-export type PushFailure = { kind: string; id: string; reason: string };
-
-/** Mirrors Rust `PushReport`. */
-export type PushReport = {
-  etags: Record<string, string>;
-  failed: PushFailure[];
-};
-
-/**
- * What `sync_configure` takes. Mirrors Rust `SyncConfigureArgs`.
- *
- * `config` is the PROVIDER's own shape, passed through to `build` in
- * `src-tauri/src/modules/sync/provider.rs` unread by anything between here and
- * there - which is what keeps a second backend to one file plus one line.
- *
- * The passphrase and the provider credentials arrive as arguments rather than
- * being read from the keychain by Rust, because the window that has them is the
- * window that just took them from the user, and a read-back would need a second
- * command whose only job is to say what this device is called.
- */
+/** Mirrors Rust `SyncConfigureArgs`. */
 export type SyncConfigureArgs = {
-  provider: string;
-  prefix: string;
+  config: SyncConfigArg;
+  credentials?: SyncCredentialsArg;
+  /** Only non-empty drafts are sent; an absent one keeps the stored value. */
+  passphrase?: string;
+  create?: boolean;
+};
+
+/** Mirrors Rust `SyncConfigureResult`. */
+export type SyncConfigureResult = {
+  remote: string;
+};
+
+/** Mirrors Rust `SyncJoinArgs`. */
+export type SyncJoinArgs = {
+  masterPassword: string;
+  config: SyncConfigArg;
+  credentials: SyncCredentialsArg;
   passphrase: string;
-  config: Record<string, unknown>;
+};
+
+/** Mirrors Rust `SyncJoinResult`. */
+export type SyncJoinResult = {
+  remote: string;
+  landed: number;
+  quarantine: { name: string; reason: string }[];
+};
+
+/** Mirrors Rust `SyncPullResult`. */
+export type SyncPullResult = {
+  /** Records the remote is still missing, as of the reconcile. */
+  pending: number;
+  landed: number;
+  quarantine: { name: string; reason: string }[];
+  stale: { kind: string; id: string }[];
+};
+
+/** Mirrors Rust `SyncPushResult`. The failure reasons stay in Rust. */
+export type SyncPushResult = {
+  pushed: number;
+  failed: number;
 };
 
 /**
  * The Rust commands the SCHEDULER drives, as a port.
  *
- * NAMED METHODS rather than one `invoke(command, args)`, and that is not
- * decoration: `scripts/command-registry-verify.ts` reads the command name as a
- * LITERAL at the `invoke` call and pins every site that passes a variable
- * instead. A generic port would make this module such a site, and the pin would
- * then be the only thing tying registered commands to a caller.
- *
- * It is also what the checks count: "with sync off, nothing is invoked" is a
- * measured zero on these, not a consequence of nobody calling.
- *
- * `sync_configure`, `sync_disable` and `sync_purge_secrets` are NOT here. Each
- * is invoked from the one place that holds what it needs - the session opener
- * beside the keychain, the other two beside the toggle the user just moved -
- * and none is reachable from a background pass, so putting them here would add
- * three methods every fake has to write and no check could fail on.
+ * NAMED METHODS rather than one `invoke(command, args)`: the command-registry
+ * scanner reads the command name as a LITERAL at the `invoke` call, so a generic
+ * port would make this module a dynamic call site to pin. They also keep the
+ * scheduler free of a Tauri import at module scope, so a plain node check can
+ * load it.
  */
 export type SyncCommands = {
-  pull(envelopes: Envelope[], etags: Record<string, string>): Promise<PullReport>;
-  push(envelopes: Envelope[], etags: Record<string, string>): Promise<PushReport>;
+  configure(args: SyncConfigureArgs): Promise<SyncConfigureResult>;
+  disable(): Promise<void>;
+  pull(): Promise<SyncPullResult>;
+  push(): Promise<SyncPushResult>;
+  join(args: SyncJoinArgs): Promise<SyncJoinResult>;
 };
-
-/** Where one record sits in the etag map. Mirrors `slot` in
- *  `src-tauri/src/modules/sync/engine.rs`; the `:` is unambiguous because no
- *  record kind contains one. */
-export function etagSlot(kind: string, id: string): string {
-  return `${kind}:${id}`;
-}

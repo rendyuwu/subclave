@@ -11,37 +11,26 @@ export function formatBytes(n: number): string {
   return `${value.toFixed(1)} ${units[unit]}`;
 }
 
-// Module-level, not one per call - see RELEASE_DATE_FORMAT in UpdaterDialog.
-const RELATIVE_TIME_FORMAT = new Intl.RelativeTimeFormat("en", { numeric: "always" });
-
-// Largest unit first: a host connected 400 days ago should read "1 year ago",
-// not "57 weeks ago".
-const RELATIVE_TIME_UNITS: ReadonlyArray<readonly [Intl.RelativeTimeFormatUnit, number]> = [
-  ["year", 365 * 24 * 60 * 60 * 1000],
-  ["month", 30 * 24 * 60 * 60 * 1000],
-  ["week", 7 * 24 * 60 * 60 * 1000],
-  ["day", 24 * 60 * 60 * 1000],
-  ["hour", 60 * 60 * 1000],
-  ["minute", 60 * 1000],
-];
+/** Locale date and time, e.g. "Jan 5, 2026, 3:04 PM". */
+export function formatDateTime(at: number): string {
+  return new Date(at).toLocaleString();
+}
 
 /**
- * "Connected 3 days ago", or undefined for a record never connected from this
- * device (renders nothing). One wording for every `lastConnectedAt` a card shows
- * - hosts, vault identities and vault keys - so the recency each list is sorted
- * by reads the same everywhere.
- *
- * `now` is a parameter, not `Date.now()` read in here, so the label stays
- * pure and deterministic.
+ * Relative time in minutes, hours or days via `Intl.RelativeTimeFormat`.
+ * `now` defaults to the current time; it is a parameter so callers and checks
+ * can pin the same instant.
  */
-export function lastConnectedLabel(at: number | undefined, now: number): string | undefined {
-  if (at === undefined) return undefined;
-  const elapsed = now - at;
-  for (const [unit, unitMs] of RELATIVE_TIME_UNITS) {
-    const count = Math.floor(elapsed / unitMs);
-    if (count >= 1) return `Connected ${RELATIVE_TIME_FORMAT.format(-count, unit)}`;
-  }
-  // Under a minute, a future stamp (negative elapsed), or NaN all fail every
-  // arm above and land here.
-  return "Connected just now";
+export function formatRelativeTime(at: number, now: number = Date.now()): string {
+  const seconds = (at - now) / 1000;
+  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const magnitude = Math.abs(seconds);
+  if (magnitude < 3600) return formatter.format(Math.round(seconds / 60), "minute");
+  if (magnitude < 86_400) return formatter.format(Math.round(seconds / 3600), "hour");
+  return formatter.format(Math.round(seconds / 86_400), "day");
+}
+
+/** A digit string spaced into readable groups of three, e.g. "123 456". */
+export function groupDigits(code: string): string {
+  return code.replace(/(.{3})(?=.)/g, "$1 ");
 }

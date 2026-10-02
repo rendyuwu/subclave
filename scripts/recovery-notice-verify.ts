@@ -47,7 +47,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel: string) => readFileSync(join(repoRoot, rel), "utf8");
 
 /** A store whose pass returns whatever the test wants, counting the asks. */
-function fakeStore(notice: StoreRecovery | null, label = "Saved machines") {
+function fakeStore(notice: StoreRecovery | null, label = "Settings") {
   const calls = { ensureLoaded: 0, take: 0 };
   let held = notice;
   const store: RecoverableStore = {
@@ -79,21 +79,21 @@ function recorder() {
 const RECOVERED: StoreRecovery = {
   found: "unparseable",
   recovered: true,
-  note: "tervia-hosts.json was unparseable; restored from tervia-hosts.json.bak",
+  note: "subclave-settings.json was unparseable; restored from subclave-settings.json.bak",
 };
 const SNAPSHOT_FAILED: StoreRecovery = {
   found: "ok",
   recovered: false,
-  note: "tervia-vault.json.bak could not be written: EACCES",
+  note: "subclave-settings.json.bak could not be written: EACCES",
 };
 const NOTHING_TO_SAY: StoreRecovery = { found: "ok", recovered: false };
 
 // ---- the words ------------------------------------------------------------
 console.log("[copy] a recovery names the store and says where the data came from");
 {
-  const t = recoveryToast("Saved machines", RECOVERED);
+  const t = recoveryToast("Settings", RECOVERED);
   check("there is something to say", t !== null);
-  check("it names the store", !!t && t.message.startsWith("Saved machines:"), t?.message);
+  check("it names the store", !!t && t.message.startsWith("Settings:"), t?.message);
   check("it says the data came from a backup", !!t && /recovered from a backup/i.test(t.message));
   check(
     // The note is where the file names live; paraphrasing it here would be a
@@ -106,20 +106,9 @@ console.log("[copy] a recovery names the store and says where the data came from
   check(
     // Nothing in this app may suggest that storing a secret here makes it safer,
     // and a restored store is not a safer store - the snapshot is metadata from
-    // the last process start while the keychain is current.
+    // the last process start, not a freshness guarantee.
     "and it claims nothing about safety, protection or encryption",
     !!t && !/safe|secure|protect|encrypt/i.test(t.message),
-    t?.message,
-  );
-  check(
-    // The other half of the same honesty, and the one that costs a user
-    // something when it is missing: the file went back, the OS keychain did not,
-    // so a restored record's `hasPrivateKey` / `hasPassword` / `fingerprint` can
-    // name a secret that has since been deleted or rotated. Nothing in the app
-    // reconciles the two and nothing can enumerate the keychain to find out, so
-    // saying it is the whole of what is done about it.
-    "and it says the stored secrets did not come back with the file",
-    !!t && /not rolled back with it/.test(t.message),
     t?.message,
   );
   check(
@@ -138,15 +127,6 @@ console.log("[copy] a recovery names the store and says where the data came from
     !!t && !/recovered from a backup/i.test(t.message),
     t?.message,
   );
-  check(
-    // Nothing was rolled back on this branch, so the keychain cannot have
-    // diverged from anything. Warning here would be a warning about a hazard
-    // that is not present, on the toast a user sees when a `.bak` merely could
-    // not be written.
-    "nor does it warn about a rollback that did not happen",
-    !!t && !/not rolled back with it/.test(t.message),
-    t?.message,
-  );
 }
 check("a notice with no note says nothing at all", recoveryToast("Vault", NOTHING_TO_SAY) === null);
 
@@ -163,7 +143,7 @@ console.log("\n[startup] each store is asked once, and a recovery reaches the us
   // would double-drain the slot on a startup pass and this would catch it.
   check("and never separately drains via takeRecoveryNotice", calls.take === 0, calls);
   check("one toast, not none", said.length === 1, said);
-  check("naming the store", said[0]?.message.startsWith("Saved machines:"), said[0]?.message);
+  check("naming the store", said[0]?.message.startsWith("Settings:"), said[0]?.message);
 }
 {
   // The ordinary launch: nothing was wrong, so nothing is said. Without this
@@ -285,18 +265,18 @@ console.log("\n[wiring] source text: the hook exists, is mounted, and uses the r
     namedImportsFrom("App.tsx", app, "./hooks/useStoreRecoveryNotices") !== null,
   );
   check("App calls it", callsFunction("App.tsx", app, "useStoreRecoveryNotices"));
-  for (const [label, specifier, name] of [
-    ["hosts", "@/modules/hosts/store", "ensureHostsLoaded"],
-    ["vault", "@/modules/vault/store", "ensureVaultLoaded"],
-    ["forwards", "@/modules/forwards/store", "ensureForwardsLoaded"],
-  ] as const) {
-    const imported = namedImportsFrom("useStoreRecoveryNotices.ts", hook, specifier);
+  {
+    const imported = namedImportsFrom(
+      "useStoreRecoveryNotices.ts",
+      hook,
+      "@/modules/settings/load",
+    );
     // The IMPORT, not a call: the hook hands each store's loader to
     // `announceRecovery` as a value rather than calling it here, so a
     // call-expression pin would be about a shape this code does not have.
     check(
-      `the hook asks the ${label} store`,
-      imported !== null && imported.names.includes(name),
+      "the hook asks the settings store",
+      imported !== null && imported.names.includes("ensureSettingsLoaded"),
       imported?.names,
     );
   }
@@ -313,9 +293,9 @@ console.log("\n[wiring] source text: the hook exists, is mounted, and uses the r
 
 // ---- the list stays complete (structural) -------------------------------
 // The defect this whole script exists for was a list with a store missing from
-// it, and the two source-text checks above cannot catch the next one: they name
-// the three stores that ARE listed, so a fourth store added tomorrow passes them
-// all while saying nothing when it recovers.
+// it, and the source-text check above cannot catch the next one: it names the
+// store that IS listed, so a second store added tomorrow passes it while saying
+// nothing when it recovers.
 //
 // So: set EQUALITY between the modules that PRODUCE a recovery notice (every
 // `src/modules/*/store.ts` re-exporting `takeRecoveryNotice`, which is generic -
@@ -369,10 +349,10 @@ console.log("\n[complete] every store that produces a recovery notice is in the 
     return out;
   }
 
-  // Every `.ts` under `src/modules`, not just `<module>/store.ts`: the CLI-agent
-  // store lives at `modules/terminal/lib/cliAgents.ts`, and a producer set that
-  // only looked at store files would have missed it - which is this check's own
-  // failure mode, one level up.
+  // Every `.ts` under `src/modules`, not just `<module>/store.ts`, because a
+  // producer set that only looked at store files would miss one that lives
+  // elsewhere in its module - which is this check's own failure mode, one level
+  // up.
   function tsFilesUnder(dir: string): string[] {
     const out: string[] = [];
     for (const name of readdirSync(dir)) {

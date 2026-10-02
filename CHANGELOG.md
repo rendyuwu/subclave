@@ -1,15 +1,17 @@
 # Changelog
 
 The latest release only. Every earlier version:
-[GitHub Releases](https://github.com/rendyuwu/tervia/releases). Versions:
+[GitHub Releases](https://github.com/rendyuwu/subclave/releases). Versions:
 [SemVer](https://semver.org/); before `1.0` a minor bump may break things.
 
-## [0.1.3] - 28-09-2026
+## [0.1.0] - 03-10-2026
 
 ### Added
 
-- In an SSH session, the status bar can show live Linux host CPU, RAM, network, disk I/O, root filesystem usage, uptime and local ping. Its visibility choice is remembered across launches. Contributed by @okkinurf.
-
-### Fixed
-
-- A terminal pane's column count now matches its width after the renderer changes (the App opacity crossing the glass edge, turning the WebGL setting off or on, a lost GPU context) or the window moves to a display with another scale. Text no longer runs past the pane's right edge, typing near the edge no longer scrolls the pane sideways, and a new pane no longer starts a few columns narrower than it is.
+- Desktop app for macOS, Linux and Windows, derived from Tervia v0.1.3, with signed in-app updates.
+- Encrypted vault: one file sealed with AES-256-GCM under an Argon2id key, a `.bak` snapshot, master password change, idle and minimize auto-lock, and a tray icon.
+- Entries and nested groups with tags, favourites, expiry dates, search, Trash and per-entry version history.
+- Copy with clipboard auto-clear, TOTP codes, and a password generator with a strength meter.
+- End-to-end encrypted sync to your own S3-compatible bucket or WebDAV share, with a merge that keeps both sides of a conflict.
+- Browser extension for Chromium browsers and Firefox: pairing, an icon and picker inside login fields, popup fill, the fill command, "Generate for this site", and a save prompt that adds or updates a login typed on a page.
+- CSV import from KeePassXC, Bitwarden, Chrome and Firefox, CSV export, and encrypted `.subclave-backup` files.

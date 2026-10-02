@@ -1,0 +1,2 @@
+# Playwright's per-run artifacts (traces, error contexts, last-run.json).
+test-results/

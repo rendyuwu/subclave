@@ -27,9 +27,9 @@ type DistroKey = "debian" | "fedora";
 function distroCommand(key: DistroKey, version: string): string {
   switch (key) {
     case "debian":
-      return `sudo apt install ./Tervia_${version}_amd64.deb`;
+      return `sudo apt install ./Subclave_${version}_amd64.deb`;
     case "fedora":
-      return `sudo dnf install ./Tervia-${version}-1.x86_64.rpm`;
+      return `sudo dnf install ./Subclave-${version}-1.x86_64.rpm`;
     default: {
       const _exhaustive: never = key;
       return _exhaustive;
@@ -77,7 +77,7 @@ export function UpdaterDialog({
           {state.kind === "available" && (
             <>
               <p className="text-muted-foreground">
-                A new version of Tervia is available.{" "}
+                A new version of Subclave is available.{" "}
                 <span className="text-foreground font-medium">v{state.currentVersion}</span> →{" "}
                 <span className="text-foreground font-medium">v{state.version}</span>
                 {state.date ? (
@@ -154,7 +154,7 @@ export function UpdaterDialog({
 
           {state.kind === "ready" && (
             <p className="text-muted-foreground">
-              v{state.version} is installed. Restart Tervia to apply the update.
+              v{state.version} is installed. Restart Subclave to apply the update.
             </p>
           )}
 
@@ -172,7 +172,7 @@ export function UpdaterDialog({
           )}
 
           {state.kind === "idle" && (
-            <p className="text-muted-foreground">You're on the latest version of Tervia.</p>
+            <p className="text-muted-foreground">You're on the latest version of Subclave.</p>
           )}
         </div>
 

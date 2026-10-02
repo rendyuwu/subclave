@@ -5,20 +5,23 @@
 //! single named constant instead of a bare string literal.
 
 /// Rust -> Settings webview: focus a settings tab (payload: tab id string).
-pub const SETTINGS_TAB: &str = "tervia:settings-tab";
+pub const SETTINGS_TAB: &str = "subclave:settings-tab";
 
-/// Rust -> main window: open a path passed to the `tervia` CLI (single-instance forward).
-pub const OPEN_CLI_TARGET: &str = "tervia:open-cli-target";
+/// Vault locked (payload: `{ reason: "manual" | "idle" }`).
+pub const VAULT_LOCKED: &str = "subclave:vault-locked";
+/// Vault content changed (payload: `{ ids: string[], origin: "local" | "sync" }`).
+pub const VAULT_CHANGED: &str = "subclave:vault-changed";
+/// Main window regained focus (payload: `null`). The webview rate-limits the
+/// pull it triggers.
+pub const SYNC_FOCUSED: &str = "subclave:sync-focused";
+/// Vault write failed, or `null` when a retry succeeded.
+pub const VAULT_SAVE_FAILED: &str = "subclave:vault-save-failed";
+/// A browser extension asked to pair (payload:
+/// `{ requestId, browser, profileName, code }`). The main webview shows the
+/// pairing dialog and answers through `browser_pairing_respond`.
+pub const PAIRING_REQUEST: &str = "subclave:pairing-request";
 
-/// Rust -> main window: the `tervia --update` shim asks the UI to start updating.
-pub const TRIGGER_UPDATE: &str = "tervia:trigger-update";
-
-/// Rust -> main window: the window regained focus, which is when the sync
-/// scheduler may pull.
-///
-/// A SIGNAL, not a command: the rate limit lives on the frontend beside the
-/// debounce, because both of them measure the same thing and splitting them
-/// across the IPC boundary would put half the policy where the other half
-/// cannot see it. Emitted only for the `main` label - see the window event
-/// handler in `src-tauri/src/lib.rs` for why only one webview may apply.
-pub const SYNC_FOCUSED: &str = "tervia:sync-focused";
+/// Rust -> main webview: the app was asked to quit while a write is still
+/// pending. Payload: `null`. The webview owns the confirmation dialog and
+/// calls `quit_subclave` once the user decides.
+pub const QUIT_REQUESTED: &str = "subclave:quit-requested";

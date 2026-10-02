@@ -1,4 +1,4 @@
-import type { CustomTheme, ThemeColors } from "../customTheme";
+import type { CustomTheme, ThemeColors } from "../theme/model";
 import { DARK_COLORS, EMPTY_BG, LIGHT_COLORS } from "./base";
 
 // Solarized family.
@@ -35,31 +35,16 @@ const SOLARIZED_DARK: ThemeColors = {
   sidebarAccent: "#b58900",
   sidebarAccentForeground: "#002b36",
   iconWorking: "#b58900",
-  iconIdle: "#859900",
-  iconBlocked: "#dc322f",
-  iconDone: "#2aa198",
-  iconBranch: "#6c71c4",
   diffAdded: "#859900",
-  diffRemoved: "#dc322f",
   info: "#2aa198",
   resizeHandle: "#0e4150",
-  // Solarized ANSI 16 (shared between Dark + Light per author's spec).
-  ansiBlack: "#073642",
+  // Solarized ANSI accents (shared between Dark + Light per author's spec).
   ansiRed: "#dc322f",
   ansiGreen: "#859900",
   ansiYellow: "#b58900",
   ansiBlue: "#268bd2",
   ansiMagenta: "#d33682",
   ansiCyan: "#2aa198",
-  ansiWhite: "#eee8d5",
-  ansiBrightBlack: "#002b36",
-  ansiBrightRed: "#cb4b16",
-  ansiBrightGreen: "#586e75",
-  ansiBrightYellow: "#657b83",
-  ansiBrightBlue: "#839496",
-  ansiBrightMagenta: "#6c71c4",
-  ansiBrightCyan: "#93a1a1",
-  ansiBrightWhite: "#fdf6e3",
 };
 // Solarized Light. Gold accent (#b58900) on cream foreground (#fdf6e3) lands
 // at ~2:1 - failing AA even at large text. Foregrounds for accent/sidebar-
@@ -94,31 +79,16 @@ const SOLARIZED_LIGHT: ThemeColors = {
   sidebarAccent: "#b58900",
   sidebarAccentForeground: "#002b36",
   iconWorking: "#b58900",
-  iconIdle: "#859900",
-  iconBlocked: "#dc322f",
-  iconDone: "#2aa198",
-  iconBranch: "#6c71c4",
   diffAdded: "#859900",
-  diffRemoved: "#dc322f",
   info: "#2aa198",
   resizeHandle: "#d6d0bd",
-  // Solarized ANSI (shared with Dark).
-  ansiBlack: "#073642",
+  // Solarized ANSI accents (shared with Dark).
   ansiRed: "#dc322f",
   ansiGreen: "#859900",
   ansiYellow: "#b58900",
   ansiBlue: "#268bd2",
   ansiMagenta: "#d33682",
   ansiCyan: "#2aa198",
-  ansiWhite: "#eee8d5",
-  ansiBrightBlack: "#002b36",
-  ansiBrightRed: "#cb4b16",
-  ansiBrightGreen: "#586e75",
-  ansiBrightYellow: "#657b83",
-  ansiBrightBlue: "#839496",
-  ansiBrightMagenta: "#6c71c4",
-  ansiBrightCyan: "#93a1a1",
-  ansiBrightWhite: "#fdf6e3",
 };
 
 export const SOLARIZED: CustomTheme = {

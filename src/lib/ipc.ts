@@ -4,23 +4,10 @@
 // a hand-copied variant that dropped `image` previously caused real images to
 // be mishandled as "non-text" and skipped.
 
-/** Mirrors Rust `fs::file::ReadResult` (commands: fs_read_file, git_file_head, git_file_at). */
+/** Mirrors Rust `fs::file::ReadResult` (command: fs_read_file). */
 export type FsReadResult =
   | { kind: "text"; content: string; size: number }
   | { kind: "image"; dataUrl: string; mime: string; size: number }
-  | { kind: "binary"; size: number }
-  | { kind: "toolarge"; size: number; limit: number };
-
-/** Mirrors Rust `fs::file::ReadPortionResult` (command: fs_read_file_portion). No image variant. */
-export type FsReadPortionResult =
-  | {
-      kind: "text";
-      content: string;
-      size: number;
-      totalLines: number;
-      startLine: number;
-      endLine: number;
-    }
   | { kind: "binary"; size: number }
   | { kind: "toolarge"; size: number; limit: number };
 
@@ -28,22 +15,36 @@ export type FsReadPortionResult =
  * Names of Tauri events emitted by the RUST process and listened to on the TS
  * side. Magic strings on both sides drift silently (a typo just never fires),
  * so every TS listener references these constants. Mirror = the `emit(...)`
- * calls in src-tauri/src/lib.rs.
+ * calls on the Rust side (`src-tauri/src/commands.rs`,
+ * `src-tauri/src/windows.rs`, the vault modules).
  */
 export const IPC_EVENTS = {
   /** Rust -> Settings webview: focus a settings tab (payload: tab id string). */
-  SETTINGS_TAB: "tervia:settings-tab",
-  /** Rust -> main window: open a path passed to the `tervia` CLI (single-instance forward). */
-  OPEN_CLI_TARGET: "tervia:open-cli-target",
-  /** Rust -> main window: the `tervia --update` shim asks the UI to start updating. */
-  TRIGGER_UPDATE: "tervia:trigger-update",
+  SETTINGS_TAB: "subclave:settings-tab",
   /**
-   * Rust -> main window: the window regained focus, which is when the sync
-   * scheduler may pull.
-   *
-   * A SIGNAL, not a command. The rate limit lives on this side beside the push
-   * debounce, because both measure the same thing and splitting them across the
-   * IPC boundary would put half the policy where the other half cannot see it.
+   * Vault locked (payload: `{ reason: "manual" | "idle" | "minimize" | "tray" }`).
    */
-  SYNC_FOCUSED: "tervia:sync-focused",
+  VAULT_LOCKED: "subclave:vault-locked",
+  /**
+   * Vault content changed (payload:
+   * `{ ids: string[], origin: "local" | "sync" | "import" | "browser" }`).
+   */
+  VAULT_CHANGED: "subclave:vault-changed",
+  /**
+   * Rust -> main webview: a browser extension asked to pair. Payload:
+   * `{ requestId: string, browser: string, profileName: string, code: string }`.
+   */
+  PAIRING_REQUEST: "subclave:pairing-request",
+  /** Vault write failed, or `null` when a retry succeeded. */
+  VAULT_SAVE_FAILED: "subclave:vault-save-failed",
+  /**
+   * Rust -> main webview: a quit was requested while a save is still failing.
+   * The webview confirms, then calls `quit_subclave`. Payload: `null`.
+   */
+  QUIT_REQUESTED: "subclave:quit-requested",
+  /**
+   * Rust -> main webview: the main window regained focus. The sync module
+   * rate-limits its own pulls, so this fires on every focus. Payload: `null`.
+   */
+  SYNC_FOCUSED: "subclave:sync-focused",
 } as const;

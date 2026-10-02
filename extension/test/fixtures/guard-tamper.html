@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guard: host tampering</title>
+  </head>
+  <body>
+    <form>
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      // The extension's host is the last child of <html>.
+      window.__tamperAttr = () => {
+        document.documentElement.lastElementChild.setAttribute("style", "opacity: 0.5");
+      };
+      window.__tamperMove = () => {
+        document.documentElement.insertBefore(
+          document.documentElement.lastElementChild,
+          document.body,
+        );
+      };
+    </script>
+  </body>
+</html>

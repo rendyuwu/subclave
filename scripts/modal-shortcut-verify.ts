@@ -274,7 +274,7 @@ const useGlobalShortcuts = read("src/modules/shortcuts/lib/useGlobalShortcuts.ts
     /if\s*\(\s*isModalOpen\(\)\s*&&\s*\(\s*mayActOn === undefined\s*\|\|\s*!isTopModal\(mayActOn\)\s*\)\s*\)\s*return\s*;/.exec(
       onKeyBody,
     );
-  const handlerCallIdx = onKeyBody.indexOf("h(e);");
+  const handlerCallIdx = onKeyBody.indexOf("h();");
   check("onKey checks isMatch before deciding anything else", continueIdx !== -1);
   check(
     "onKey gates on isModalOpen() plus the matched chord's topmost target",

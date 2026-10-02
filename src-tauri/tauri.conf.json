@@ -1,37 +1,38 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Tervia",
-  "mainBinaryName": "TerviaApp",
-  "version": "0.1.3",
-  "identifier": "dev.rendy.tervia",
+  "productName": "Subclave",
+  "mainBinaryName": "SubclaveApp",
+  "version": "0.1.0",
+  "identifier": "dev.rendy.subclave",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm build:sidecar:dev && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:sidecar && pnpm build",
     "frontendDist": "../dist",
     "removeUnusedCommands": true
   },
   "app": {
     "windows": [
       {
-        "title": "Tervia",
+        "title": "Subclave",
         "width": 800,
         "height": 600,
         "minWidth": 640,
         "minHeight": 480,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "visible": false
+        "visible": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
     "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/subclave-proxy"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -45,16 +46,10 @@
     "linux": {
       "deb": {
         "section": "utils",
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"],
-        "desktopTemplate": "tervia.desktop",
-        "postInstallScript": "scripts/linux-postinstall.sh",
-        "preRemoveScript": "scripts/linux-preremove.sh"
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libayatana-appindicator3-1"]
       },
       "rpm": {
-        "depends": ["webkit2gtk4.1", "gtk3"],
-        "desktopTemplate": "tervia.desktop",
-        "postInstallScript": "scripts/linux-postinstall.sh",
-        "preRemoveScript": "scripts/linux-preremove.sh"
+        "depends": ["webkit2gtk4.1", "gtk3", "libayatana-appindicator-gtk3"]
       },
       "appimage": {
         "bundleMediaFramework": true
@@ -68,18 +63,18 @@
         "installerIcon": "icons/icon.ico"
       }
     },
-    "category": "DeveloperTool",
-    "copyright": "Copyright © 2026 rendyuwu. Derived from TEDI © 2026 IlhamriSKY, itself derived from Terax © 2026 Crynta. Apache License 2.0.",
+    "category": "Utility",
+    "copyright": "Copyright © 2026 rendyuwu. Derived from Tervia © 2026 rendyuwu, TEDI © 2026 IlhamriSKY and Terax © 2026 Crynta. Apache License 2.0.",
     "licenseFile": "../LICENSE",
-    "shortDescription": "Remote machine client",
-    "longDescription": "Tervia is a lightweight desktop client for remote machines: SSH sessions, port forwarding, SFTP browsing, and an encrypted backup of your saved connections."
+    "shortDescription": "Local-first password manager",
+    "longDescription": "Subclave is a local-first desktop password vault with end-to-end encrypted sync to storage you own."
   },
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/rendyuwu/tervia/releases/latest/download/latest.json"
+        "https://github.com/rendyuwu/subclave/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk4RTM5MTA2QTBDOUFEQTgKUldTb3JjbWdCcEhqbUlxbGJ5R01IMTE3UjczSklLM3VxR0VGSFJUZWs3dlljellCaWdVVFVPd20K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NEZEMkU4QTM2QjQ5QzkKUldUSlNXdWo2TkpQcVlzUXlIczI1TlE3QlVuTXJ3YXJKUW5ZOGRQUGFlVjZvenNNUzFPK1lMcGMK",
       "windows": {
         "installMode": "passive"
       }

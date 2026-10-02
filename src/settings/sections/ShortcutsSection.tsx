@@ -1,21 +1,14 @@
 import { Button } from "@/components/ui/button";
-import { IconTooltip } from "@/components/ui/icon-tooltip";
 import { Input } from "@/components/ui/input";
-import { Kbd, KbdGroup } from "@/components/ui/kbd";
-import { DESTRUCTIVE_ACTION } from "@/lib/toolbarButton";
-import { cn } from "@/lib/utils";
 import { usePreferencesStore } from "@/modules/settings/preferences";
-import { setShortcuts } from "@/modules/settings/store";
+import { setShortcuts } from "@/modules/settings/mutations";
 import {
-  canonicalKeyFromEvent,
-  getBindingTokens,
   SHORTCUTS,
   SHORTCUT_GROUPS,
   type KeyBinding,
-  type Shortcut,
   type ShortcutId,
 } from "@/modules/shortcuts/shortcuts";
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useMemo, useState } from "react";
 import { SectionHeader } from "../components/SectionHeader";
 import {
   AlertDialog,
@@ -27,7 +20,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { CornerUpLeft, Search, Trash2 } from "lucide-react";
+import { CornerUpLeft, Search } from "lucide-react";
+import { ShortcutRow } from "./shortcuts/ShortcutRow";
 
 export function ShortcutsSection() {
   const userShortcuts = usePreferencesStore((s) => s.shortcuts);
@@ -36,8 +30,7 @@ export function ShortcutsSection() {
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
 
   const filteredShortcuts = useMemo(() => {
-    // Filter out non-overridable shortcuts like tab.selectByIndex.
-    const base = SHORTCUTS.filter((s) => s.id !== "tab.selectByIndex");
+    const base = SHORTCUTS;
     if (!search) return base;
     const lower = search.toLowerCase();
     return base.filter(
@@ -146,181 +139,6 @@ export function ShortcutsSection() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
-  );
-}
-
-function ShortcutRow({
-  shortcut,
-  isRecording,
-  onStartRecording,
-  onStopRecording,
-  onRecord,
-  onClear,
-  onReset,
-  userBindings,
-}: {
-  shortcut: Shortcut;
-  isRecording: boolean;
-  onStartRecording: () => void;
-  onStopRecording: () => void;
-  onRecord: (b: KeyBinding) => void;
-  onClear: () => void;
-  onReset: () => void;
-  userBindings?: KeyBinding[];
-}) {
-  const bindings = userBindings !== undefined ? userBindings : shortcut.defaultBindings;
-  const isModified = userBindings !== undefined;
-  const hasBindings = bindings && bindings.length > 0;
-  const isReadOnly = !!shortcut.readOnly;
-
-  return (
-    <div className="group hover:bg-muted/30 flex items-center justify-between px-3 py-2.5 transition-colors">
-      <div className="flex flex-col gap-0.5">
-        <span className="text-[12.5px] font-medium">{shortcut.label}</span>
-        {isReadOnly ? (
-          <span className="text-muted-foreground text-[10.5px]">Built-in. Not rebindable.</span>
-        ) : null}
-      </div>
-
-      <div className="flex items-center gap-2">
-        {isRecording && !isReadOnly ? (
-          <Recorder onRecord={onRecord} onCancel={onStopRecording} />
-        ) : (
-          <>
-            <div
-              role={isReadOnly ? undefined : "button"}
-              tabIndex={isReadOnly ? undefined : 0}
-              onClick={isReadOnly ? undefined : onStartRecording}
-              onKeyDown={
-                isReadOnly
-                  ? undefined
-                  : (e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        onStartRecording();
-                      }
-                    }
-              }
-              className={
-                isReadOnly
-                  ? "flex min-w-[100px] items-center justify-end gap-1"
-                  : "flex min-w-[100px] cursor-pointer items-center justify-end gap-1"
-              }
-            >
-              {hasBindings ? (
-                <KbdGroup>
-                  {getBindingTokens(bindings[0]).map((t, i) => (
-                    <Kbd
-                      key={i}
-                      className={
-                        isReadOnly
-                          ? "opacity-80"
-                          : "group-hover:bg-accent group-hover:text-accent-foreground transition-colors"
-                      }
-                    >
-                      {t}
-                    </Kbd>
-                  ))}
-                </KbdGroup>
-              ) : (
-                <span className="text-muted-foreground text-[11px] italic">Unassigned</span>
-              )}
-            </div>
-
-            {isReadOnly ? null : (
-              <div className="flex items-center gap-1">
-                {isModified && (
-                  <IconTooltip label="Reset to default" side="left">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="text-muted-foreground hover:text-foreground size-7"
-                      onClick={onReset}
-                      aria-label="Reset to default"
-                    >
-                      <CornerUpLeft size={12} />
-                    </Button>
-                  </IconTooltip>
-                )}
-                <IconTooltip label="Clear shortcut" side="left">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                      DESTRUCTIVE_ACTION,
-                      "size-7 opacity-0 transition-opacity group-hover:opacity-100",
-                    )}
-                    onClick={onClear}
-                    aria-label="Clear shortcut"
-                  >
-                    <Trash2 size={12} />
-                  </Button>
-                </IconTooltip>
-              </div>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Recorder({
-  onRecord,
-  onCancel,
-}: {
-  onRecord: (b: KeyBinding) => void;
-  onCancel: () => void;
-}) {
-  const onRecordRef = useRef(onRecord);
-  const onCancelRef = useRef(onCancel);
-  useEffect(() => {
-    onRecordRef.current = onRecord;
-    onCancelRef.current = onCancel;
-  });
-
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-
-      if (e.key === "Escape") {
-        onCancelRef.current();
-        return;
-      }
-
-      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
-
-      // Require at least one primary modifier (Ctrl, Alt, Meta). Reject
-      // Shift-only shortcuts that would insert a character.
-      const hasPrimaryModifier = e.ctrlKey || e.altKey || e.metaKey;
-      const isCharacterKey = e.key.length === 1; // anything that types a glyph
-      // Blocks shortcuts like Shift+2 ("@") and Shift+, ("<") on many layouts.
-      if (!hasPrimaryModifier && (!e.shiftKey || isCharacterKey)) {
-        return;
-      }
-      // Record the canonical, layout-independent key. Option+Z on macOS or
-      // Ctrl+T on a Cyrillic layout would otherwise store the glyph and never re-fire.
-      onRecordRef.current({
-        key: canonicalKeyFromEvent(e),
-        ctrl: e.ctrlKey,
-        shift: e.shiftKey,
-        alt: e.altKey,
-        meta: e.metaKey,
-      });
-    };
-
-    window.addEventListener("keydown", onDown, { capture: true });
-    return () => {
-      window.removeEventListener("keydown", onDown, { capture: true });
-    };
-  }, []);
-
-  return (
-    <div className="bg-accent/50 ring-accent flex items-center gap-2 rounded px-2 py-1 text-[11px] ring-1">
-      <span className="animate-pulse font-medium">Recording…</span>
-      <span className="text-muted-foreground">(Esc to cancel)</span>
     </div>
   );
 }

@@ -9,7 +9,7 @@
 // blocks a release.
 import { readFileSync } from "node:fs";
 
-const REPO = "https://github.com/rendyuwu/tervia";
+const REPO = "https://github.com/rendyuwu/subclave";
 
 const version = (process.argv[2] ?? "").replace(/^v/, "").trim();
 if (!version) {
@@ -46,10 +46,10 @@ const body = section || `Release ${version}. All releases: ${REPO}/releases`;
 const footer = [
   "---",
   "",
-  '**macOS users:** if Gatekeeper says Tervia "can\'t be opened because Apple cannot check it for malicious software" or "is damaged and can\'t be opened", drag the app to `/Applications` and run this once in Terminal:',
+  '**macOS users:** if Gatekeeper says Subclave "can\'t be opened because Apple cannot check it for malicious software" or "is damaged and can\'t be opened", drag the app to `/Applications` and run this once in Terminal:',
   "",
   "```",
-  "xattr -cr /Applications/Tervia.app",
+  "xattr -cr /Applications/Subclave.app",
   "```",
 ].join("\n");
 

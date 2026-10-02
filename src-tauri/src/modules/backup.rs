@@ -1,721 +1,639 @@
-//! Passphrase-encrypted blobs for the connection backup, reached from the
-//! Hosts page's Export button.
+//! Encrypted backups: the `.subclave-backup` export, its preview and its apply.
 //!
-//! An exported backup carries every credential that lives in the OS keychain -
-//! SSH passwords, private keys and key passphrases; RDP passwords; vault
-//! identity passwords; and vault key bodies and their passphrases - so it can
-//! never be written as plaintext: the file ends up on a USB stick, in
-//! Downloads, or in a synced folder. This module plus
-//! `src-tauri/src/modules/aesgcm.rs` is the whole crypto surface; everything
-//! above it in JS handles only the already-sealed blob.
-//!
-//! One format lives here (`tervia-connections`), and it seals the WHOLE
-//! payload - five collections (hosts, groups, identities, keys, forward
-//! rules) and every credential - so the plaintext never leaves this process.
-//! On export, JS passes keychain REFERENCES and [`backup_seal_payload`] reads
-//! the values itself. On import, [`backup_open_payload`] returns only the
-//! metadata - the five collections with no credential in them - and parks the
-//! credentials here behind a handle; JS validates the metadata, says which
-//! ids survived, and [`backup_apply_secrets`] writes those straight to the
-//! keychain. That is the same property `rdp_open`'s keychain reference exists
-//! to protect, extended to the backup path. There used to be an exception - an
-//! older format handed decrypted credentials back to JS - and there no longer
-//! is one.
-//!
-//! Not solved here: the decrypted plaintext is ordinary `String`/`serde_json`
-//! data and is dropped unscrubbed. The keychain values this module reads are
-//! `Zeroizing<String>`, but the `serde_json::Value` tree and the `String`
-//! payload built around them are plain heap data, so a credential folded into
-//! one outlives its use until the allocator reuses the page.
-//!
-//! This lives in the host process rather than the webview because
-//! `crypto.subtle` is gated to secure contexts and the app origin is plain
-//! http (the same reason `crypto.randomUUID` is unavailable).
-//!
-//! Construction: PBKDF2-HMAC-SHA256 over the passphrase with a random 16-byte
-//! salt, then AES-256-GCM with a random 12-byte nonce - the second half in
-//! `src-tauri/src/modules/aesgcm.rs`, shared with the sync module. Salt and
-//! nonce are generated per seal and stored beside the ciphertext; neither is
-//! secret.
-//! GCM's authentication tag is what makes a wrong passphrase, a truncated
-//! file, or a flipped byte all fail closed as "wrong passphrase or corrupt
-//! file" rather than yielding garbage that the importer would try to parse.
+//! A backup is a [`VaultFile`] with `format: "subclave-backup"` whose
+//! ciphertext is a [`BackupPayload`] (entries and groups, nothing else) under
+//! AES-256-GCM with a key derived from the backup passphrase by Argon2id. The
+//! header is the associated data, as in the vault file. A preview stages the
+//! decoded records in `Unlocked.staged`; the apply merges each one through
+//! `merge_into_payload`, the path a sync pull lands records through.
+
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use ring::{
-    aead::NONCE_LEN,
-    pbkdf2,
-    rand::{SecureRandom, SystemRandom},
-};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex};
 use tauri::AppHandle;
+use zeroize::Zeroizing;
 
-use crate::modules::aesgcm::{open_with_key, seal_with_key};
-use crate::modules::secrets::{read_secret, write_secrets, SecretsState};
+use crate::modules::aesgcm;
+use crate::modules::fs::atomic;
+use crate::modules::strength::strength_of;
+use crate::modules::sync::engine::payload::{
+    entry_envelope, group_envelope, local_envelope, merge_into_payload,
+};
+use crate::modules::sync::model::{ENTRY_KIND, GROUP_KIND};
+use crate::modules::vault::events::{emit_changed, run_blocking};
+use crate::modules::vault::file::{header_aad, VaultFile};
+use crate::modules::vault::kdf::{derive_key, fresh_params, Argon2Params};
+use crate::modules::vault::model::{Entry, Group, VaultPayload};
+use crate::modules::vault::state::{commit, now_ms, VaultState, LOCKED_ERR};
+use crate::modules::vault::{next_stage_handle, replace_staged, vault_dir, Staged, StagedSource};
 
-/// Deliberately high: the passphrase is user-chosen and the file is offline,
-/// so an attacker gets unlimited guesses. OWASP's 2023 floor for
-/// PBKDF2-HMAC-SHA256 is 600k. Stored in the envelope rather than hardcoded on
-/// the read path so raising it later still opens older backups.
-const PBKDF2_ITERATIONS: u32 = 600_000;
-const SALT_LEN: usize = 16;
+const FORMAT: &str = "subclave-backup";
+const FORMAT_VERSION: u32 = 1;
+const NOT_A_BACKUP: &str = "backup: not a Subclave backup file";
+/// Wrong passphrase, tampered bytes and truncation share one message, as the
+/// vault file's do: telling them apart tells an attacker which guess was
+/// closer.
+const CORRUPT: &str = "backup: wrong passphrase, or the file is corrupt";
+const GONE: &str = "backup: this preview is gone; open the file again";
 
+/// What the ciphertext holds: entries and groups only, never `DeviceState`
+/// (sync credentials, paired browsers) and never tombstones, so a restore
+/// cannot delete anything. `Cow` lets the seal borrow the snapshot's records
+/// instead of copying the plaintext a second time.
 #[derive(Serialize, Deserialize)]
-pub struct SealedBlob {
-    /// Named so a future format change is a value check, not a guess.
-    pub kdf: String,
-    pub iterations: u32,
-    pub salt: String,
-    pub nonce: String,
-    pub ciphertext: String,
+#[serde(rename_all = "camelCase")]
+struct BackupPayload<'a> {
+    entries: Cow<'a, [Entry]>,
+    groups: Cow<'a, [Group]>,
 }
 
-fn derive_key(passphrase: &str, salt: &[u8], iterations: u32) -> Result<[u8; 32], String> {
-    let iters =
-        NonZeroU32::new(iterations).ok_or_else(|| "backup: iteration count is zero".to_string())?;
-    let mut key = [0u8; 32];
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iters,
-        salt,
-        passphrase.as_bytes(),
-        &mut key,
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupPreview {
+    handle: u32,
+    added: usize,
+    newer: usize,
+    older: usize,
+    same: usize,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupApplied {
+    added: usize,
+    updated: usize,
+}
+
+fn seal_backup(
+    entries: &[Entry],
+    groups: &[Group],
+    passphrase: &str,
+    kdf: &Argon2Params,
+) -> Result<VaultFile, String> {
+    let key = derive_key(passphrase, kdf)?;
+    let json = Zeroizing::new(
+        serde_json::to_vec(&BackupPayload {
+            entries: Cow::Borrowed(entries),
+            groups: Cow::Borrowed(groups),
+        })
+        .map_err(|e| format!("backup: {e}"))?,
     );
-    Ok(key)
-}
-
-/// Encrypt `plaintext` under `passphrase`. Returns the blob to embed in the
-/// export file. An empty passphrase is refused here rather than in the UI so
-/// the guarantee holds no matter which caller reaches this.
-///
-/// Not a command: exports go through [`backup_seal_payload`], which is the
-/// only caller, so there is no reason to expose a general-purpose encrypt-this
-/// entry point to the webview.
-fn seal_blob(plaintext: String, passphrase: &str) -> Result<SealedBlob, String> {
-    if passphrase.is_empty() {
-        return Err("backup: a passphrase is required".into());
-    }
-    let mut salt = [0u8; SALT_LEN];
-    SystemRandom::new()
-        .fill(&mut salt)
-        .map_err(|_| "backup: random salt failed".to_string())?;
-
-    let key = derive_key(passphrase, &salt, PBKDF2_ITERATIONS)?;
-    let (nonce, buf) = seal_with_key(&key, plaintext.as_bytes())?;
-
-    Ok(SealedBlob {
-        kdf: "pbkdf2-hmac-sha256".into(),
-        iterations: PBKDF2_ITERATIONS,
-        salt: B64.encode(salt),
+    let (nonce, ciphertext) =
+        aesgcm::seal_with_key(&key, &header_aad(FORMAT, FORMAT_VERSION, kdf), &json)?;
+    Ok(VaultFile {
+        format: FORMAT.to_string(),
+        v: FORMAT_VERSION,
+        kdf: kdf.clone(),
         nonce: B64.encode(nonce),
-        ciphertext: B64.encode(&buf),
+        ciphertext: B64.encode(ciphertext),
     })
 }
 
-/// Decrypt a blob produced by [`seal_blob`]. Every failure below - wrong
-/// passphrase, tampered ciphertext, truncated file - is reported with the same
-/// message on purpose: distinguishing them tells an attacker which guess was
-/// closer, and none of them is separately actionable for the user.
-fn open_blob(blob: SealedBlob, passphrase: &str) -> Result<String, String> {
-    if blob.kdf != "pbkdf2-hmac-sha256" {
-        return Err(format!(
-            "backup: unsupported key derivation \"{}\"",
-            blob.kdf
-        ));
+/// Checks in order: format, version, KDF header, then the key and the GCM
+/// tag, then the payload shape.
+fn open_backup(file: &VaultFile, passphrase: &str) -> Result<(Vec<Entry>, Vec<Group>), String> {
+    if file.format != FORMAT {
+        return Err(NOT_A_BACKUP.to_string());
     }
-    let salt = B64
-        .decode(&blob.salt)
-        .map_err(|_| "backup: malformed salt".to_string())?;
-    let nonce_bytes = B64
-        .decode(&blob.nonce)
-        .map_err(|_| "backup: malformed nonce".to_string())?;
-    let buf = B64
-        .decode(&blob.ciphertext)
-        .map_err(|_| "backup: malformed ciphertext".to_string())?;
-    let nonce: [u8; NONCE_LEN] = nonce_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "backup: malformed nonce".to_string())?;
-
-    let key = derive_key(passphrase, &salt, blob.iterations)?;
-    let plain = open_with_key(&key, &nonce, buf, "backup")?;
-    String::from_utf8(plain).map_err(|_| "backup: decrypted data is not valid UTF-8".into())
+    if file.v > FORMAT_VERSION {
+        return Err("backup: this backup was written by a newer Subclave".to_string());
+    }
+    // `derive_key` runs `check_params` first; a bad salt or argon2's own
+    // refusal is a header fault all the same.
+    let key = derive_key(passphrase, &file.kdf)
+        .map_err(|_| "backup: the backup's key settings are not accepted".to_string())?;
+    let nonce: [u8; 12] = B64
+        .decode(&file.nonce)
+        .ok()
+        .and_then(|n| n.try_into().ok())
+        .ok_or_else(|| CORRUPT.to_string())?;
+    let ciphertext = B64
+        .decode(&file.ciphertext)
+        .map_err(|_| CORRUPT.to_string())?;
+    let plain = aesgcm::open_with_key(
+        &key,
+        &header_aad(FORMAT, file.v, &file.kdf),
+        &nonce,
+        ciphertext,
+        "backup",
+    )?;
+    let payload: BackupPayload = serde_json::from_slice(&plain)
+        .map_err(|_| "backup: the backup file is corrupt".to_string())?;
+    Ok((payload.entries.into_owned(), payload.groups.into_owned()))
 }
 
-/// Where one secret lives in the keychain, and where it belongs inside the
-/// sealed payload.
-///
-/// The same shape on the way out and the way back in. `group`, `id` and `field`
-/// are the three levels of the path inside the payload JSON and are supplied by
-/// the caller verbatim, so this module holds no knowledge of either protocol's
-/// field names - `password` versus `privateKey`, or which of `hostSecrets`,
-/// `identitySecrets` and `keySecrets` a credential belongs to - all decided in
-/// `src/modules/backup/file.ts`.
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretRef {
-    /// Top-level key of the payload object, e.g. `hostSecrets` or `keySecrets`.
-    group: String,
-    /// Connection id: the second level.
-    id: String,
-    /// Field name: the third level, e.g. `password`.
-    field: String,
-    service: String,
-    account: String,
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic::atomic_write_private(path, bytes)
+        .map_err(|e| format!("backup: could not write the file: {e}"))
 }
 
-/// Insert `values` into `payload` at each ref's `group`/`id`/`field` path.
-///
-/// Refuses to write into a group the payload already carries. That guard is not
-/// theoretical bookkeeping: the caller sends five inventory collections - hosts,
-/// groups, identities, keys, rules - and a secret group is meant to never match
-/// one of those names. This is the guard against exactly that: without it, a
-/// `group` that collided with `hosts` would replace the whole host inventory
-/// with a credential map, and the export would still report success.
-fn merge_secrets(
-    payload: &str,
-    values: &[(SecretRef, zeroize::Zeroizing<String>)],
-) -> Result<String, String> {
-    let mut root: Map<String, Value> = serde_json::from_str(payload)
-        .map_err(|_| "backup: the payload is not a JSON object".to_string())?;
-    for (r, _) in values {
-        if root.contains_key(&r.group) {
-            return Err(format!(
-                "backup: the payload already carries a \"{}\" key",
-                r.group
-            ));
-        }
-    }
-    for (r, value) in values {
-        let group = root
-            .entry(r.group.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        let Some(group) = group.as_object_mut() else {
-            continue;
-        };
-        let entry = group
-            .entry(r.id.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(entry) = entry.as_object_mut() {
-            entry.insert(r.field.clone(), Value::String(value.to_string()));
-        }
-    }
-    serde_json::to_string(&Value::Object(root)).map_err(|e| e.to_string())
-}
-
-/// Seal a payload, reading every credential out of the keychain here rather
-/// than taking it from the caller.
-///
-/// `payload` is the caller's inventory as JSON - today the five collections
-/// (hosts, groups, identities, keys, forward rules). That parenthesis describes
-/// the one caller there is, not this parameter's contract: nothing here reads a
-/// collection name, for the same reason [`SecretRef`] takes its `group` from the
-/// caller verbatim, so a sixth collection or a different inventory sealed
-/// through this command needs no change on this side. `refs` say which keychain
-/// entries to fold into it. A reference that resolves to nothing is skipped, not
-/// an error - a connection whose password was never saved is ordinary.
 #[tauri::command]
-pub async fn backup_seal_payload(
-    app: AppHandle,
-    state: tauri::State<'_, SecretsState>,
-    payload: String,
-    refs: Vec<SecretRef>,
-    passphrase: String,
-) -> Result<SealedBlob, String> {
+pub async fn backup_export(app: AppHandle, path: String, passphrase: String) -> Result<(), String> {
+    run_blocking(&app, move |state| {
+        backup_export_inner(state, Path::new(&path), &passphrase)
+    })
+    .await
+}
+
+/// The passphrase rule is the sync passphrase's: refused below zxcvbn score
+/// 3. The key derivation runs after the vault mutex is released, on a
+/// snapshot that is wiped on every path.
+pub(crate) fn backup_export_inner(
+    state: &VaultState,
+    path: &Path,
+    passphrase: &str,
+) -> Result<(), String> {
     if passphrase.is_empty() {
-        return Err("backup: a passphrase is required".into());
+        return Err("backup: a passphrase is required".to_string());
     }
-    let mut values: Vec<(SecretRef, zeroize::Zeroizing<String>)> = Vec::new();
-    for r in refs {
-        // A keychain read that FAILS is propagated rather than skipped: an
-        // export that silently omits a credential is worse than one that
-        // refuses, because the file looks complete until the day it is needed.
-        if let Some(v) = read_secret(&app, &state, &r.service, &r.account)? {
-            if !v.is_empty() {
-                values.push((r, v));
+    let strength = strength_of(passphrase);
+    if strength.score < 3 {
+        return Err(match strength.warning {
+            Some(warning) => format!("backup: the passphrase is too weak: {warning}"),
+            None => "backup: the passphrase is too weak".to_string(),
+        });
+    }
+    let mut snapshot = {
+        let guard = state.access()?;
+        let unlocked = guard.as_ref().ok_or_else(|| LOCKED_ERR.to_string())?;
+        let mut entries = unlocked.payload.entries.clone();
+        for entry in &mut entries {
+            // Device-local: when this machine last filled the entry.
+            entry.last_used_at = None;
+        }
+        VaultPayload {
+            entries,
+            groups: unlocked.payload.groups.clone(),
+            ..Default::default()
+        }
+    };
+    let result = fresh_params()
+        .and_then(|kdf| seal_backup(&snapshot.entries, &snapshot.groups, passphrase, &kdf))
+        .and_then(|file| serde_json::to_vec(&file).map_err(|e| format!("backup: {e}")))
+        .and_then(|bytes| write_file(path, &bytes));
+    snapshot.wipe();
+    result
+}
+
+#[tauri::command]
+pub async fn backup_import_preview(
+    app: AppHandle,
+    path: String,
+    passphrase: String,
+) -> Result<BackupPreview, String> {
+    run_blocking(&app, move |state| {
+        backup_import_preview_inner(state, Path::new(&path), &passphrase)
+    })
+    .await
+}
+
+/// Classify each backup entry against the vault on stamps alone: history is
+/// not compared, so an entry whose history grew without a new stamp reads as
+/// same. Groups are merged at apply but not counted.
+pub(crate) fn backup_import_preview_inner(
+    state: &VaultState,
+    path: &Path,
+    passphrase: &str,
+) -> Result<BackupPreview, String> {
+    if state.access()?.is_none() {
+        return Err(LOCKED_ERR.to_string());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("backup: could not read the file: {e}"))?;
+    let file: VaultFile = serde_json::from_slice(&bytes).map_err(|_| NOT_A_BACKUP.to_string())?;
+    let (entries, groups) = open_backup(&file, passphrase)?;
+    let mut records = VaultPayload {
+        entries,
+        groups,
+        ..Default::default()
+    };
+
+    let mut guard = match state.access() {
+        Ok(guard) => guard,
+        Err(e) => {
+            records.wipe();
+            return Err(e);
+        }
+    };
+    let Some(unlocked) = guard.as_mut() else {
+        records.wipe();
+        return Err(LOCKED_ERR.to_string());
+    };
+    let now = now_ms();
+    let mut preview = BackupPreview {
+        handle: next_stage_handle(),
+        added: 0,
+        newer: 0,
+        older: 0,
+        same: 0,
+    };
+    for entry in &records.entries {
+        match local_envelope(&unlocked.payload, ENTRY_KIND, &entry.id, now) {
+            None => preview.added += 1,
+            // A tie goes to the delete on apply, as in the merge.
+            Some(local) if local.deleted => {
+                if entry.updated_at > local.updated_at.unwrap_or(0) {
+                    preview.added += 1;
+                } else {
+                    preview.older += 1;
+                }
+            }
+            Some(local) => match entry.updated_at.cmp(&local.updated_at.unwrap_or(0)) {
+                Ordering::Greater => preview.newer += 1,
+                Ordering::Less => preview.older += 1,
+                Ordering::Equal => preview.same += 1,
+            },
+        }
+    }
+    replace_staged(
+        unlocked,
+        Staged {
+            handle: preview.handle,
+            source: StagedSource::Backup,
+            records: Some(records),
+        },
+    );
+    Ok(preview)
+}
+
+#[tauri::command]
+pub async fn backup_import_apply(app: AppHandle, handle: u32) -> Result<BackupApplied, String> {
+    let dir = vault_dir(&app)?;
+    let result = run_blocking(&app, move |state| {
+        backup_import_apply_inner(state, &dir, handle)
+    })
+    .await;
+    if result.is_ok() {
+        emit_changed(&app, &[], "import");
+    }
+    result
+}
+
+/// Merge every staged record into the vault, groups first so entries land
+/// under them. The merge keeps the newer copy current and puts the other into
+/// history as `conflict`; a local tombstone newer than the backup copy wins.
+/// `updated` counts live entries whose stored form changed, `added` the rest.
+pub(crate) fn backup_import_apply_inner(
+    state: &VaultState,
+    dir: &Path,
+    handle: u32,
+) -> Result<BackupApplied, String> {
+    state.ensure_writable()?;
+    let mut guard = state.access()?;
+    let unlocked = guard.as_mut().ok_or_else(|| LOCKED_ERR.to_string())?;
+    let mut records = match unlocked.staged.take() {
+        Some(Staged {
+            handle: staged,
+            source: StagedSource::Backup,
+            records: Some(records),
+        }) if staged == handle => records,
+        other => {
+            unlocked.staged = other;
+            return Err(GONE.to_string());
+        }
+    };
+    let payload = &mut unlocked.payload;
+    let now = now_ms();
+    let mut applied = BackupApplied {
+        added: 0,
+        updated: 0,
+    };
+    // `Err` names a record this build refuses to store; unreachable for
+    // records that deserialized as `Entry` and `Group`, so it is skipped.
+    for group in &records.groups {
+        if matches!(
+            merge_into_payload(payload, &group_envelope(group), now),
+            Ok(true)
+        ) {
+            payload.device.sync.mark_dirty(GROUP_KIND, &group.id);
+        }
+    }
+    for entry in &records.entries {
+        let was_live =
+            local_envelope(payload, ENTRY_KIND, &entry.id, now).is_some_and(|l| !l.deleted);
+        if matches!(
+            merge_into_payload(payload, &entry_envelope(entry), now),
+            Ok(true)
+        ) {
+            payload.device.sync.mark_dirty(ENTRY_KIND, &entry.id);
+            if was_live {
+                applied.updated += 1;
+            } else {
+                applied.added += 1;
             }
         }
     }
-    let plaintext = merge_secrets(&payload, &values)?;
-    seal_blob(plaintext, &passphrase)
-}
-
-/// Credentials decrypted out of a backup, waiting for the importer to say
-/// which connection ids survived validation.
-struct Held {
-    groups: Map<String, Value>,
-}
-
-/// Parked payloads, oldest first.
-///
-/// Process-global rather than Tauri-managed state so the whole import path
-/// stays inside this module. The cap is what bounds the damage if a caller ever
-/// fails to release: an abandoned import holds its credentials until four more
-/// imports have run, not until the app exits.
-static HELD: LazyLock<Mutex<Vec<(u32, Held)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
-const MAX_HELD: usize = 4;
-
-fn hold(groups: Map<String, Value>) -> Result<u32, String> {
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let mut store = HELD.lock().map_err(|_| POISONED.to_string())?;
-    while store.len() >= MAX_HELD {
-        store.remove(0);
-    }
-    store.push((handle, Held { groups }));
-    Ok(handle)
-}
-
-fn release(handle: u32) -> Result<(), String> {
-    let mut store = HELD.lock().map_err(|_| POISONED.to_string())?;
-    store.retain(|(h, _)| *h != handle);
-    Ok(())
-}
-
-const POISONED: &str = "backup: the import store is poisoned";
-
-/// The value one ref points at, or `None` when nothing usable is parked there.
-fn pick(groups: &Map<String, Value>, r: &SecretRef) -> Option<String> {
-    groups
-        .get(&r.group)?
-        .get(&r.id)?
-        .get(&r.field)?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-/// Split the named groups out of a decrypted payload. Returns the remainder as
-/// JSON plus the groups that were removed.
-fn split_groups(plain: &str, groups: &[String]) -> Result<(String, Map<String, Value>), String> {
-    let mut root: Map<String, Value> = serde_json::from_str(plain)
-        .map_err(|_| "backup: the decrypted payload is not a JSON object".to_string())?;
-    let mut taken = Map::new();
-    for g in groups {
-        if let Some(v) = root.remove(g) {
-            taken.insert(g.clone(), v);
-        }
-    }
-    let rest = serde_json::to_string(&Value::Object(root)).map_err(|e| e.to_string())?;
-    Ok((rest, taken))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OpenedPayload {
-    /// Pass to [`backup_apply_secrets`], then to [`backup_release`].
-    handle: u32,
-    /// The payload with every requested group removed: the caller's inventory
-    /// metadata with no credential left in it, safe to hand to the webview's
-    /// validator. Today that inventory is the five collections; what this side
-    /// guarantees is only that the named groups are gone.
-    payload: String,
-}
-
-/// Open a payload: return the metadata, park the credentials.
-///
-/// The two-step shape exists so validation can stay on the JS side, where the
-/// trust-boundary rules for an imported connection already live, without the
-/// credentials having to travel with it. `groups` names the payload keys to
-/// withhold.
-#[tauri::command]
-pub async fn backup_open_payload(
-    blob: SealedBlob,
-    passphrase: String,
-    groups: Vec<String>,
-) -> Result<OpenedPayload, String> {
-    let plain = open_blob(blob, &passphrase)?;
-    let (payload, taken) = split_groups(&plain, &groups)?;
-    Ok(OpenedPayload {
-        handle: hold(taken)?,
-        payload,
-    })
-}
-
-/// Write the parked credentials the importer asked for into the keychain.
-///
-/// Returns one flag per ref, in order, saying whether anything was actually
-/// stored - which is what lets the importer report "imported without stored
-/// credentials" without ever seeing the credentials.
-///
-/// The write is ONE store commit, so a failure writes nothing rather than a
-/// prefix: importing N connections used to cost roughly 3N whole-store
-/// rewrites on Linux and Windows.
-#[tauri::command]
-pub async fn backup_apply_secrets(
-    app: AppHandle,
-    state: tauri::State<'_, SecretsState>,
-    handle: u32,
-    refs: Vec<SecretRef>,
-) -> Result<Vec<bool>, String> {
-    // Copy out under the lock and write outside it: a keychain write is a file
-    // write plus, on Windows, a DPAPI call, and holding a process-global mutex
-    // across that would serialize every concurrent import behind the slowest.
-    let values: Vec<Option<String>> = {
-        let store = HELD.lock().map_err(|_| POISONED.to_string())?;
-        let held = store
-            .iter()
-            .find(|(h, _)| *h == handle)
-            .map(|(_, v)| v)
-            .ok_or_else(|| "backup: that import is no longer open".to_string())?;
-        refs.iter().map(|r| pick(&held.groups, r)).collect()
-    };
-
-    let entries: Vec<(&str, &str, &str)> = refs
-        .iter()
-        .zip(&values)
-        .filter_map(|(r, v)| {
-            v.as_deref()
-                .map(|v| (r.service.as_str(), r.account.as_str(), v))
-        })
-        .collect();
-    write_secrets(&app, &state, &entries)?;
-    let written = values.iter().map(Option::is_some).collect();
-    Ok(written)
-}
-
-/// Drop a parked payload. Releasing an unknown or already-released handle is
-/// deliberately not an error: the importer calls this from a `finally`, which
-/// also runs on the path where opening itself failed.
-#[tauri::command]
-pub async fn backup_release(handle: u32) -> Result<(), String> {
-    release(handle)
+    records.wipe();
+    drop(guard);
+    commit(state, dir)?;
+    Ok(applied)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::lockext::lock_or_recover;
+    use crate::modules::vault::entry_commands::vault_entry_upsert_inner;
+    use crate::modules::vault::model::{Tombstone, TombstoneKind, VersionReason};
+    use crate::modules::vault::session::vault_create_inner;
+    use crate::modules::vault::test_util::{draft, TempDir};
 
-    fn seal(pt: &str, pw: &str) -> SealedBlob {
-        seal_blob(pt.into(), pw).expect("seal")
-    }
-    fn open(b: SealedBlob, pw: &str) -> Result<String, String> {
-        open_blob(b, pw)
-    }
-    fn secret_ref(group: &str, id: &str, field: &str) -> SecretRef {
-        SecretRef {
-            group: group.into(),
-            id: id.into(),
-            field: field.into(),
-            service: "tervia-ssh".into(),
-            account: format!("{id}::{field}"),
-        }
-    }
-    /// A keychain value as `merge_secrets` takes it.
-    fn zz(v: &str) -> zeroize::Zeroizing<String> {
-        zeroize::Zeroizing::new(v.to_string())
+    const PASS: &str = "correct horse battery staple 42";
+
+    /// Cheap parameters (8 MiB, one pass) so a test does not pay the default
+    /// cost, as `seal_cheap` in the vault file tests.
+    fn cheap_kdf() -> Argon2Params {
+        let mut kdf = fresh_params().unwrap();
+        kdf.memory_kib = 8192;
+        kdf.iterations = 1;
+        kdf
     }
 
-    /// A blob sealed by the build that came BEFORE the AES-GCM pair moved out
-    /// of this module into its own leaf, pasted in as a literal.
-    ///
-    /// The provenance is the whole value. A vector generated after that move
-    /// is a round-trip test with extra steps: it proves the code agrees with
-    /// itself, which [`round_trips`] already says. Only a literal that predates
-    /// the move catches a SYMMETRIC mistake - argument order swapped on both
-    /// halves, AAD introduced on both halves, the nonce and the salt exchanged
-    /// on both halves - each of which round-trips green while breaking every
-    /// backup file a user has already exported.
-    ///
-    /// So this must never be regenerated to make it pass. If it fails, the
-    /// on-disk format changed and every existing export stopped opening.
+    fn write_backup(
+        dir: &TempDir,
+        name: &str,
+        entries: &[Entry],
+        groups: &[Group],
+    ) -> std::path::PathBuf {
+        let file = seal_backup(entries, groups, PASS, &cheap_kdf()).unwrap();
+        let path = dir.0.join(name);
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        path
+    }
+
+    fn unlocked_vault(tag: &str) -> (TempDir, VaultState) {
+        let dir = TempDir::new(tag);
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        (dir, state)
+    }
+
+    fn with_payload<T>(state: &VaultState, f: impl FnOnce(&mut VaultPayload) -> T) -> T {
+        f(&mut lock_or_recover(&state.inner).as_mut().unwrap().payload)
+    }
+
+    fn entry_by_id(state: &VaultState, id: &str) -> Option<Entry> {
+        with_payload(state, |p| p.entries.iter().find(|e| e.id == id).cloned())
+    }
+
     #[test]
-    fn a_blob_sealed_before_the_extraction_still_opens() {
-        let blob = SealedBlob {
-            kdf: "pbkdf2-hmac-sha256".into(),
-            iterations: 600_000,
-            salt: "7aw3WpydpuX8SM5xXQ8kCg==".into(),
-            nonce: "viAKCz2DY1lxIN92".into(),
-            ciphertext: "XjlFeALKXGhGJFEBfWTJmpwxQwtSElMhsA7JDvoqzhMKghZl2krRlOOFamog\
-                         MDg7rNcKDRof4972JfpM2uBn4GeCcogMNBA="
-                .into(),
-        };
+    fn export_writes_a_sealed_file_without_device_state() {
+        let (dir, state) = unlocked_vault("bkexport");
+        let id = vault_entry_upsert_inner(&state, &dir.0, draft(None, "One"))
+            .unwrap()
+            .id;
+        with_payload(&state, |p| p.entries[0].last_used_at = Some(42));
+
+        let first = dir.0.join("a.subclave-backup");
+        let second = dir.0.join("b.subclave-backup");
+        backup_export_inner(&state, &first, PASS).unwrap();
+        backup_export_inner(&state, &second, PASS).unwrap();
+        let a: VaultFile = serde_json::from_slice(&std::fs::read(&first).unwrap()).unwrap();
+        let b: VaultFile = serde_json::from_slice(&std::fs::read(&second).unwrap()).unwrap();
+
+        assert_eq!(a.format, "subclave-backup");
+        assert_eq!(a.v, 1);
         assert_eq!(
-            open(blob, "golden").unwrap(),
-            "golden — ✓ 日本語 {\"c-1\":{\"password\":\"hunter2\"}}"
+            (
+                a.kdf.name.as_str(),
+                a.kdf.memory_kib,
+                a.kdf.iterations,
+                a.kdf.parallelism
+            ),
+            ("argon2id", 65536, 3, 4)
         );
-    }
-
-    #[test]
-    fn round_trips() {
-        let pt = r#"{"c-1":{"password":"hunter2"}}"#;
-        assert_eq!(
-            open(seal(pt, "correct horse"), "correct horse").unwrap(),
-            pt
-        );
-    }
-
-    #[test]
-    fn wrong_passphrase_fails_closed() {
-        // The whole point of the auth tag: a bad passphrase must not yield
-        // plausible-looking bytes for the importer to parse.
-        let err = open(seal("secret", "right"), "wrong").unwrap_err();
-        assert!(err.contains("wrong passphrase"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn tampered_ciphertext_fails_closed() {
-        let mut b = seal("secret", "pw");
-        let mut raw = B64.decode(&b.ciphertext).unwrap();
-        raw[0] ^= 0x01;
-        b.ciphertext = B64.encode(&raw);
-        assert!(open(b, "pw").is_err());
-    }
-
-    #[test]
-    fn empty_passphrase_is_refused() {
-        assert!(seal_blob("x".into(), "").is_err());
-    }
-
-    #[test]
-    fn salt_and_nonce_differ_per_seal() {
-        // Same plaintext and passphrase must never produce the same bytes, or
-        // two exports would reveal that nothing changed between them.
-        let (a, b) = (seal("same", "pw"), seal("same", "pw"));
-        assert_ne!(a.salt, b.salt);
+        assert_ne!(a.kdf.salt, b.kdf.salt);
         assert_ne!(a.nonce, b.nonce);
-        assert_ne!(a.ciphertext, b.ciphertext);
-    }
-
-    #[test]
-    fn unicode_survives() {
-        let pt = "kunci rahasia — ✓ 日本語";
-        assert_eq!(open(seal(pt, "pw"), "pw").unwrap(), pt);
-    }
-
-    // --- payload assembly: group names are arbitrary, the caller's own ----
-
-    #[test]
-    fn merge_places_each_secret_at_its_path() {
-        let merged = merge_secrets(
-            r#"{"connections":[{"id":"c-1"}],"rdpConnections":[]}"#,
-            &[
-                (secret_ref("secrets", "c-1", "password"), zz("hunter2")),
-                (secret_ref("secrets", "c-1", "privateKey"), zz("KEY")),
-                (secret_ref("rdpSecrets", "r-1", "password"), zz("rdp-pw")),
-            ],
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(v["secrets"]["c-1"]["password"], "hunter2");
-        assert_eq!(v["secrets"]["c-1"]["privateKey"], "KEY");
-        assert_eq!(v["rdpSecrets"]["r-1"]["password"], "rdp-pw");
-        // The inventory the caller sent must come through untouched.
-        assert_eq!(v["connections"][0]["id"], "c-1");
-        assert!(v["rdpConnections"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn merge_refuses_to_overwrite_an_existing_key() {
-        // The failure this prevents: a group named `connections` would replace
-        // the whole inventory with a credential map, and the export would still
-        // report success.
-        let err = merge_secrets(
-            r#"{"connections":[{"id":"c-1"}]}"#,
-            &[(secret_ref("connections", "c-1", "password"), zz("pw"))],
-        )
-        .unwrap_err();
-        assert!(err.contains("already carries"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn merge_rejects_a_payload_that_is_not_an_object() {
-        assert!(merge_secrets("[1,2]", &[]).is_err());
-        assert!(merge_secrets("not json", &[]).is_err());
-    }
-
-    #[test]
-    fn merge_with_no_refs_is_a_passthrough() {
-        // The shape of an export with no credentials saved anywhere: still a
-        // valid payload, just with no secret groups in it.
-        let out = merge_secrets(r#"{"connections":[],"rdpConnections":[]}"#, &[]).unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert!(v.get("secrets").is_none());
-    }
-
-    // --- import: split, pick, park - group names are arbitrary here too ---
-
-    #[test]
-    fn split_withholds_only_the_named_groups() {
-        let sealed_plain = merge_secrets(
-            r#"{"connections":[{"id":"c-1","host":"example.com"}],"rdpConnections":[]}"#,
-            &[(secret_ref("secrets", "c-1", "password"), zz("hunter2"))],
-        )
-        .unwrap();
-        let (rest, taken) =
-            split_groups(&sealed_plain, &["secrets".into(), "rdpSecrets".into()]).unwrap();
-        // What goes to the webview: metadata, no credentials.
-        assert!(rest.contains("example.com"));
-        assert!(!rest.contains("hunter2"), "credential leaked into {rest}");
-        assert_eq!(taken["secrets"]["c-1"]["password"], "hunter2");
-        // A group the file never had is simply absent, not an error.
-        assert!(taken.get("rdpSecrets").is_none());
-    }
-
-    #[test]
-    fn split_withholds_all_three_secret_groups() {
-        // The property three groups buys over one: none of hostSecrets,
-        // identitySecrets or keySecrets plaintext reaches `rest` - the JSON
-        // that goes to the webview's validator - while every one of them is
-        // still reachable through `pick` afterwards.
-        let sealed_plain = merge_secrets(
-            r#"{"connections":[{"id":"c-1","host":"example.com"}]}"#,
-            &[
-                (secret_ref("hostSecrets", "c-1", "password"), zz("hunter2")),
-                (
-                    secret_ref("identitySecrets", "i-1", "passphrase"),
-                    zz("id-pass"),
-                ),
-                (
-                    secret_ref("keySecrets", "k-1", "privateKey"),
-                    zz("KEYMATERIAL"),
-                ),
-            ],
-        )
-        .unwrap();
-        let (rest, taken) = split_groups(
-            &sealed_plain,
-            &[
-                "hostSecrets".into(),
-                "identitySecrets".into(),
-                "keySecrets".into(),
-            ],
-        )
-        .unwrap();
-        for needle in ["hunter2", "id-pass", "KEYMATERIAL"] {
-            assert!(!rest.contains(needle), "{needle} leaked into {rest}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&first).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
         }
-        assert_eq!(
-            pick(&taken, &secret_ref("hostSecrets", "c-1", "password")),
-            Some("hunter2".to_string())
-        );
-        assert_eq!(
-            pick(&taken, &secret_ref("identitySecrets", "i-1", "passphrase")),
-            Some("id-pass".to_string())
-        );
-        assert_eq!(
-            pick(&taken, &secret_ref("keySecrets", "k-1", "privateKey")),
-            Some("KEYMATERIAL".to_string())
-        );
-    }
 
-    #[test]
-    fn split_rejects_a_non_object_payload() {
-        assert!(split_groups("[]", &["secrets".into()]).is_err());
-    }
-
-    #[test]
-    fn pick_finds_a_value_and_refuses_anything_else() {
-        let (_, groups) = split_groups(
-            r#"{"secrets":{"c-1":{"password":"pw","privateKey":"","keyPassphrase":7}}}"#,
-            &["secrets".into()],
+        // Decrypt by hand to see the payload's exact shape.
+        let key = derive_key(PASS, &a.kdf).unwrap();
+        let nonce: [u8; 12] = B64.decode(&a.nonce).unwrap().try_into().unwrap();
+        let plain = aesgcm::open_with_key(
+            &key,
+            &header_aad(FORMAT, a.v, &a.kdf),
+            &nonce,
+            B64.decode(&a.ciphertext).unwrap(),
+            "test",
         )
         .unwrap();
-        assert_eq!(
-            pick(&groups, &secret_ref("secrets", "c-1", "password")),
-            Some("pw".to_string())
-        );
-        // An empty string is "no credential", not a credential of length zero:
-        // storing it would set the hasPassword flag on a connection that then
-        // fails the backend's "no credentials" guard at dial time.
-        assert_eq!(
-            pick(&groups, &secret_ref("secrets", "c-1", "privateKey")),
-            None
-        );
-        // A non-string is junk from a hand-edited file.
-        assert_eq!(
-            pick(&groups, &secret_ref("secrets", "c-1", "keyPassphrase")),
-            None
-        );
-        assert_eq!(
-            pick(&groups, &secret_ref("secrets", "c-2", "password")),
-            None
-        );
-        assert_eq!(
-            pick(&groups, &secret_ref("rdpSecrets", "c-1", "password")),
-            None
-        );
-    }
-
-    /// `HELD` is process-global, so the two tests that assert on its contents
-    /// have to take turns: cargo runs tests in parallel, and one test's inserts
-    /// would otherwise evict the other's handle before it looked for it.
-    static PARK_GUARD: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn a_released_handle_is_gone_and_releasing_twice_is_fine() {
-        let _guard = PARK_GUARD.lock().unwrap();
-        let mut groups = Map::new();
-        groups.insert("secrets".into(), Value::Object(Map::new()));
-        let handle = hold(groups).unwrap();
-        assert!(HELD.lock().unwrap().iter().any(|(h, _)| *h == handle));
-        release(handle).unwrap();
-        assert!(!HELD.lock().unwrap().iter().any(|(h, _)| *h == handle));
-        release(handle).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        let mut keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["entries", "groups"]);
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], id.as_str());
+        assert!(entries
+            .iter()
+            .all(|e| e.get("lastUsedAt").is_none_or(|v| v.is_null())));
+        assert!(!json["groups"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn the_park_evicts_the_oldest_rather_than_growing() {
-        // An importer that never releases must not accumulate credentials for
-        // the process's lifetime.
-        let _guard = PARK_GUARD.lock().unwrap();
-        let handles: Vec<u32> = (0..MAX_HELD + 2)
-            .map(|_| hold(Map::new()).unwrap())
-            .collect();
-        let store = HELD.lock().unwrap();
-        assert!(store.len() <= MAX_HELD);
-        let newest = handles.last().copied().unwrap();
-        assert!(store.iter().any(|(h, _)| *h == newest));
-        let oldest = handles[0];
-        assert!(!store.iter().any(|(h, _)| *h == oldest));
+    fn export_refuses_a_missing_or_weak_passphrase() {
+        let (dir, state) = unlocked_vault("bkweak");
+        let path = dir.0.join("weak.subclave-backup");
+        assert_eq!(
+            backup_export_inner(&state, &path, "").unwrap_err(),
+            "backup: a passphrase is required"
+        );
+        let err = backup_export_inner(&state, &path, "abc").unwrap_err();
+        assert!(
+            err.starts_with("backup: the passphrase is too weak"),
+            "{err}"
+        );
+        assert!(!path.exists());
+
+        let locked = VaultState::default();
+        assert_eq!(
+            backup_import_preview_inner(&locked, &path, PASS).unwrap_err(),
+            LOCKED_ERR
+        );
     }
 
     #[test]
-    fn a_sealed_export_leaks_no_metadata() {
-        // A sealed blob leaks no metadata - not the hostname, the username, the
-        // port, or a keychain credential. This is all Rust ever sees of an
-        // export; the envelope wrapped around it is TypeScript's concern. The
-        // username sits inside the host's `credential` object rather than on
-        // the row itself, which is where the SSH inline-credentials type puts
-        // it.
-        //
-        // Every needle is a run of five or more characters drawn ENTIRELY from
-        // the base64 alphabet, and that is what makes each one discriminating.
-        // The ciphertext is base64, so a needle carrying a `.` - the dotted
-        // host, say - can only fire if the encoding itself breaks, which reads
-        // as coverage without being any; and a short run turns up in base64
-        // output by chance, which makes an assertion flaky rather than strict.
-        // Hence a distinctive label inside the host rather than the whole
-        // dotted name, a distinctive username rather than a four-character one,
-        // and 54321 for the port rather than the real default 22.
-        let needles = ["vpsalpha", "svcdeploy", "hunter2", "54321"];
-        let plain = merge_secrets(
-            r#"{"hosts":[{"id":"h-1","name":"vps","protocol":"ssh","host":"vpsalpha.example.com","port":54321,"credential":{"kind":"inline","hostId":"h-1","user":"svcdeploy","authMode":"password","hasPassword":true,"hasPrivateKey":false,"hasKeyPassphrase":false}}],"groups":[],"identities":[],"keys":[],"rules":[]}"#,
-            &[(secret_ref("hostSecrets", "h-1", "password"), zz("hunter2"))],
-        )
-        .unwrap();
-        // Negative assertions below are free to pass if a needle is simply
-        // absent from the fixture, so a dropped field would read as coverage
-        // instead of a hole. This confirms every needle is actually present
-        // before the sealing loop gets to claim it hid them.
-        for needle in needles {
-            assert!(
-                plain.contains(needle),
-                "{needle} is missing from the fixture"
-            );
+    fn open_checks_the_header_and_the_passphrase() {
+        let file = seal_backup(&[], &[], PASS, &cheap_kdf()).unwrap();
+        assert!(open_backup(&file, PASS).is_ok());
+        assert_eq!(
+            open_backup(&file, "not the passphrase").unwrap_err(),
+            CORRUPT
+        );
+
+        // v = 0 passes the version check and derives the same key, so only
+        // the associated data differs: the header is bound.
+        let mut flipped = file.clone();
+        flipped.v = 0;
+        assert_eq!(open_backup(&flipped, PASS).unwrap_err(), CORRUPT);
+
+        let mut other = file.clone();
+        other.format = "subclave-vault".into();
+        assert_eq!(open_backup(&other, PASS).unwrap_err(), NOT_A_BACKUP);
+        let mut newer = file.clone();
+        newer.v = 2;
+        assert_eq!(
+            open_backup(&newer, PASS).unwrap_err(),
+            "backup: this backup was written by a newer Subclave"
+        );
+        let mut greedy = file.clone();
+        greedy.kdf.memory_kib = 1 << 30;
+        assert_eq!(
+            open_backup(&greedy, PASS).unwrap_err(),
+            "backup: the backup's key settings are not accepted"
+        );
+    }
+
+    /// One vault holding every class the preview names, then the apply over
+    /// it: an older tombstone wins, a newer backup copy revives the entry.
+    #[test]
+    fn preview_classifies_on_stamps_and_apply_merges() {
+        let (dir, state) = unlocked_vault("bkclass");
+        for title in ["Same", "Newer", "Newer too", "Older"] {
+            vault_entry_upsert_inner(&state, &dir.0, draft(None, title)).unwrap();
         }
-        let blob = seal(&plain, "pw");
-        // Collected rather than asserted one at a time so a leak names every
-        // needle it exposed, instead of stopping at whichever comes first.
-        let leaked: Vec<&str> = needles
-            .into_iter()
-            .filter(|n| blob.ciphertext.contains(n))
-            .collect();
-        assert!(leaked.is_empty(), "readable in the sealed blob: {leaked:?}");
-        assert_eq!(open(blob, "pw").unwrap(), plain);
+        let local = with_payload(&state, |p| p.entries.clone());
+        let now = now_ms();
+        let mut backup = local.clone();
+        backup[1].updated_at += 10;
+        backup[1].title = "Newer from backup".into();
+        backup[2].updated_at += 10;
+        backup[3].updated_at -= 10;
+        backup[3].title = "Older from backup".into();
+        let mut fresh = local[0].clone();
+        fresh.id = "fresh".into();
+        let mut buried = local[0].clone();
+        buried.id = "buried".into();
+        buried.updated_at = now - 2_000;
+        let mut revived = local[0].clone();
+        revived.id = "revived".into();
+        revived.updated_at = now;
+        backup.extend([fresh, buried, revived]);
+        with_payload(&state, |p| {
+            for id in ["buried", "revived"] {
+                p.tombstones.push(Tombstone {
+                    id: id.into(),
+                    kind: TombstoneKind::Entry,
+                    deleted_at: now - 1_000,
+                });
+            }
+            p.device.sync.dirty.clear();
+        });
+        let path = write_backup(&dir, "class.subclave-backup", &backup, &[]);
+
+        let preview = backup_import_preview_inner(&state, &path, PASS).unwrap();
+        assert_eq!(
+            (preview.added, preview.newer, preview.older, preview.same),
+            (2, 2, 2, 1)
+        );
+        assert_eq!(
+            backup_import_apply_inner(&state, &dir.0, preview.handle + 1).unwrap_err(),
+            GONE
+        );
+
+        let applied = backup_import_apply_inner(&state, &dir.0, preview.handle).unwrap();
+        // The older live copy changed the stored form too: it went into
+        // history.
+        assert_eq!((applied.added, applied.updated), (2, 3));
+        assert!(
+            entry_by_id(&state, "buried").is_none(),
+            "an older copy undid a delete"
+        );
+        assert!(with_payload(&state, |p| p
+            .tombstones
+            .iter()
+            .any(|t| t.id == "buried")));
+        assert!(entry_by_id(&state, "revived").is_some());
+        assert!(entry_by_id(&state, "fresh").is_some());
+        let dirty = with_payload(&state, |p| p.device.sync.dirty.clone());
+        assert!(!dirty.contains(&format!("entry:{}", local[0].id)));
+        assert!(dirty.contains("entry:fresh"));
+        assert_eq!(
+            backup_import_apply_inner(&state, &dir.0, preview.handle).unwrap_err(),
+            GONE
+        );
+    }
+
+    #[test]
+    fn a_divergent_copy_lands_in_history_as_conflict() {
+        let (dir, state) = unlocked_vault("bkdiverge");
+        let older_id = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Kept"))
+            .unwrap()
+            .id;
+        let newer_id = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Replaced"))
+            .unwrap()
+            .id;
+        let local_older = entry_by_id(&state, &older_id).unwrap();
+        let local_newer = entry_by_id(&state, &newer_id).unwrap();
+        with_payload(&state, |p| p.device.sync.dirty.clear());
+
+        let mut stale = local_older.clone();
+        stale.title = "Stale".into();
+        stale.updated_at -= 5;
+        stale.history.clear();
+        let mut ahead = local_newer.clone();
+        ahead.title = "Ahead".into();
+        ahead.updated_at += 5;
+        ahead.history.clear();
+        let path = write_backup(
+            &dir,
+            "diverge.subclave-backup",
+            &[stale.clone(), ahead.clone()],
+            &[],
+        );
+
+        let preview = backup_import_preview_inner(&state, &path, PASS).unwrap();
+        assert_eq!((preview.newer, preview.older), (1, 1));
+        let applied = backup_import_apply_inner(&state, &dir.0, preview.handle).unwrap();
+        assert_eq!((applied.added, applied.updated), (0, 2));
+
+        let kept = entry_by_id(&state, &older_id).unwrap();
+        assert_eq!(kept.title, "Kept");
+        assert_eq!(kept.updated_at, local_older.updated_at);
+        assert!(kept.history.iter().any(|v| v.title == "Stale"
+            && v.updated_at == stale.updated_at
+            && v.reason == VersionReason::Conflict));
+
+        let replaced = entry_by_id(&state, &newer_id).unwrap();
+        assert_eq!(replaced.title, "Ahead");
+        assert_eq!(replaced.updated_at, ahead.updated_at);
+        assert!(replaced.history.iter().any(|v| v.title == "Replaced"
+            && v.updated_at == local_newer.updated_at
+            && v.reason == VersionReason::Conflict));
+
+        let dirty = with_payload(&state, |p| p.device.sync.dirty.clone());
+        assert!(dirty.contains(&format!("entry:{older_id}")));
+        assert!(dirty.contains(&format!("entry:{newer_id}")));
+    }
+
+    /// Export, edit, import: the backup copy is the version the edit already
+    /// pushed into history, so nothing changes.
+    #[test]
+    fn restoring_a_backup_older_than_an_edit_changes_nothing() {
+        let (dir, state) = unlocked_vault("bknatural");
+        let id = vault_entry_upsert_inner(&state, &dir.0, draft(None, "Before"))
+            .unwrap()
+            .id;
+        let path = dir.0.join("natural.subclave-backup");
+        backup_export_inner(&state, &path, PASS).unwrap();
+        vault_entry_upsert_inner(&state, &dir.0, draft(Some(id.clone()), "After")).unwrap();
+        let edited = entry_by_id(&state, &id).unwrap();
+        assert_eq!(edited.history.len(), 1);
+
+        let preview = backup_import_preview_inner(&state, &path, PASS).unwrap();
+        assert_eq!(
+            (preview.added, preview.newer, preview.older, preview.same),
+            (0, 0, 1, 0)
+        );
+        let applied = backup_import_apply_inner(&state, &dir.0, preview.handle).unwrap();
+        assert_eq!((applied.added, applied.updated), (0, 0));
+        assert_eq!(entry_by_id(&state, &id).unwrap(), edited);
     }
 }

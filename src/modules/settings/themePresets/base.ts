@@ -1,4 +1,4 @@
-import type { ThemeColors } from "../customTheme";
+import type { ThemeColors } from "../theme/model";
 
 export const EMPTY_BG = {
   enabled: false,
@@ -10,65 +10,30 @@ export const EMPTY_BG = {
 } as const;
 
 /**
- * Generic ANSI 16 palette tuned for dark surfaces. Each preset spreads
+ * Generic ANSI accent palette tuned for dark surfaces. Each preset spreads
  * this so it picks up the full set, then can override individual slots
  * where the canonical preset specifies different ANSI colors.
  */
 const ANSI_DARK = {
-  ansiBlack: "#18181b",
   ansiRed: "#ef4444",
   ansiGreen: "#22c55e",
   ansiYellow: "#eab308",
   ansiBlue: "#3b82f6",
   ansiMagenta: "#a855f7",
   ansiCyan: "#06b6d4",
-  ansiWhite: "#e4e4e7",
-  ansiBrightBlack: "#52525b",
-  ansiBrightRed: "#f87171",
-  ansiBrightGreen: "#4ade80",
-  ansiBrightYellow: "#facc15",
-  ansiBrightBlue: "#60a5fa",
-  ansiBrightMagenta: "#c084fc",
-  ansiBrightCyan: "#22d3ee",
-  ansiBrightWhite: "#fafafa",
 } satisfies Pick<
   ThemeColors,
-  | "ansiBlack"
-  | "ansiRed"
-  | "ansiGreen"
-  | "ansiYellow"
-  | "ansiBlue"
-  | "ansiMagenta"
-  | "ansiCyan"
-  | "ansiWhite"
-  | "ansiBrightBlack"
-  | "ansiBrightRed"
-  | "ansiBrightGreen"
-  | "ansiBrightYellow"
-  | "ansiBrightBlue"
-  | "ansiBrightMagenta"
-  | "ansiBrightCyan"
-  | "ansiBrightWhite"
+  "ansiRed" | "ansiGreen" | "ansiYellow" | "ansiBlue" | "ansiMagenta" | "ansiCyan"
 >;
 
-/** Generic ANSI 16 palette tuned for light surfaces (less neon, more contrast). */
+/** Generic ANSI accent palette tuned for light surfaces (less neon, more contrast). */
 const ANSI_LIGHT = {
-  ansiBlack: "#3f3f46",
   ansiRed: "#dc2626",
   ansiGreen: "#16a34a",
   ansiYellow: "#ca8a04",
   ansiBlue: "#2563eb",
   ansiMagenta: "#9333ea",
   ansiCyan: "#0891b2",
-  ansiWhite: "#e4e4e7",
-  ansiBrightBlack: "#71717a",
-  ansiBrightRed: "#ef4444",
-  ansiBrightGreen: "#22c55e",
-  ansiBrightYellow: "#eab308",
-  ansiBrightBlue: "#3b82f6",
-  ansiBrightMagenta: "#a855f7",
-  ansiBrightCyan: "#06b6d4",
-  ansiBrightWhite: "#fafafa",
 } satisfies typeof ANSI_DARK;
 
 export const DARK_COLORS: ThemeColors = {
@@ -98,19 +63,8 @@ export const DARK_COLORS: ThemeColors = {
   sidebarAccent: "#37373d",
   sidebarAccentForeground: "#ffffff",
   iconWorking: "#facc15",
-  iconIdle: "#34d399",
-  iconBlocked: "#f87171",
-  iconDone: "#60a5fa",
-  iconBranch: "#a78bfa",
   diffAdded: "#4ade80",
-  diffRemoved: "#f87171",
   info: "#38bdf8",
-  tabAccentTerminal: "#34d399",
-  tabAccentSsh: "#38bdf8",
-  tabAccentEditor: "#5b8bff",
-  tabAccentPreview: "#22d3ee",
-  tabAccentAiDiff: "#a78bfa",
-  tabAccentGitDiff: "#fbbf24",
   resizeHandle: "#2b2b2b",
   ...ANSI_DARK,
 };
@@ -142,19 +96,8 @@ export const LIGHT_COLORS: ThemeColors = {
   sidebarAccent: "#dbe5ff",
   sidebarAccentForeground: "#1f2328",
   iconWorking: "#ca8a04",
-  iconIdle: "#059669",
-  iconBlocked: "#dc2626",
-  iconDone: "#2563eb",
-  iconBranch: "#7c3aed",
   diffAdded: "#16a34a",
-  diffRemoved: "#dc2626",
   info: "#0284c7",
-  tabAccentTerminal: "#10b981",
-  tabAccentSsh: "#0ea5e9",
-  tabAccentEditor: "#0057fe",
-  tabAccentPreview: "#06b6d4",
-  tabAccentAiDiff: "#8b5cf6",
-  tabAccentGitDiff: "#f59e0b",
   resizeHandle: "#e5e7eb",
   ...ANSI_LIGHT,
 };

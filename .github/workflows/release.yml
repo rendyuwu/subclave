@@ -18,6 +18,7 @@ env:
     libdbus-1-dev
     libxcb1-dev
     libxcb-randr0-dev
+    libayatana-appindicator3-dev
     patchelf
 
 jobs:
@@ -51,9 +52,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           {
-            echo 'body<<TERVIA_NOTES_EOF'
+            echo 'body<<SUBCLAVE_NOTES_EOF'
             node scripts/release-notes.mjs "$TAG"
-            echo 'TERVIA_NOTES_EOF'
+            echo 'SUBCLAVE_NOTES_EOF'
           } >> "$GITHUB_OUTPUT"
 
       - name: Create draft release
@@ -69,7 +70,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: tag,
-              name: `Tervia ${tag}`,
+              name: `Subclave ${tag}`,
               body: process.env.RELEASE_BODY,
               draft: true,
               prerelease: false,
@@ -138,25 +139,6 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build the `tervia` console-subsystem launcher (Windows only). The
-      # NSIS hook in `installer.nsh` `File`s the resulting binary from
-      # `src-tauri/target/release/tervia.exe` into the install dir alongside
-      # the GUI `TerviaApp.exe`. `tauri-action` below only builds the main
-      # binary (the one named by `default-run`), so the stub needs an
-      # explicit step. Cargo's incremental cache means the subsequent main
-      # build reuses everything compiled here.
-      - name: Build tervia console launcher (Windows only)
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        working-directory: src-tauri
-        # The launcher lives in the `tervia-cli/` workspace member - kept
-        # separate from the GUI package on purpose so Tauri 2's deb / dmg
-        # bundlers don't enumerate it as a `[[bin]]` to bundle on POSIX.
-        # The shared workspace target dir means the produced
-        # `target/release/tervia.exe` sits next to the GUI's TerviaApp.exe,
-        # ready for the NSIS hook's `File` directive.
-        run: cargo build --release -p tervia-cli
-
       # tauri-action fills latest.json's `notes` (the in-app updater changelog)
       # from `releaseBody`; without it the updater shows no notes. Recompute the
       # same CHANGELOG-derived notes create-release used for the release body.
@@ -167,9 +149,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           {
-            echo 'body<<TERVIA_NOTES_EOF'
+            echo 'body<<SUBCLAVE_NOTES_EOF'
             node scripts/release-notes.mjs "$TAG"
-            echo 'TERVIA_NOTES_EOF'
+            echo 'SUBCLAVE_NOTES_EOF'
           } >> "$GITHUB_OUTPUT"
 
       # Uploads this platform's signed installers + updater artifacts into the

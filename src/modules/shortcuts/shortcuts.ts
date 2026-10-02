@@ -1,41 +1,21 @@
-import { IS_MAC, KEY_SEP, MOD_PROP } from "@/lib/platform";
+import { IS_MAC, MOD_PROP } from "@/lib/platform";
 
 /** Keyboard shortcut catalog. */
 
 export type ShortcutId =
-  | "tab.new"
-  | "tab.newEditor"
-  | "tab.newAgent"
-  | "tab.close"
-  | "tab.next"
-  | "tab.prev"
-  | "tab.selectByIndex"
-  | "pane.splitRight"
-  | "pane.splitDown"
-  | "pane.focusNext"
-  | "pane.focusPrev"
-  | "search.focus"
-  | "explorer.search"
-  | "explorer.grep"
-  | "explorer.replaceAll"
-  | "editor.findReplace"
-  | "shortcuts.open"
   | "settings.open"
-  | "sidebar.toggle"
-  | "view.zoomIn"
-  | "view.zoomOut"
-  | "view.zoomReset"
-  | "editor.toggleWordWrap"
-  | "editor.formatDocument"
-  | "editor.toggleComment"
-  | "terminal.copy"
-  | "terminal.paste"
-  | "terminal.close"
-  | "rdp.connect"
-  | "commandPalette.open";
+  | "commandPalette.open"
+  | "search.focus"
+  | "vault.lock"
+  | "entry.new"
+  | "entry.edit"
+  | "entry.trash"
+  | "entry.copyPassword"
+  | "entry.copyUsername"
+  | "entry.copyTotp"
+  | "entry.openUrl";
 
-export type ShortcutGroup =
-  "General" | "Tabs" | "Panes" | "Search" | "View" | "Editor" | "Terminal" | "Command Palette";
+export type ShortcutGroup = "General" | "Entries" | "Vault" | "Command Palette";
 
 export type KeyBinding = {
   key: string;
@@ -50,10 +30,37 @@ export type Shortcut = {
   label: string;
   group: ShortcutGroup;
   defaultBindings: KeyBinding[];
-  /** List in settings but disable recorder + reset. For component-hardcoded
-   *  keys (e.g. textarea Enter) shown for documentation. */
-  readOnly?: boolean;
+  /**
+   * Extra guard evaluated after a binding matches and before the modal gate.
+   * Scopes a chord to its surface: the list-scoped entry chords must not fire
+   * from a text field or a tree row, where the same key means something else.
+   * A returned false skips this chord and lets the loop try the next one.
+   */
+  when?: (e: KeyboardEvent) => boolean;
 };
+
+/**
+ * True when the event target is a text-entry surface (input, textarea, select
+ * or a contenteditable host). Duck-typed, so the node-loaded verify scripts can
+ * pass a plain object rather than a real Element.
+ */
+export function isTextEntryTarget(target: EventTarget | null): boolean {
+  const el = target as { tagName?: unknown; isContentEditable?: unknown } | null;
+  if (!el) return false;
+  const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable === true;
+}
+
+/**
+ * True when the event target sits inside the entry list (`[data-vault-list]`).
+ * Duck-typed: only the `closest` method is assumed, so a node test can pass a
+ * stub without a DOM.
+ */
+export function isEntryListTarget(target: EventTarget | null): boolean {
+  const el = target as { closest?: (selector: string) => Element | null } | null;
+  if (!el || typeof el.closest !== "function") return false;
+  return el.closest("[data-vault-list]") !== null;
+}
 
 export const SHORTCUTS: Shortcut[] = [
   {
@@ -63,122 +70,64 @@ export const SHORTCUTS: Shortcut[] = [
     defaultBindings: [{ [MOD_PROP]: true, key: "," }],
   },
   {
-    id: "shortcuts.open",
-    label: "Show keyboard shortcuts",
-    group: "General",
-    defaultBindings: [{ [MOD_PROP]: true, key: "k" }],
-  },
-  {
-    id: "tab.new",
-    label: "New tab",
-    group: "Tabs",
-    defaultBindings: [{ [MOD_PROP]: true, key: "t" }],
-  },
-  {
-    id: "tab.newEditor",
-    label: "New editor tab",
-    group: "Tabs",
-    defaultBindings: [{ [MOD_PROP]: true, key: "e" }],
-  },
-  {
-    // Opens the AI-CLI picker, not a tab directly - the dialog decides how many
-    // panes and in what layout. N for "new agents": Mod+Shift+N is free, and
-    // being Mod+Shift it never shadows a shell control code the way a bare
-    // Mod+letter would. Deliberately NOT A or B - those are the GNU screen and
-    // tmux prefixes, so muscle memory in a multiplexer session would keep
-    // hitting this by mistake even though the bare-Ctrl form still reaches the
-    // shell.
-    id: "tab.newAgent",
-    label: "Run AI agents...",
-    group: "Tabs",
-    defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "n" }],
-  },
-  {
-    id: "tab.close",
-    label: "Close tab or pane",
-    group: "Tabs",
-    defaultBindings: [{ [MOD_PROP]: true, key: "w" }],
-  },
-  {
-    // Horizontal split: new tab beside the focused one.
-    id: "pane.splitRight",
-    label: "Split pane horizontally",
-    group: "Panes",
-    defaultBindings: [{ [MOD_PROP]: true, key: "d" }],
-  },
-  {
-    // Vertical split: new tab stacked below the focused one.
-    id: "pane.splitDown",
-    label: "Split pane vertically",
-    group: "Panes",
-    defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "d" }],
-  },
-  {
-    id: "pane.focusNext",
-    label: "Focus next pane",
-    group: "Panes",
-    defaultBindings: [{ [MOD_PROP]: true, key: "]" }],
-  },
-  {
-    id: "pane.focusPrev",
-    label: "Focus previous pane",
-    group: "Panes",
-    defaultBindings: [{ [MOD_PROP]: true, key: "[" }],
-  },
-  {
-    id: "tab.next",
-    label: "Next tab",
-    group: "Tabs",
-    defaultBindings: [{ ctrl: true, key: "Tab" }],
-  },
-  {
-    id: "tab.prev",
-    label: "Previous tab",
-    group: "Tabs",
-    defaultBindings: [{ ctrl: true, shift: true, key: "Tab" }],
-  },
-  {
-    id: "tab.selectByIndex",
-    label: "Jump to tab 1–9",
-    group: "Tabs",
-    defaultBindings: [{ [MOD_PROP]: true, key: "1" }],
-  },
-  {
-    id: "explorer.grep",
-    label: "Search in files",
-    group: "Search",
-    defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "f" }],
-  },
-  {
-    id: "explorer.replaceAll",
-    label: "Replace in files",
-    group: "Search",
-    defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "h" }],
-  },
-  {
-    id: "editor.findReplace",
-    label: "Find and replace in editor",
-    group: "Editor",
-    defaultBindings: [{ [MOD_PROP]: true, key: "h" }],
-  },
-  {
-    // VS Code uses Ctrl+P for the fuzzy file picker; we ship Mod+P as an
-    // equivalent. Mod+Shift+P is claimed by the Command Palette (VS Code
-    // convention). Mod+G is an explicit alternative requested by Indonesian
-    // users who already bind Ctrl+G to "open file" in their muscle memory.
-    id: "explorer.search",
-    label: "Go to file",
-    group: "Search",
-    defaultBindings: [
-      { [MOD_PROP]: true, key: "p" },
-      { [MOD_PROP]: true, key: "g" },
-    ],
-  },
-  {
     id: "search.focus",
-    label: "Find in terminal",
-    group: "Search",
+    label: "Focus search",
+    group: "General",
     defaultBindings: [{ [MOD_PROP]: true, key: "f" }],
+  },
+  {
+    id: "vault.lock",
+    label: "Lock the vault",
+    group: "Vault",
+    defaultBindings: [{ [MOD_PROP]: true, key: "l" }],
+  },
+  {
+    id: "entry.new",
+    label: "New entry",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "n" }],
+  },
+  {
+    id: "entry.edit",
+    label: "Edit entry",
+    group: "Entries",
+    defaultBindings: [{ key: "Enter" }, { [MOD_PROP]: true, key: "e" }],
+    when: (e) => isEntryListTarget(e.target),
+  },
+  {
+    id: "entry.trash",
+    label: "Move to trash",
+    group: "Entries",
+    defaultBindings: [{ key: "Delete" }],
+    when: (e) => isEntryListTarget(e.target),
+  },
+  {
+    id: "entry.copyPassword",
+    label: "Copy password",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "c" }],
+    when: (e) => isEntryListTarget(e.target),
+  },
+  {
+    id: "entry.copyUsername",
+    label: "Copy username",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "b" }],
+    when: (e) => !isTextEntryTarget(e.target),
+  },
+  {
+    id: "entry.copyTotp",
+    label: "Copy TOTP",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "t" }],
+    when: (e) => !isTextEntryTarget(e.target),
+  },
+  {
+    id: "entry.openUrl",
+    label: "Open URL",
+    group: "Entries",
+    defaultBindings: [{ [MOD_PROP]: true, key: "u" }],
+    when: (e) => !isTextEntryTarget(e.target),
   },
   {
     // Opens the Command Palette — a searchable list of all commands. VS Code
@@ -188,129 +137,9 @@ export const SHORTCUTS: Shortcut[] = [
     group: "Command Palette",
     defaultBindings: [{ [MOD_PROP]: true, shift: true, key: "p" }],
   },
-  {
-    id: "sidebar.toggle",
-    label: "Toggle file explorer",
-    group: "View",
-    defaultBindings: [{ [MOD_PROP]: true, key: "b" }],
-  },
-  {
-    // `=` is the unshifted "+" on US layouts. Matches VS Code and browsers,
-    // so Cmd/Ctrl + "+" works with or without Shift.
-    id: "view.zoomIn",
-    label: "Zoom in",
-    group: "View",
-    defaultBindings: [
-      { [MOD_PROP]: true, key: "=" },
-      { [MOD_PROP]: true, shift: true, key: "=" },
-    ],
-  },
-  {
-    id: "view.zoomOut",
-    label: "Zoom out",
-    group: "View",
-    defaultBindings: [{ [MOD_PROP]: true, key: "-" }],
-  },
-  {
-    id: "view.zoomReset",
-    label: "Reset zoom",
-    group: "View",
-    defaultBindings: [{ [MOD_PROP]: true, key: "0" }],
-  },
-  {
-    id: "editor.toggleWordWrap",
-    label: "Toggle word wrap",
-    group: "Editor",
-    defaultBindings: [{ alt: true, key: "z" }],
-  },
-  {
-    // VSCode parity. Runs the configured formatter (built-in Prettier or
-    // user external command) against the active editor and rewrites the
-    // buffer. Does not save — pair with Mod+S for format-then-save.
-    id: "editor.formatDocument",
-    label: "Format document",
-    group: "Editor",
-    defaultBindings: [{ shift: true, alt: true, key: "f" }],
-  },
-  {
-    // CodeMirror's own `defaultKeymap` binds this, so it is documentation, not
-    // a command we dispatch - listing it is what puts it in Settings >
-    // Shortcuts. `readOnly` matters for more than the label: an entry with no
-    // handler makes `useGlobalShortcuts` bail BEFORE `preventDefault`, so the
-    // keystroke still reaches the editor. The comment syntax comes from the
-    // language itself, see `COMMENT_TOKENS` in editor/lib/languages.ts.
-    id: "editor.toggleComment",
-    label: "Toggle comment",
-    group: "Editor",
-    defaultBindings: [{ [MOD_PROP]: true, key: "/" }],
-    readOnly: true,
-  },
-  {
-    // Ctrl+C in a shell is SIGINT, so copy is Ctrl+Shift+C on Linux/Windows.
-    // Matches GNOME Terminal, Konsole, Windows Terminal, VS Code. On macOS
-    // the convention (Terminal.app, iTerm2) is Cmd+C - Cmd is not a shell
-    // signal, so it's safe to bind unconditionally.
-    id: "terminal.copy",
-    label: "Copy selection",
-    group: "Terminal",
-    defaultBindings: IS_MAC ? [{ meta: true, key: "c" }] : [{ ctrl: true, shift: true, key: "c" }],
-  },
-  {
-    // Uses xterm's bracketed-paste so multi-line snippets aren't executed
-    // line-by-line. Cmd+V on macOS; Ctrl+Shift+V elsewhere. Shift+Insert is
-    // a de-facto universal terminal paste on Linux/Windows - included as a
-    // secondary default for muscle memory from other emulators.
-    id: "terminal.paste",
-    label: "Paste from clipboard",
-    group: "Terminal",
-    defaultBindings: IS_MAC
-      ? [{ meta: true, key: "v" }]
-      : [
-          { ctrl: true, shift: true, key: "v" },
-          { shift: true, key: "Insert" },
-        ],
-  },
-  {
-    // Closes the focused PANE, whatever it holds - terminal, RDP session,
-    // editor or board. `tabs/lib/closable.ts` decides, so this refuses exactly
-    // what the pane-header and tab-strip X buttons refuse: the Hosts page and
-    // the last entry in the workspace. Named for a terminal while it was gated
-    // to one, which is how it came to drop the chord for an RDP pane both X
-    // buttons closed happily. The id keeps its `terminal.` prefix
-    // because a user's rebinding is stored under it; only the wording moves.
-    id: "terminal.close",
-    label: "Close focused pane",
-    group: "Panes",
-    defaultBindings: [{ ctrl: true, shift: true, key: "x" }],
-  },
-  {
-    // Opens the Hosts page: pick a saved host to connect, or add one. Used
-    // to raise the header's RDP connection list before that dropdown was
-    // deleted; the id is kept so a user's custom binding survives the repoint.
-    //
-    // NO default binding, deliberately. Every free Mod+letter is either a shell
-    // control code a focused terminal owns or already spoken for, and this is a
-    // command you reach for occasionally rather than a chord worth spending one
-    // of those on. It still lists in Settings > Shortcuts for a user to bind,
-    // and the palette can run it regardless (`runCommand` goes through the
-    // registry, not the keyboard).
-    id: "rdp.connect",
-    label: "Open Hosts...",
-    group: "General",
-    defaultBindings: [],
-  },
 ];
 
-export const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  "General",
-  "Tabs",
-  "Panes",
-  "View",
-  "Editor",
-  "Terminal",
-  "Search",
-  "Command Palette",
-];
+export const SHORTCUT_GROUPS: ShortcutGroup[] = ["General", "Entries", "Vault", "Command Palette"];
 
 /**
  * Layout-independent key canonicalization. Uses `e.code` for letters/digits
@@ -322,8 +151,11 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
  * `e.code` is stable across layouts (`KeyT`, `Digit5`, `BracketLeft`).
  * For everything else (punctuation, function/navigation/named keys) fall
  * back to `e.key`. Same hybrid VS Code and CodeMirror use.
+ *
+ * Exported for the recorder, which stores this key so a binding recorded
+ * with Option held or on a non-Latin layout still matches on replay.
  */
-function canonicalKey(e: KeyboardEvent): string {
+export function canonicalKey(e: KeyboardEvent): string {
   const code = e.code;
   // KeyA..KeyZ -> "a".."z"
   if (code.length === 4 && code.startsWith("Key")) {
@@ -338,17 +170,11 @@ function canonicalKey(e: KeyboardEvent): string {
 }
 
 /** Returns true if the KeyboardEvent matches the KeyBinding. */
-export function matchBinding(e: KeyboardEvent, binding: KeyBinding, id?: ShortcutId): boolean {
+export function matchBinding(e: KeyboardEvent, binding: KeyBinding): boolean {
   const eventKey = canonicalKey(e);
   const bindingKey = binding.key.toLowerCase();
 
-  // Jump-to-tab matches via canonical key (e.code for digits) so the shortcut
-  // works on layouts where Shift+digit or Alt changes the printable char.
-  if (id === "tab.selectByIndex") {
-    if (!/^[1-9]$/.test(eventKey)) return false;
-  } else if (eventKey !== bindingKey) {
-    return false;
-  }
+  if (eventKey !== bindingKey) return false;
 
   return (
     !!e.ctrlKey === !!binding.ctrl &&
@@ -356,115 +182,6 @@ export function matchBinding(e: KeyboardEvent, binding: KeyBinding, id?: Shortcu
     !!e.altKey === !!binding.alt &&
     !!e.metaKey === !!binding.meta
   );
-}
-
-/**
- * Recorder counterpart. Returns the canonical key so bindings recorded with
- * Option held or on non-Latin layouts still match on replay.
- */
-export function canonicalKeyFromEvent(e: KeyboardEvent): string {
-  return canonicalKey(e);
-}
-
-/**
- * True when `e` is a bare-Ctrl chord (Ctrl held, no Shift/Alt/Meta) whose key
- * produces a C0 control code a shell needs: Ctrl+A..Z -> 0x01-0x1A, Ctrl+[ =
- * Esc (0x1B), Ctrl+\ = FS/SIGQUIT (0x1C), Ctrl+] = GS (0x1D). On Windows/Linux
- * `Mod` is Ctrl, so the catalog's Mod+letter defaults (Ctrl+E, Ctrl+W, Ctrl+K,
- * Ctrl+L, Ctrl+B, …) otherwise steal readline editing keys and the GNU
- * screen / tmux prefix from a focused terminal. `yieldsToRawKeyboard`
- * (`shortcuts/lib/keyboardOwner.ts`) returns true for this while a terminal is
- * focused, so the byte falls through to xterm instead of firing an app action.
- * Uses `e.code` so it holds on non-US layouts (Ctrl+Shift+letter app chords
- * keep Shift, so they are excluded here and stay active). No-op on macOS: Mod
- * is Cmd there, so no bare-Ctrl chord matches an app shortcut in the first
- * place.
- */
-export function isTerminalControlChord(e: KeyboardEvent): boolean {
-  if (!e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return false;
-  const code = e.code;
-  if (code.length === 4 && code.startsWith("Key")) return true; // KeyA..KeyZ
-  return code === "BracketLeft" || code === "BracketRight" || code === "Backslash";
-}
-
-/**
- * True when `e` is a bare-Alt chord (Alt held, no Ctrl/Shift/Meta) on a
- * letter or digit. xterm sends these to the shell as ESC-prefixed meta
- * sequences that readline uses: M-b / M-f word movement, M-d kill-word,
- * M-. last-arg, M-1..M-9 digit-argument, etc. Like [[isTerminalControlChord]]
- * this is gated on by `yieldsToRawKeyboard` so a focused terminal owns them
- * instead of an app Alt+letter shortcut (only Alt+Z = word-wrap today, which
- * is an editor action with no meaning in a terminal anyway). Uses `e.code` for
- * layout independence; app chords that add Ctrl/Shift/Meta (Ctrl+Alt+P,
- * Shift+Alt+F) keep those modifiers and are excluded, so they stay active.
- */
-export function isTerminalMetaChord(e: KeyboardEvent): boolean {
-  if (!e.altKey || e.ctrlKey || e.shiftKey || e.metaKey) return false;
-  const code = e.code;
-  if (code.length === 4 && code.startsWith("Key")) return true; // KeyA..KeyZ
-  return code.length === 6 && code.startsWith("Digit"); // Digit0..Digit9
-}
-
-/**
- * Parses an extension's `contributes.keybindings[].key` string
- * (e.g. "Mod+Shift+E", "Ctrl+K", "Alt+Shift+ArrowLeft") into a `KeyBinding`.
- * VS Code grammar:
- *   `Mod` is `meta` on macOS, `ctrl` elsewhere (matches `MOD_PROP`).
- *   Modifiers (case-insensitive): ctrl/control, shift, alt/option/opt,
- *   meta/cmd/command/win/super, mod. Separated by `+`. Trailing token is the key.
- *   Single chars are lowercased; named keys pass through.
- * Returns `null` when input is empty or has no key token. Unknown modifiers
- * are skipped silently.
- */
-export function parseKeybindingString(input: string): KeyBinding | null {
-  if (typeof input !== "string") return null;
-  const parts = input
-    .split("+")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-  if (parts.length === 0) return null;
-  const binding: KeyBinding = { key: "" };
-  for (let i = 0; i < parts.length; i++) {
-    const token = parts[i];
-    const isLast = i === parts.length - 1;
-    const lower = token.toLowerCase();
-    if (!isLast) {
-      switch (lower) {
-        case "ctrl":
-        case "control":
-          binding.ctrl = true;
-          break;
-        case "shift":
-          binding.shift = true;
-          break;
-        case "alt":
-        case "option":
-        case "opt":
-          binding.alt = true;
-          break;
-        case "meta":
-        case "cmd":
-        case "command":
-        case "win":
-        case "super":
-          binding.meta = true;
-          break;
-        case "mod":
-          // VS Code alias: Cmd on Mac, Ctrl elsewhere. Aligns with `MOD_PROP`.
-          binding[MOD_PROP] = true;
-          break;
-        default:
-          // Unknown modifier: drop it so a single typo doesn't kill the binding.
-          break;
-      }
-      continue;
-    }
-    // Last token is the key. Lowercase single chars so `matchBinding`'s
-    // canonical comparison matches regardless of manifest casing.
-    binding.key = token.length === 1 ? token.toLowerCase() : token;
-  }
-  if (!binding.key) return null;
-  return binding;
 }
 
 /** Display tokens for a binding (platform-specific glyphs on macOS). */
@@ -497,19 +214,4 @@ export function getBindingTokens(binding?: KeyBinding): string[] {
 
   tokens.push(keyLabel);
   return tokens;
-}
-
-/** Display string for a shortcut's first binding: the user override if set, else
- *  the default, rendered as glyph tokens joined by KEY_SEP. Returns "" when the
- *  id is unknown or has no binding. Shared by the header search hint and the
- *  toolbar tooltip labels. */
-export function shortcutHint(
-  id: ShortcutId,
-  userShortcuts: Record<ShortcutId, KeyBinding[]>,
-): string {
-  const s = SHORTCUTS.find((s) => s.id === id);
-  if (!s) return "";
-  const bindings = userShortcuts[id] || s.defaultBindings;
-  if (!bindings || bindings.length === 0) return "";
-  return getBindingTokens(bindings[0]).join(KEY_SEP);
 }

@@ -7,8 +7,8 @@
  *     destructures `undefined` and white-screens the window that fired it,
  *   - a window that can `toast()` but renders no `<Toaster />`: toast listeners
  *     are a per-webview module Set, so the notification is dropped with no
- *     error anywhere (this is exactly how the Settings and float windows lost
- *     every format-failure toast).
+ *     error anywhere (this is exactly how the Settings window lost every
+ *     format-failure toast).
  *
  * Source text, not imports: this file is JSX + a path alias + lucide, none of
  * which is worth booting for four structural facts.
@@ -31,7 +31,6 @@ function check(name: string, ok: boolean, detail?: unknown): void {
 }
 
 const toastSrc = read("src/components/ui/toast.tsx");
-const generalSrc = read("src/settings/sections/GeneralSection.tsx");
 const cssSrc = read("src/styles/globals.css");
 
 // ---- variants ------------------------------------------------------------
@@ -47,26 +46,17 @@ for (const v of variants) {
 }
 
 // The per-variant preview buttons used to live in Settings > General. They were
-// a dev aid shipping in every production build, so they are gone; the style-map
-// check above is what actually caught a broken variant.
-check(
-  "Settings ships no toast preview",
-  !generalSrc.includes("TOAST_PREVIEWS") && !generalSrc.includes("Preview notifications"),
-);
+// a dev aid shipping in every production build, so they are gone.
 
 // ---- every toasting webview renders a Toaster -----------------------------
-for (const rootFile of [
-  "src/app/App.tsx",
-  "src/settings/SettingsApp.tsx",
-  "src/float/FloatApp.tsx",
-]) {
+for (const rootFile of ["src/app/App.tsx", "src/settings/SettingsApp.tsx"]) {
   check(`${rootFile} mounts <Toaster />`, read(rootFile).includes("<Toaster />"));
 }
 
 // ---- countdown bar + leave animation -------------------------------------
 check(
   "countdown keyframe exists",
-  toastSrc.includes("tervia-toast-drain") && cssSrc.includes("@keyframes tervia-toast-drain"),
+  toastSrc.includes("subclave-toast-drain") && cssSrc.includes("@keyframes subclave-toast-drain"),
 );
 
 // The card is removed from the list on a timer, so that timer must outlast the

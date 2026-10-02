@@ -24,6 +24,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use ring::{digest, hmac};
 
 /// The algorithm token, which opens the string to sign and the header alike.
@@ -41,18 +42,12 @@ pub const EMPTY_PAYLOAD_SHA256: &str =
 /// Lowercase hex, which is what every hash and signature in SigV4 is spelled
 /// in.
 ///
-/// The same fold `object_name` in `src-tauri/src/modules/sync/crypto.rs` uses.
-/// Kept as two copies rather than a shared helper: that one produces a path
-/// segment and this one produces a signature component, and they have no
-/// reason to move together.
+/// The `hex` crate's encoding, which `object_name` in
+/// `src-tauri/src/modules/sync/crypto.rs` also uses. Two calls rather than a
+/// shared helper: that one produces a path segment and this one produces a
+/// signature component, and they have no reason to move together.
 pub fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    hex::encode(bytes)
 }
 
 /// SHA-256 of `bytes`, hex encoded.
@@ -212,7 +207,7 @@ pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8
 /// Everything a signature needs that is not the request itself.
 ///
 /// A struct rather than five more parameters on [`authorization_header`],
-/// because the four builders in `src-tauri/src/modules/sync/providers/s3.rs`
+/// because the four builders in `src-tauri/src/modules/sync/providers/s3/build.rs`
 /// each pass the same five values and a positional mix-up between `region` and
 /// `service` would compile.
 ///
@@ -274,40 +269,17 @@ pub fn authorization_header(
 // The name is not `parse_http_date` deliberately: an HTTP date is the RFC 7231
 // form that the `Last-Modified` HEADER carries, which is a different spelling
 // of a different field. That third format has a home now:
-// `parse_http_date` in `src-tauri/src/modules/sync/providers/webdav.rs` reads
-// it, because a WebDAV listing spells its modification time that way. It
-// shares [`days_from_civil`] rather than carrying a second copy of the era
-// arithmetic, which is why that one is `pub(super)` where its inverse is not.
+// `parse_http_date` in
+// `src-tauri/src/modules/sync/providers/webdav/dav_time.rs` reads
+// it, because a WebDAV listing spells its modification time that way.
 //
-// This is the only hand-rolled civil arithmetic in the diff, and the signing
-// vectors take their timestamp as a literal string, so nothing else in this
-// file exercises it.
-
-/// Civil date from a day count since the epoch, by the usual era arithmetic.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-/// Day count since the epoch from a civil date. The inverse of
-/// [`civil_from_days`].
-pub(super) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (if m > 2 { m - 3 } else { m + 9 }) as i64;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
+// THE CIVIL ARITHMETIC IS `chrono`'S, and each parser keeps its own shape check
+// in front of it. The narrowness is deliberate: an offset and a leap second are
+// both things `chrono` reads and these must not, so the separators and the
+// trailing `Z` are checked here and the value is handed over only once it has
+// the shape the field's generator emits. One place this is narrower than the
+// arithmetic it replaced: a thirty-first of February used to resolve into March
+// and is now refused, and no server emits one.
 
 /// `("20150830T123600Z", "20150830")` for an instant: the `x-amz-date` value
 /// and the date half the credential scope needs.
@@ -322,16 +294,14 @@ pub fn amz_date(at: SystemTime) -> (String, String) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
-    let rem = secs % 86_400;
-    let date = format!("{y:04}{m:02}{d:02}");
-    let stamp = format!(
-        "{date}T{:02}{:02}{:02}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    );
-    (stamp, date)
+    // `from_timestamp` answers `None` only past the end of `chrono`'s calendar,
+    // where the epoch is as good an answer as any: the service refuses the
+    // request either way.
+    let at = DateTime::<Utc>::from_timestamp(secs as i64, 0).unwrap_or_default();
+    (
+        at.format("%Y%m%dT%H%M%SZ").to_string(),
+        at.format("%Y%m%d").to_string(),
+    )
 }
 
 /// Unix MILLISECONDS from an ISO 8601 extended UTC timestamp, or `None`.
@@ -343,12 +313,12 @@ pub fn amz_date(at: SystemTime) -> (String, String) {
 /// The fractional field is optional and is read to millisecond resolution,
 /// padded when shorter and truncated when longer.
 ///
-/// ONE THING IT DOES NOT CHECK, said out loud: the day is bounded at 31 rather
-/// than against the month's real length, so an impossible date such as a
-/// thirty-first of February resolves into the following month instead of
-/// failing. The value is a sort input with no other reader, so a nonsense
-/// stamp and a nonsense-but-adjacent stamp are the same outcome, and no server
-/// emits one.
+/// TWO THINGS THE SHAPE CHECK HAS TO CATCH before `chrono` sees the value,
+/// because `chrono` reads both: an OFFSET, where this field is UTC and nothing
+/// else, and a LEAP SECOND, where RFC 3339 allows a sixtieth second and this
+/// answers in a plain millisecond count that has no room for one. The
+/// separators, the trailing `Z` and the range on the seconds field are those
+/// two checks.
 pub fn parse_iso8601_utc(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20
@@ -368,45 +338,27 @@ pub fn parse_iso8601_utc(s: &str) -> Option<u64> {
         }
         part.parse().ok()
     };
-    let year = num(0, 4)? as i64;
-    let month = num(5, 7)?;
-    let day = num(8, 10)?;
-    let hour = num(11, 13)?;
-    let minute = num(14, 16)?;
-    let second = num(17, 19)?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if num(17, 19)? > 59 {
         return None;
     }
 
-    let millis = match b[19] {
-        b'Z' if b.len() == 20 => 0u64,
+    match b[19] {
+        b'Z' if b.len() == 20 => {}
         b'.' => {
             let frac = s.get(20..s.len() - 1)?;
             if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
                 return None;
             }
-            let mut digits: String = frac.chars().take(3).collect();
-            while digits.len() < 3 {
-                digits.push('0');
-            }
-            digits.parse::<u64>().ok()?
         }
         _ => return None,
-    };
+    }
 
-    let secs = days_from_civil(year, month, day) * 86_400
-        + hour as i64 * 3600
-        + minute as i64 * 60
-        + second as i64;
+    let at = DateTime::parse_from_rfc3339(s).ok()?;
+    let secs = at.timestamp();
     if secs < 0 {
         return None;
     }
-    Some(secs as u64 * 1000 + millis)
+    Some(secs as u64 * 1000 + u64::from(at.timestamp_subsec_millis()))
 }
 
 #[cfg(test)]
@@ -648,18 +600,32 @@ mod tests {
     #[test]
     fn the_two_calendar_directions_agree_where_they_overlap() {
         // Not a round trip between the two PUBLIC functions, which read
-        // different formats - this is the shared arithmetic underneath them,
-        // across four centuries of leap-year edges.
+        // different formats - this is the calendar underneath them, across
+        // four centuries of leap-year edges. The instant goes out as the basic
+        // form and comes back in as the extended one.
         for (y, m, d) in [
             (1970, 1, 1),
-            (1969, 12, 31),
             (2000, 2, 29),
             (2024, 2, 29),
             (2100, 3, 1),
             (2100, 2, 28),
-            (1900, 3, 1),
         ] {
-            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+            let date = format!("{y:04}{m:02}{d:02}");
+            let millis = parse_iso8601_utc(&format!("{y:04}-{m:02}-{d:02}T00:00:00Z")).unwrap();
+            assert_eq!(
+                amz_date(at(millis / 1000)),
+                (format!("{date}T000000Z"), date)
+            );
+        }
+        // The instants under test on the other side of the epoch, where the
+        // millisecond answer has no room for them and the parse is refused
+        // rather than wrapped. All three are century edges the calendar has to
+        // get right: 1900 is not a leap year, so its February has a
+        // twenty-eighth and then a first of March, and 1969-12-31 is the last
+        // day before the count starts.
+        for (y, m, d) in [(1900, 2, 28), (1900, 3, 1), (1969, 12, 31)] {
+            let date = format!("{y:04}-{m:02}-{d:02}T00:00:00Z");
+            assert_eq!(parse_iso8601_utc(&date), None, "{date}");
         }
     }
 }

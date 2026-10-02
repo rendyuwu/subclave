@@ -8,7 +8,7 @@
 //! The chain, top to bottom:
 //!
 //! ```text
-//! passphrase + random salt, PBKDF2-HMAC-SHA256 @ 600000  ->  key-encryption key
+//! passphrase + random salt, Argon2id                     ->  key-encryption key
 //! root key (32 random bytes), AES-256-GCM under the KEK  ->  wrapped, in the keyfile
 //! root key, HKDF-SHA256 Expand with two labels           ->  data key, name key
 //! data key, AES-256-GCM with a fresh nonce               ->  each record
@@ -28,89 +28,88 @@
 //! keeping the name deterministic, so two devices independently compute the
 //! same name for the same record.
 //!
-//! NO PATHS HERE. The layout `<prefix>/v1/keyfile` and `<prefix>/v1/obj/<name>`
-//! belongs to the SYNC LAYER ABOVE THE PROVIDER, which composes the key a
-//! provider receives; this module produces the `<name>` half and the keyfile
-//! struct and builds no path.
-//!
-//! Not the provider, which an earlier version of this paragraph said. A
-//! provider in `src-tauri/src/modules/sync/provider.rs` sees keys and bytes and
-//! has no idea what a record is, so the `v1` segment - which is the wire
-//! format's version expressed in the object namespace - cannot be its
-//! business.
+//! NO PATHS HERE. The layout `<prefix>/v1/keyfile` and
+//! `<prefix>/v1/obj/<name>` belongs to
+//! `src-tauri/src/modules/sync/engine/layout.rs`, the sync layer above the
+//! provider, which composes the key a provider receives; this module produces
+//! the `<name>` half and the keyfile struct and builds no path. A provider in
+//! `src-tauri/src/modules/sync/provider.rs` sees keys and bytes and has no idea
+//! what a record is, so the `v1` segment (the wire format's version expressed in
+//! the object namespace) cannot be its business.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ring::{
     aead::NONCE_LEN,
-    hkdf, hmac, pbkdf2,
+    hkdf, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU32;
+use zeroize::Zeroizing;
 
 use crate::modules::aesgcm::{open_with_key, seal_with_key};
+use crate::modules::vault::file::header_aad;
+use crate::modules::vault::kdf::{check_params, derive_key, fresh_params, Argon2Params};
 
 /// The keyfile's own version, DELIBERATELY SEPARATE from `WIRE_VERSION` in
 /// `src-tauri/src/modules/sync/model.rs` even though both are 1 today.
 ///
 /// Welding them together is a data-loss trapdoor. The root key exists in
-/// exactly one place - [`Keyfile::wrapped`] - so the day the ENVELOPE shape
+/// exactly one place, `SyncKeyfile::wrapped`, so the day the ENVELOPE shape
 /// changes for an envelope reason and `WIRE_VERSION` goes to 2, a shared
-/// constant would have [`open_keyfile`] refuse every keyfile already written
-/// and every object on every remote would become permanently undecryptable.
-/// The two version the two things, and they move independently.
+/// constant would have `open_keyfile` refuse every keyfile already written and
+/// every object on every remote would become permanently undecryptable. The
+/// two version the two things, and they move independently.
 const KEYFILE_VERSION: u32 = 1;
 
-/// Deliberately high, on the same grounds as the backup's: the passphrase is
-/// user-chosen and the keyfile sits on storage an attacker may hold, so they
-/// get unlimited offline guesses. Stored in the keyfile rather than hardcoded
-/// on the read path, so raising it later still opens older keyfiles.
-const PBKDF2_ITERATIONS: u32 = 600_000;
+/// The `format` string every keyfile this build writes carries, and the one
+/// `open_keyfile` accepts. Anything else is a folder this app did not write.
+const KEYFILE_FORMAT: &str = "subclave-sync";
 
-/// What [`open_keyfile`] will actually run, because `iterations` arrives from
-/// the remote and nothing up to here has authenticated it.
-///
-/// The wrapped root cannot be forged without the passphrase, but the iteration
-/// count can be REWRITTEN by anyone who can write to the storage, and a pull
-/// runs the KDF before it can tell. `u32::MAX` is hours of PBKDF2 per pull.
-/// The ceiling is far above the current cost so raising [`PBKDF2_ITERATIONS`]
-/// stays a one-line change, and far below "the app stopped responding".
-const MAX_ITERATIONS: u32 = 10_000_000;
-
-const SALT_LEN: usize = 16;
-const KDF_NAME: &str = "pbkdf2-hmac-sha256";
-
-/// The two HKDF labels. DISTINCT is the whole requirement - they are what make
-/// the two subkeys independent - and they are spelled out rather than built
+/// The two HKDF labels. DISTINCT is the whole requirement, they are what make
+/// the two subkeys independent, and they are spelled out rather than built
 /// from a shared stem so a refactor cannot accidentally collapse them.
-const DATA_LABEL: &[u8] = b"tervia-sync-record-key";
-const NAME_LABEL: &[u8] = b"tervia-sync-object-name-key";
+const DATA_LABEL: &[u8] = b"subclave-sync-record-key";
+const NAME_LABEL: &[u8] = b"subclave-sync-object-name-key";
 
 /// One message for every way opening can fail.
 ///
 /// Wrong passphrase, a flipped byte, a truncated field, base64 that is not
 /// base64: all the same sentence, because distinguishing them tells an
 /// attacker which guess was closer and none of them is separately actionable.
-/// The string is spelled here as well as in
-/// `src-tauri/src/modules/aesgcm.rs` because the two must MATCH, and
-/// [`a_wrong_passphrase_and_a_corrupt_keyfile_are_indistinguishable`] is what
-/// notices when they stop.
-const OPAQUE_FAILURE: &str = "sync: wrong passphrase, or the file is corrupt";
+/// `a_wrong_passphrase_and_a_corrupt_keyfile_are_indistinguishable` is what
+/// notices when that stops being true.
+const OPAQUE_FAILURE: &str = "sync: wrong sync passphrase, or the keyfile is corrupt";
 
-const PREFIX: &str = "sync";
+/// What a remote that is not a Subclave sync folder answers with, whether its
+/// keyfile carries another `format` or does not parse as a keyfile at all.
+///
+/// `pub(crate)` because the sync engine refuses bytes that do not parse a
+/// keyfile before it gets this far, and one spelling of the sentence is the
+/// point.
+pub(crate) const NOT_A_KEYFILE: &str = "sync: not a Subclave sync folder";
+
+/// A keyfile written by a build that knows a later `KEYFILE_VERSION`. Named
+/// rather than opaque because it depends on nothing the user typed, so it is
+/// not a guessing oracle.
+const NEWER_KEYFILE: &str = "sync: this keyfile was written by a newer Subclave";
+
+/// A keyfile whose KDF parameters ride over the caps in
+/// `src-tauri/src/modules/vault/kdf.rs`. Refused before any derivation runs,
+/// so a hostile keyfile cannot hang the app with a huge Argon2id request.
+const CAPS_FAILURE: &str = "sync: the keyfile's kdf parameters exceed the accepted maximum";
 
 /// The two working keys, held only in memory and never serialized.
 ///
 /// Both halves are 32 random-derived bytes, so SWAPPING them breaks nothing
 /// observable while silently discarding the separation this design paid for.
-/// That is what [`each_path_uses_its_own_subkey`] exists to pin.
+/// That is what `each_path_uses_its_own_subkey` exists to pin.
 ///
 /// NO `Debug`, deliberately: a derived one prints key material, and the one
 /// place that would happen is a log line or a panic message written by
 /// somebody who did not think about it.
 pub struct SyncKeys {
-    data: [u8; 32],
-    name: [u8; 32],
+    pub(crate) data: Zeroizing<[u8; 32]>,
+    pub(crate) name: Zeroizing<[u8; 32]>,
 }
 
 /// What sits at the root of the remote, and the only thing a second device
@@ -121,18 +120,20 @@ pub struct SyncKeys {
 /// construction, and `wrapped` is the root key under a passphrase-derived key.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct Keyfile {
-    /// Checked, not assumed, the same way `kdf` is.
+pub struct SyncKeyfile {
+    /// Checked, not assumed. Every other keyfile check depends on it.
+    pub format: String,
     pub v: u32,
-    pub kdf: String,
-    pub iterations: u32,
-    pub salt: String,
+    pub kdf: Argon2Params,
+    /// Base64, 12 bytes.
     pub nonce: String,
+    /// Base64: AES-256-GCM(KEK, 32-byte root key).
     pub wrapped: String,
 }
 
 /// One sealed record, as it is stored. The nonce is per record and public.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct SealedRecord {
     pub nonce: String,
     pub ciphertext: String,
@@ -143,106 +144,107 @@ pub struct SealedRecord {
 /// Expand rather than Extract-then-Expand because the root is already 32
 /// uniformly random bytes from the system RNG, which is exactly the input
 /// `Prk` wants. Extract would add a step that buys nothing here.
-fn subkey(root: &[u8; 32], label: &[u8]) -> Result<[u8; 32], String> {
+fn subkey(root: &[u8; 32], label: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
     let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, root);
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     prk.expand(&[label], hkdf::HKDF_SHA256)
-        .and_then(|okm| okm.fill(&mut out))
+        .and_then(|okm| okm.fill(&mut *out))
         .map_err(|_| "sync: key expansion failed".to_string())?;
     Ok(out)
 }
 
-fn expand_root(root: &[u8; 32]) -> Result<SyncKeys, String> {
+/// The two subkeys the root expands into, the only working keys this module
+/// ever holds.
+pub fn expand_root(root: &[u8; 32]) -> Result<SyncKeys, String> {
     Ok(SyncKeys {
         data: subkey(root, DATA_LABEL)?,
         name: subkey(root, NAME_LABEL)?,
     })
 }
 
-/// Both bounds are part of this function rather than of its callers, so no
-/// future caller can reach PBKDF2 with an unchecked count. Both failures are
-/// the OPAQUE message: an out-of-range count is a malformed keyfile, and
-/// saying so in detail would only tell whoever wrote it what the ceiling is.
-fn derive_kek(passphrase: &str, salt: &[u8], iterations: u32) -> Result<[u8; 32], String> {
-    if iterations > MAX_ITERATIONS {
-        return Err(OPAQUE_FAILURE.into());
-    }
-    let iters = NonZeroU32::new(iterations).ok_or(OPAQUE_FAILURE)?;
-    let mut key = [0u8; 32];
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iters,
-        salt,
-        passphrase.as_bytes(),
-        &mut key,
-    );
-    Ok(key)
+/// The keyfile header as associated data: the shared header AAD
+/// ([`header_aad`]) over the keyfile's own format and version.
+fn kek_aad(kdf: &Argon2Params) -> Vec<u8> {
+    header_aad(KEYFILE_FORMAT, KEYFILE_VERSION, kdf)
 }
 
 /// Mint a brand new root key and wrap it under `passphrase`.
 ///
-/// Returns both halves because the caller that creates a keyfile also wants to
-/// start using it: making it re-open what it just wrote would run PBKDF2 twice
-/// for nothing.
+/// Returns the root beside the keyfile. A caller that has to PERSIST the root
+/// cannot recover it from [`SyncKeys`], whose halves are expanded subkeys, so
+/// re-opening what this just wrote would spend a second KDF run for nothing.
 ///
 /// An empty passphrase is refused HERE rather than in a caller, so the
-/// guarantee holds no matter which caller reaches this - the same placement
-/// `seal_blob` in `src-tauri/src/modules/backup.rs` uses.
-pub fn new_keyfile(passphrase: &str) -> Result<(Keyfile, SyncKeys), String> {
+/// guarantee holds no matter which caller reaches this.
+pub fn new_keyfile_with_root(
+    passphrase: &str,
+) -> Result<(SyncKeyfile, Zeroizing<[u8; 32]>), String> {
     if passphrase.is_empty() {
         return Err("sync: a passphrase is required".into());
     }
-    let rng = SystemRandom::new();
-    let mut salt = [0u8; SALT_LEN];
-    rng.fill(&mut salt)
-        .map_err(|_| "sync: random salt failed".to_string())?;
-    let mut root = [0u8; 32];
-    rng.fill(&mut root)
+    let kdf = fresh_params()?;
+    let mut root = Zeroizing::new([0u8; 32]);
+    SystemRandom::new()
+        .fill(&mut *root)
         .map_err(|_| "sync: random root key failed".to_string())?;
 
-    let kek = derive_kek(passphrase, &salt, PBKDF2_ITERATIONS)?;
-    let (nonce, wrapped) = seal_with_key(&kek, &root)?;
+    let kek = derive_key(passphrase, &kdf)?;
+    let (nonce, wrapped) = seal_with_key(&kek, &kek_aad(&kdf), &root[..])?;
 
     Ok((
-        Keyfile {
+        SyncKeyfile {
+            format: KEYFILE_FORMAT.into(),
             v: KEYFILE_VERSION,
-            kdf: KDF_NAME.into(),
-            iterations: PBKDF2_ITERATIONS,
-            salt: B64.encode(salt),
+            kdf,
             nonce: B64.encode(nonce),
             wrapped: B64.encode(&wrapped),
         },
-        expand_root(&root)?,
+        root,
     ))
 }
 
-/// Unwrap the root key out of a keyfile and expand it.
-///
-/// `v` and `kdf` are checked BEFORE anything is derived, and those two are the
-/// only failures here that name what went wrong: an unreadable keyfile version
-/// is a "this device runs an older build" message, and neither depends on the
-/// passphrase, so neither is a guessing oracle. Every other failure below -
-/// wrong passphrase, tampered `wrapped`, malformed base64, an iteration count
-/// outside the accepted range - is [`OPAQUE_FAILURE`].
-pub fn open_keyfile(kf: &Keyfile, passphrase: &str) -> Result<SyncKeys, String> {
-    if kf.v != KEYFILE_VERSION {
-        return Err(format!(
-            "sync: unsupported keyfile version {}, expected {KEYFILE_VERSION}",
-            kf.v
-        ));
-    }
-    if kf.kdf != KDF_NAME {
-        return Err(format!("sync: unsupported key derivation \"{}\"", kf.kdf));
-    }
-    let salt = B64.decode(&kf.salt).map_err(|_| OPAQUE_FAILURE)?;
-    let wrapped = B64.decode(&kf.wrapped).map_err(|_| OPAQUE_FAILURE)?;
-    let nonce = decode_nonce(&kf.nonce)?;
+/// [`new_keyfile_with_root`] with the root expanded into its two subkeys, for a
+/// caller that is about to use them rather than store the root.
+pub fn new_keyfile(passphrase: &str) -> Result<(SyncKeyfile, SyncKeys), String> {
+    let (keyfile, root) = new_keyfile_with_root(passphrase)?;
+    Ok((keyfile, expand_root(&root)?))
+}
 
-    let kek = derive_kek(passphrase, &salt, kf.iterations)?;
-    let root: [u8; 32] = open_with_key(&kek, &nonce, wrapped, PREFIX)?
+/// Unwrap the root key out of a keyfile.
+///
+/// `format`, `v` and the KDF caps are checked BEFORE anything is derived, and
+/// those three are the only failures here that name what went wrong: an
+/// unreadable keyfile is a "this is not ours" or "this device runs an older
+/// build" message, and none of them depends on the passphrase, so none is a
+/// guessing oracle. Every other failure below (wrong passphrase, tampered
+/// `wrapped`, malformed base64, a bad salt) is `OPAQUE_FAILURE`.
+pub fn open_keyfile_root(
+    kf: &SyncKeyfile,
+    passphrase: &str,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    if kf.format != KEYFILE_FORMAT {
+        return Err(NOT_A_KEYFILE.to_string());
+    }
+    if kf.v != KEYFILE_VERSION {
+        return Err(NEWER_KEYFILE.to_string());
+    }
+    check_params(&kf.kdf).map_err(|_| CAPS_FAILURE.to_string())?;
+
+    let nonce = decode_nonce(&kf.nonce)?;
+    let wrapped = B64.decode(&kf.wrapped).map_err(|_| OPAQUE_FAILURE)?;
+
+    let kek = derive_key(passphrase, &kf.kdf).map_err(|_| OPAQUE_FAILURE)?;
+    let root: [u8; 32] = open_with_key(&kek, &kek_aad(&kf.kdf), &nonce, wrapped, "sync")
+        .map_err(|_| OPAQUE_FAILURE)?
         .as_slice()
         .try_into()
         .map_err(|_| OPAQUE_FAILURE)?;
+    Ok(Zeroizing::new(root))
+}
+
+/// [`open_keyfile_root`] with the root expanded into its two subkeys.
+pub fn open_keyfile(kf: &SyncKeyfile, passphrase: &str) -> Result<SyncKeys, String> {
+    let root = open_keyfile_root(kf, passphrase)?;
     expand_root(&root)
 }
 
@@ -253,26 +255,27 @@ fn decode_nonce(encoded: &str) -> Result<[u8; NONCE_LEN], String> {
         .ok_or_else(|| OPAQUE_FAILURE.to_string())
 }
 
-/// Seal one record's JSON under the data key.
+/// Seal one record's bytes under the data key.
 ///
 /// A FRESH RANDOM NONCE PER CALL, drawn inside
 /// `src-tauri/src/modules/aesgcm.rs`. `OneNonce` guarantees one use per key
 /// INSTANCE and cannot guarantee this: the same data key seals every record in
 /// the inventory, so a constant nonce here would be reuse across the whole
 /// inventory rather than within one file.
-pub fn seal_record(keys: &SyncKeys, plaintext: &str) -> Result<SealedRecord, String> {
-    let (nonce, buf) = seal_with_key(&keys.data, plaintext.as_bytes())?;
+pub fn seal_record(keys: &SyncKeys, plaintext: &[u8]) -> Result<SealedRecord, String> {
+    let (nonce, buf) = seal_with_key(&keys.data, &[], plaintext)?;
     Ok(SealedRecord {
         nonce: B64.encode(nonce),
         ciphertext: B64.encode(&buf),
     })
 }
 
-pub fn open_record(keys: &SyncKeys, sealed: SealedRecord) -> Result<String, String> {
+/// Open what `seal_record` produced. AAD is empty: the record's identity is
+/// the object name it is stored under.
+pub fn open_record(keys: &SyncKeys, sealed: &SealedRecord) -> Result<Zeroizing<Vec<u8>>, String> {
     let nonce = decode_nonce(&sealed.nonce)?;
     let buf = B64.decode(&sealed.ciphertext).map_err(|_| OPAQUE_FAILURE)?;
-    let plain = open_with_key(&keys.data, &nonce, buf, PREFIX)?;
-    String::from_utf8(plain).map_err(|_| OPAQUE_FAILURE.to_string())
+    open_with_key(&keys.data, &[], &nonce, buf, "sync")
 }
 
 /// The remote's name for one record: `hex(HMAC-SHA256(name_key, kind:id))`.
@@ -282,28 +285,27 @@ pub fn open_record(keys: &SyncKeys, sealed: SealedRecord) -> Result<String, Stri
 /// can list the storage.
 ///
 /// Hex rather than base64 because the result is a path segment, and base64's
-/// alphabet includes `/`. The encoding is one fold, not a dependency.
+/// alphabet includes `/`. The encoding is the `hex` crate's, which
+/// `sigv4::hex` in `src-tauri/src/modules/sync/providers/sigv4.rs` also calls.
 ///
-/// The `:` is a real separator only because NO `kind` CONTAINS ONE - the five
-/// in use are `host`, `group`, `identity`, `key` and `rule`. Without that,
+/// The `:` is a real separator only because NO `kind` CONTAINS ONE. The two in
+/// use are `entry` and `group`, and both live in
+/// `src-tauri/src/modules/sync/model.rs`. Without that,
 /// `("a:b", "c")` and `("a", "b:c")` would name one object.
 pub fn object_name(keys: &SyncKeys, kind: &str, id: &str) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &keys.name);
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &keys.name[..]);
     let tag = hmac::sign(&key, format!("{kind}:{id}").as_bytes());
-    tag.as_ref().iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    hex::encode(tag.as_ref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::vault::kdf::{MAX_ITERATIONS, MAX_MEMORY_KIB, MAX_PARALLELISM};
 
     /// One keyfile plus its keys, for tests that do not care about the
     /// passphrase.
-    fn fresh() -> (Keyfile, SyncKeys) {
+    fn fresh() -> (SyncKeyfile, SyncKeys) {
         new_keyfile("correct horse").expect("new keyfile")
     }
 
@@ -313,12 +315,18 @@ mod tests {
         // inventory, not within one file, which is why this is asserted here
         // and not left to `OneNonce`.
         let (_, keys) = fresh();
-        let a = seal_record(&keys, "the same record").unwrap();
-        let b = seal_record(&keys, "the same record").unwrap();
+        let a = seal_record(&keys, b"the same record").unwrap();
+        let b = seal_record(&keys, b"the same record").unwrap();
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ciphertext, b.ciphertext);
-        assert_eq!(open_record(&keys, a).unwrap(), "the same record");
-        assert_eq!(open_record(&keys, b).unwrap(), "the same record");
+        assert_eq!(
+            open_record(&keys, &a).unwrap().as_slice(),
+            b"the same record"
+        );
+        assert_eq!(
+            open_record(&keys, &b).unwrap().as_slice(),
+            b"the same record"
+        );
     }
 
     #[test]
@@ -328,7 +336,7 @@ mod tests {
         // construction where the two differ, including one that never calls
         // HKDF at all.
         let (_, keys) = fresh();
-        assert_ne!(keys.data, keys.name);
+        assert_ne!(&*keys.data, &*keys.name);
     }
 
     #[test]
@@ -336,20 +344,20 @@ mod tests {
         // Built by hand with known distinct halves, because swapping the two
         // inside this module passes every other test here unchanged.
         let straight = SyncKeys {
-            data: [1u8; 32],
-            name: [2u8; 32],
+            data: Zeroizing::new([1u8; 32]),
+            name: Zeroizing::new([2u8; 32]),
         };
         let swapped = SyncKeys {
-            data: [2u8; 32],
-            name: [1u8; 32],
+            data: Zeroizing::new([2u8; 32]),
+            name: Zeroizing::new([1u8; 32]),
         };
         // Only the DATA key is allowed to open a record sealed under it.
-        let sealed = seal_record(&straight, "payload").unwrap();
-        assert!(open_record(&swapped, sealed).is_err());
+        let sealed = seal_record(&straight, b"payload").unwrap();
+        assert!(open_record(&swapped, &sealed).is_err());
         // Only the NAME key is allowed to name an object.
         assert_ne!(
-            object_name(&straight, "host", "h-1"),
-            object_name(&swapped, "host", "h-1")
+            object_name(&straight, "entry", "e-1"),
+            object_name(&swapped, "entry", "e-1")
         );
     }
 
@@ -360,11 +368,14 @@ mod tests {
         // sealed on one device is unreadable on the other.
         let (kf, first) = fresh();
         let second = open_keyfile(&kf, "correct horse").unwrap();
-        let sealed = seal_record(&first, "shared record").unwrap();
-        assert_eq!(open_record(&second, sealed).unwrap(), "shared record");
+        let sealed = seal_record(&first, b"shared record").unwrap();
         assert_eq!(
-            object_name(&first, "key", "k-1"),
-            object_name(&second, "key", "k-1")
+            open_record(&second, &sealed).unwrap().as_slice(),
+            b"shared record"
+        );
+        assert_eq!(
+            object_name(&first, "group", "g-1"),
+            object_name(&second, "group", "g-1")
         );
     }
 
@@ -372,14 +383,14 @@ mod tests {
     fn a_record_does_not_open_under_a_different_keyfile() {
         let (_, mine) = fresh();
         let (_, theirs) = fresh();
-        let sealed = seal_record(&mine, "mine").unwrap();
-        assert!(open_record(&theirs, sealed).is_err());
+        let sealed = seal_record(&mine, b"mine").unwrap();
+        assert!(open_record(&theirs, &sealed).is_err());
     }
 
     #[test]
     fn a_wrong_passphrase_and_a_corrupt_keyfile_are_indistinguishable() {
         // `.err()` rather than `.unwrap_err()`, which would need `SyncKeys` to
-        // be `Debug` - see the struct for why it deliberately is not.
+        // be `Debug`, see the struct for why it deliberately is not.
         let (kf, _) = fresh();
         let wrong = open_keyfile(&kf, "not the passphrase")
             .err()
@@ -394,73 +405,87 @@ mod tests {
             .expect("a corrupt keyfile must fail");
 
         assert_eq!(wrong, tampered, "the two failures are distinguishable");
-        // And it says `sync`, not `backup` - the reason the prefix is a
-        // parameter rather than a literal shared between the two paths.
+        // And it says `sync`, not `vault`: the prefix is what separates this
+        // path's message from the vault file's.
         assert!(wrong.starts_with("sync:"), "unexpected error: {wrong}");
-        assert!(!wrong.contains("backup"), "unexpected error: {wrong}");
+        assert!(!wrong.contains("vault"), "unexpected error: {wrong}");
     }
 
     #[test]
-    fn a_keyfile_from_a_build_this_one_does_not_know_is_refused() {
-        let (kf, _) = fresh();
+    fn an_unknown_format_is_refused_by_name() {
+        let (mut kf, _) = fresh();
+        kf.format = "some-other-tool".into();
+        let err = open_keyfile(&kf, "correct horse")
+            .err()
+            .expect("an unknown format must fail");
+        assert_eq!(err, NOT_A_KEYFILE);
+        // The message names the product, so the user knows what it expected.
+        assert!(err.contains("Subclave"), "unexpected error: {err}");
+    }
 
-        let mut newer = kf.clone();
+    #[test]
+    fn a_newer_keyfile_is_refused_before_the_kdf() {
+        let (mut newer, _) = fresh();
         newer.v = KEYFILE_VERSION + 1;
-        assert!(open_keyfile(&newer, "correct horse").is_err());
-
-        let mut other_kdf = kf;
-        other_kdf.kdf = "argon2id".into();
-        assert!(open_keyfile(&other_kdf, "correct horse").is_err());
+        // A WRONG passphrase is the proof that the KDF never ran: had it run,
+        // this would be OPAQUE_FAILURE.
+        assert_eq!(
+            open_keyfile(&newer, "not the passphrase").err(),
+            Some(NEWER_KEYFILE.to_string())
+        );
+        assert_eq!(
+            open_keyfile(&newer, "correct horse").err(),
+            Some(NEWER_KEYFILE.to_string())
+        );
     }
 
     #[test]
-    fn the_keyfile_version_is_not_welded_to_the_envelope_version() {
-        // They are both 1 today, which is exactly why this is worth an
-        // assertion: a `use` of the envelope constant here compiles, passes
-        // every other test, and only fails the day the ENVELOPE shape changes
-        // - at which point every keyfile already on a remote is refused and
-        // the root key inside it is gone for good.
+    fn kdf_params_over_the_caps_are_refused_before_the_kdf() {
+        // Argon2id parameters arrive from storage and nothing has authenticated
+        // them by the time the KDF runs, so an unbounded request is a hang per
+        // pull for whoever can write to the remote.
         let (kf, _) = fresh();
-        assert_eq!(kf.v, KEYFILE_VERSION);
-        // Not `assert_ne!`: the claim is that the keyfile reads its OWN
-        // constant, so bumping the envelope one must not move this.
-        let mut envelope_bumped = kf.clone();
-        envelope_bumped.v = crate::modules::sync::model::WIRE_VERSION + 1;
-        assert!(open_keyfile(&envelope_bumped, "correct horse").is_err());
-        assert!(open_keyfile(&kf, "correct horse").is_ok());
-    }
 
-    #[test]
-    fn an_iteration_count_outside_the_accepted_range_is_refused_opaquely() {
-        // `iterations` arrives from storage and nothing has authenticated it
-        // by the time the KDF runs, so an unbounded count is hours of PBKDF2
-        // per pull for whoever can write to the remote.
-        let (kf, _) = fresh();
-        for count in [0, MAX_ITERATIONS + 1, u32::MAX] {
-            let mut tampered = kf.clone();
-            tampered.iterations = count;
-            let err = open_keyfile(&tampered, "correct horse")
-                .err()
-                .unwrap_or_else(|| panic!("{count} iterations must be refused"));
-            // Opaque, or the refusal tells whoever rewrote the field where the
-            // ceiling sits.
-            assert_eq!(err, OPAQUE_FAILURE);
-        }
-        // And the real count still opens, so the bound is not simply refusing
+        let mut too_much_memory = kf.clone();
+        too_much_memory.kdf.memory_kib = MAX_MEMORY_KIB + 1;
+        assert_eq!(
+            open_keyfile(&too_much_memory, "not the passphrase").err(),
+            Some(CAPS_FAILURE.to_string())
+        );
+
+        let mut too_many_iterations = kf.clone();
+        too_many_iterations.kdf.iterations = MAX_ITERATIONS + 1;
+        assert_eq!(
+            open_keyfile(&too_many_iterations, "not the passphrase").err(),
+            Some(CAPS_FAILURE.to_string())
+        );
+
+        let mut too_much_parallelism = kf.clone();
+        too_much_parallelism.kdf.parallelism = MAX_PARALLELISM + 1;
+        assert_eq!(
+            open_keyfile(&too_much_parallelism, "not the passphrase").err(),
+            Some(CAPS_FAILURE.to_string())
+        );
+
+        // The same wrong passphrase against the real parameters reaches the
+        // KDF and comes back opaque, so the caps path is not simply refusing
         // everything.
+        assert_eq!(
+            open_keyfile(&kf, "not the passphrase").err(),
+            Some(OPAQUE_FAILURE.to_string())
+        );
         assert!(open_keyfile(&kf, "correct horse").is_ok());
     }
 
     #[test]
     fn a_sealed_record_leaks_none_of_its_plaintext() {
-        // Needle discipline, as `a_sealed_export_leaks_no_metadata` in
-        // `src-tauri/src/modules/backup.rs` established it: every needle is a
-        // run of five or more characters drawn ENTIRELY from the base64
-        // alphabet. A needle carrying a `.` could only fire if the encoding
-        // itself broke, which reads as coverage without being any, and a short
-        // run turns up in base64 output by chance.
+        // Needle discipline: every needle is a run of five or more characters
+        // drawn ENTIRELY from the base64 alphabet. A needle carrying a `.`
+        // could only fire if the encoding itself broke, which reads as
+        // coverage without being any, and a short run turns up in base64
+        // output by chance.
         let needles = ["vpsalpha", "svcdeploy", "hunter2", "54321"];
-        let plain = r#"{"id":"h-1","host":"vpsalpha.example.com","port":54321,"user":"svcdeploy","password":"hunter2"}"#;
+        let plain = r#"{"id":"e-1","title":"vpsalpha","url":"vpsalpha.example.com","port":54321,"user":"svcdeploy","password":"hunter2"}"#;
         // Negative assertions pass for free when a needle is simply absent, so
         // a dropped field would read as coverage instead of a hole.
         for needle in needles {
@@ -471,7 +496,7 @@ mod tests {
         }
 
         let (_, keys) = fresh();
-        let sealed = seal_record(&keys, plain).unwrap();
+        let sealed = seal_record(&keys, plain.as_bytes()).unwrap();
         // Collected rather than asserted one at a time, so a leak names every
         // needle it exposed instead of stopping at the first.
         let leaked: Vec<&str> = needles
@@ -482,7 +507,10 @@ mod tests {
             leaked.is_empty(),
             "readable in the sealed record: {leaked:?}"
         );
-        assert_eq!(open_record(&keys, sealed).unwrap(), plain);
+        assert_eq!(
+            open_record(&keys, &sealed).unwrap().as_slice(),
+            plain.as_bytes()
+        );
     }
 
     #[test]
@@ -490,10 +518,9 @@ mod tests {
         // NEEDLE DISCIPLINE, and here it cuts the other way from the sealed
         // record's. An object name is HEX, so a needle carrying any character
         // outside `[0-9a-f]` cannot appear in one no matter what the function
-        // does - `!name.contains("identity")` is true of every hex string ever
-        // printed, and asserting it reads as coverage without being any. So
-        // the fixture's kind and id are drawn entirely from the hex alphabet
-        // and are long enough not to turn up by chance.
+        // does, and asserting it reads as coverage without being any. So the
+        // fixture's kind and id are drawn entirely from the hex alphabet and
+        // are long enough not to turn up by chance.
         let (_, keys) = fresh();
         let (kind, id) = ("decaf", "deadbeefcafe");
         let name = object_name(&keys, kind, id);

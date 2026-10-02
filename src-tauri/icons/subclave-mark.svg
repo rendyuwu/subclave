@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Subclave application mark. Source of truth for every raster in this
+  directory, `public/icon.png`, `extension/public/icons/` and `subclave.png`;
+  regenerate them all with scripts/gen-icons.mjs after editing.
+
+  A gold "S" drawn as one stroke of two mirrored arcs, on a navy tile. Not
+  Tervia's "T" monogram the scaffold started from, and no keyhole or shield,
+  which other password managers already use.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2b53" />
+      <stop offset="1" stop-color="#0d1530" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+
+  <!--
+    Two r=76 arcs meeting at the centre, point-symmetric about it. Stroke
+    width is 56 so the letter still resolves at 16x16.
+  -->
+  <path
+    d="M327.4 154 A76 76 0 1 0 256 256 A76 76 0 1 1 184.6 358"
+    fill="none"
+    stroke="#f5b83d"
+    stroke-width="56"
+    stroke-linecap="round"
+  />
+</svg>

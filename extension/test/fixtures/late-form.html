@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Login form rendered after load</title>
+  </head>
+  <body>
+    <!-- A single-page app: the login form appears well after `load`. -->
+    <div id="app">Loading</div>
+    <script>
+      window.addEventListener("load", () => {
+        setTimeout(() => {
+          document.getElementById("app").innerHTML =
+            '<form><input id="username" type="text" autocomplete="username" />' +
+            '<input id="password" type="password" autocomplete="current-password" /></form>';
+        }, 2000);
+      });
+    </script>
+  </body>
+</html>

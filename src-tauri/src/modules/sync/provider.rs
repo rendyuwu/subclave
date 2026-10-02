@@ -6,16 +6,17 @@
 //! line without touching anything in `src-tauri/src/modules/sync/model.rs` or
 //! `src-tauri/src/modules/sync/crypto.rs`.
 //!
-//! NOTHING HERE OPENS A SOCKET. The trait is a shape; the one implementation
-//! behind it lives in `src-tauri/src/modules/sync/providers/s3.rs`.
+//! NOTHING HERE OPENS A SOCKET. The trait is a shape; the implementations
+//! behind it live in `src-tauri/src/modules/sync/providers/s3/mod.rs` and
+//! `src-tauri/src/modules/sync/providers/webdav/mod.rs`.
 //!
 //! WHY THE FUTURES ARE BOXED BY HAND. `Arc<dyn SyncProvider>` needs the trait
 //! to be dyn-compatible, and a native `async fn` in a trait is not. The usual
 //! answer is a proc macro that generates exactly the signatures written out
 //! below. It is not taken here: its only route into this tree is through two
 //! plugins that declare it for the BSD-family and Linux targets only, so
-//! promoting it would newly compile it on half the bundle matrix. Four
-//! hand-written signatures cost four lines, no manifest edit and no lockfile
+//! promoting it would newly compile it on half the bundle matrix. Five
+//! hand-written signatures cost five lines, no manifest edit and no lockfile
 //! change.
 
 use std::future::Future;
@@ -23,23 +24,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
-
-/// What a backend can do that the layer above has to branch on.
-///
-/// One field today, and a struct rather than a bare `bool` so the second
-/// capability is an added field rather than a changed signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Caps {
-    /// Whether a conditional write is honoured, so the caller may use
-    /// compare-and-swap instead of last-write-wins.
-    ///
-    /// A STORED USER TOGGLE, not a probe. Probing would mean writing a
-    /// throwaway object into the user's bucket during setup, and a rejection
-    /// can come back for reasons other than the one being probed. Set wrong it
-    /// degrades to last-write-wins, which is the normal path for backends that
-    /// have no conditional write at all; it does not lose data.
-    pub cas: bool,
-}
 
 /// One object's bytes and the etag the remote gave them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,10 +82,9 @@ pub enum ProviderError {
     /// is the ordinary answer when reading and an anomaly when writing
     /// conditionally.
     NotFound,
-    /// The SSRF guard, an unsupported scheme, a redirect that was refused
-    /// rather than followed, or a remote whose own shape will not accept the
-    /// write - a parent that is an ordinary file where a collection was
-    /// needed.
+    /// The SSRF guard, an unsupported scheme, or a remote whose own shape will
+    /// not accept the write - a parent that is an ordinary file where a
+    /// collection was needed.
     ///
     /// NOT A RETRY DISPOSITION, which is why that last case is here rather
     /// than in [`ProviderError::Conflict`]: nothing about trying again changes
@@ -110,6 +93,12 @@ pub enum ProviderError {
     /// A response the provider understood as a failure but has no specific
     /// disposition for. `code` is the remote's own error code when the body
     /// carried one.
+    ///
+    /// A REFUSED CREDENTIAL IS RENDERED AS ITS OWN SENTENCE - see the
+    /// `Display` impl - because `401` and `403` are the one status a user can
+    /// act on without reading a status code, and "the remote answered 403
+    /// (SignatureDoesNotMatch)" reads like a bug report rather than a
+    /// misconfigured key.
     Remote { status: u16, code: Option<String> },
     /// The request never completed: a timeout, a refused connection, a broken
     /// stream.
@@ -137,6 +126,14 @@ impl std::fmt::Display for ProviderError {
             Self::Conflict => write!(f, "sync: a conflicting write landed during the upload"),
             Self::NotFound => write!(f, "sync: the object named by the condition is gone"),
             Self::Blocked(why) => write!(f, "sync: {why}"),
+            // The two statuses a user fixes by re-entering credentials. Every
+            // other status keeps the numbered sentence, where the code is the
+            // useful half.
+            Self::Remote {
+                status: 401 | 403, ..
+            } => {
+                write!(f, "sync: storage refused the credentials")
+            }
             Self::Remote { status, code } => match code {
                 Some(code) => write!(f, "sync: the remote answered {status} ({code})"),
                 None => write!(f, "sync: the remote answered {status}"),
@@ -161,7 +158,21 @@ pub trait SyncProvider: Send + Sync {
     /// A stable id, matching the one [`build`] dispatches on.
     fn id(&self) -> &'static str;
 
-    fn capabilities(&self) -> Caps;
+    /// Whether this backend honours a conditional write, so the caller may use
+    /// compare-and-swap instead of last-write-wins.
+    ///
+    /// `false` UNLESS A BACKEND SAYS OTHERWISE, which is the reading that
+    /// cannot lose data: a condition that is not honoured degrades to
+    /// last-write-wins, the normal path for a backend with no conditional write
+    /// at all, and the merge recovers the overwritten copy on the next pull.
+    ///
+    /// THE S3 BACKEND ANSWERS FROM A STORED USER TOGGLE rather than a probe.
+    /// Probing would mean writing a throwaway object into the user's bucket
+    /// during setup, and a rejection can come back for reasons other than the
+    /// one being probed.
+    fn cas(&self) -> bool {
+        false
+    }
 
     /// The object at `key`, or `Ok(None)` when there is none.
     ///
@@ -177,9 +188,9 @@ pub trait SyncProvider: Send + Sync {
     /// Store `bytes` at `key` and answer with the new etag.
     ///
     /// `if_match` asks for a conditional write. It is HONOURED ONLY WHEN
-    /// [`Caps::cas`] is set, so a caller may pass it unconditionally and a
-    /// backend that cannot do it degrades to last-write-wins rather than
-    /// failing.
+    /// [`cas`](SyncProvider::cas) answers `true`, so a caller may pass it
+    /// unconditionally and a backend that cannot do it degrades to
+    /// last-write-wins rather than failing.
     ///
     /// A missing key IS an error here - see [`ProviderError::NotFound`] - and
     /// that asymmetry with `get` is deliberate.
@@ -189,6 +200,18 @@ pub trait SyncProvider: Send + Sync {
         bytes: Vec<u8>,
         if_match: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + 'a>>;
+
+    /// Store `bytes` at `key` only if the key is absent.
+    ///
+    /// `Ok(Some(etag))` = written; `Ok(None)` = an object was already there and
+    /// nothing was written. A backend that cannot honour a conditional write
+    /// sends the request anyway and reports `Some`, which is the documented
+    /// residue for WebDAV.
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ProviderError>> + Send + 'a>>;
 
     /// Every object under `prefix`, following pagination to the end.
     fn list<'a>(
@@ -220,10 +243,6 @@ pub trait SyncProvider: Send + Sync {
 /// frontend, so each config struct carries camelCase field names and refuses
 /// unknown fields, which turns a renamed or misspelled field into a loud error
 /// at the first call rather than a silently defaulted one.
-///
-/// NO CALLER YET, by design. The command that selects a provider arrives with
-/// the path that uses it; this exists so that command never has to learn
-/// provider ids.
 pub fn build(id: &str, cfg: Value) -> Result<Arc<dyn SyncProvider>, ProviderError> {
     match id {
         "s3" => {
@@ -255,7 +274,7 @@ mod tests {
         json!({
             "endpoint": "https://storage.example",
             "region": "us-east-1",
-            "bucket": "tervia",
+            "bucket": "subclave",
             "cas": true,
             "accessKeyId": "test-access-key",
             "secretAccessKey": "test-secret",
@@ -266,7 +285,7 @@ mod tests {
     fn a_known_id_with_a_good_config_builds_something_behind_the_trait() {
         let provider = build("s3", s3_config()).expect("s3 builds");
         assert_eq!(provider.id(), "s3");
-        assert!(provider.capabilities().cas);
+        assert!(provider.cas());
     }
 
     fn webdav_config() -> Value {
@@ -283,7 +302,7 @@ mod tests {
         assert_eq!(provider.id(), "webdav");
         // A CONSTANT, not a toggle the user can set: the protocol gives no
         // guarantee for the user to report.
-        assert!(!provider.capabilities().cas);
+        assert!(!provider.cas());
     }
 
     #[test]
@@ -414,6 +433,36 @@ mod tests {
         );
         assert_ne!(ProviderError::PreconditionFailed, ProviderError::Conflict);
         assert_ne!(ProviderError::NotFound, ProviderError::Conflict);
+    }
+
+    #[test]
+    fn a_refused_credential_message_is_the_plain_sentence() {
+        // The one status pair a user fixes by re-entering credentials. Both
+        // spellings, and `code` present and absent, because the arm matches on
+        // the status alone and a body that carries a code must not fall
+        // through to the numbered sentence.
+        for (status, code) in [
+            (401u16, None),
+            (401, Some("InvalidAccessKeyId".to_string())),
+            (403, None),
+            (403, Some("SignatureDoesNotMatch".to_string())),
+        ] {
+            let err = ProviderError::Remote { status, code };
+            assert_eq!(
+                err.to_string(),
+                "sync: storage refused the credentials",
+                "{err:?}"
+            );
+        }
+        // Everything else keeps the numbered sentence.
+        assert_eq!(
+            ProviderError::Remote {
+                status: 404,
+                code: None
+            }
+            .to_string(),
+            "sync: the remote answered 404"
+        );
     }
 
     #[test]

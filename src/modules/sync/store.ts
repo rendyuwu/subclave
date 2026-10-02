@@ -1,16 +1,19 @@
-// Sync's own settings file: the configuration, the etag map, and the status the
-// settings window renders.
+// Sync's own settings file: the configuration and the status the status bar
+// renders.
 //
-// ITS OWN FILE, never a key inside another store's. `fileKeyValueStore.ts`
+// ITS OWN FILE, never a key inside another store's. `src/lib/fileKeyValueStore.ts`
 // records that a contended write eventually gives up and writes this session's
 // pending keys over a stale baseline, so every key a store writes is a key it
-// can clobber - and a pull writes the etag map on every run. Putting that beside
-// the host list would put the host list inside the blast radius of a background
-// pull.
+// can clobber, and a background pull writes the status on every run. Putting
+// that beside the preferences would put the preferences inside the blast radius
+// of a background pull.
 //
 // NO CREDENTIALS AND NO PASSPHRASE. This is plain JSON in the app data
-// directory beside the host list; the secret half goes to the keychain under
-// `SYNC_KEYRING_SERVICE`.
+// directory; the secret half goes into the vault payload's device state, sealed
+// with the rest of the vault. No etag map and no dirty set either: Rust holds
+// both, so a restart cannot lose them.
+
+import { create } from "zustand";
 
 import type { FileKeyValueStore } from "@/lib/fileKeyValueStore";
 
@@ -18,24 +21,11 @@ import {
   DEFAULT_SYNC_CONFIG,
   EMPTY_SYNC_STATUS,
   SYNC_CONFIG_KEY,
-  SYNC_DIRTY_KEY,
-  SYNC_ETAGS_KEY,
   SYNC_STATUS_KEY,
   type SyncConfig,
+  type SyncPhase,
   type SyncStatus,
 } from "./types";
-
-/**
- * Persistence for this module, injected.
- *
- * No crash recovery in front of it, unlike the three record stores, and that is
- * a decision rather than an omission: nothing here is user-authored. A torn
- * configuration costs the user one re-entry in settings, and a torn etag map
- * costs one full inventory download - both recoverable by doing the thing
- * again, which is what `tervia-settings.json` already accepts for the same
- * reason.
- */
-export type SyncStoreIo = FileKeyValueStore;
 
 /**
  * Every operation this module's two windows perform on that file.
@@ -49,27 +39,12 @@ export type SyncSettingsStore = {
   /**
    * Store what the settings window collected.
    *
-   * THE ONE KEY THE SETTINGS WINDOW WRITES, and `main` writes none of it - see
-   * `SYNC_CONFIG_KEY` for why the four keys are separate. Two windows writing
-   * one blob here would make a status write from `main` able to roll back a
-   * configuration the user just typed.
+   * THE ONE KEY THE SETTINGS WINDOW WRITES, and the main window writes none of
+   * it. Two windows writing one blob here would make a status write from the
+   * main window able to roll back a configuration the user just typed.
    */
   writeConfig(config: SyncConfig): Promise<void>;
-  /** `kind:id` to etag, as `sync_pull` returned it. */
-  readEtags(): Promise<Record<string, string>>;
-  writeEtags(etags: Record<string, string>): Promise<void>;
-  /**
-   * The `kind:id` slots this device still owes the remote.
-   *
-   * DURABLE, and that is not tidiness. An etag-skipped object hides this
-   * device's local edit from the reconcile entirely - the pull sees the remote
-   * copy has not moved and skips the local copy with it - so the dirty set is
-   * the only thing carrying a local edit across a restart. In memory alone, a
-   * quit inside the five-second debounce loses the edit with no error, no
-   * failed request, and a pending count of zero.
-   */
-  readDirty(): Promise<string[]>;
-  writeDirty(slots: string[]): Promise<void>;
+  /** What the last pass found, as the main window recorded it. */
   readStatus(): Promise<SyncStatus>;
   writeStatus(status: SyncStatus): Promise<void>;
 };
@@ -81,7 +56,7 @@ function object<T extends object>(raw: unknown, fallback: T): T {
   return { ...fallback, ...(raw as Partial<T>) };
 }
 
-export function createSyncSettingsStore(io: SyncStoreIo): SyncSettingsStore {
+export function createSyncSettingsStore(io: FileKeyValueStore): SyncSettingsStore {
   /**
    * Drop the cache, then do the thing.
    *
@@ -89,22 +64,14 @@ export function createSyncSettingsStore(io: SyncStoreIo): SyncSettingsStore {
    * wrapper rather than a line in each body so that a method added later cannot
    * be the one that forgets.
    *
-   * On a READ it is what makes the other window's write visible: this file is
-   * the only store two webviews write, and nothing broadcasts a change event
-   * for it, so a cached copy is otherwise frozen at whatever the file said when
-   * this webview launched.
+   * On a READ it is what makes the other window's write visible: nothing
+   * broadcasts a change event for this file, so a cached copy is otherwise
+   * frozen at whatever the file said when this webview launched.
    *
-   * On a WRITE it is what stops this window putting that frozen copy back.
-   * `createFileKeyValueStore` writes the whole map, built from its cache plus
-   * this session's pending keys - so a status write from a background pull,
-   * built on a baseline read before the user pressed Save, silently reverts the
-   * configuration they just entered. Dropping the cache immediately before
-   * forces the payload to be built on what the file says NOW, and the pending
-   * key being written survives an invalidation by design.
-   *
-   * The cost is one small file read per operation, a few per minute at most. It
-   * buys the correctness a cross-window change event would buy, without a
-   * second event to keep in step.
+   * On a WRITE it is what stops this window putting that frozen copy back:
+   * `createFileKeyValueStore` writes the whole map, so a status write from a
+   * background pull built on a baseline read before the user pressed Save would
+   * silently revert the configuration they just entered.
    */
   async function fresh<T>(op: () => Promise<T>): Promise<T> {
     io.invalidate();
@@ -118,33 +85,6 @@ export function createSyncSettingsStore(io: SyncStoreIo): SyncSettingsStore {
         await io.set(SYNC_CONFIG_KEY, config);
         await io.save();
       }),
-    readEtags: () =>
-      fresh(async () => {
-        const raw = await io.get(SYNC_ETAGS_KEY);
-        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
-        // Every value, not just the map - a hand-edited file can hold anything,
-        // and a non-string etag would be sent back as an `If-Match`.
-        const out: Record<string, string> = {};
-        for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-          if (typeof value === "string") out[key] = value;
-        }
-        return out;
-      }),
-    writeEtags: (etags) =>
-      fresh(async () => {
-        await io.set(SYNC_ETAGS_KEY, etags);
-        await io.save();
-      }),
-    readDirty: () =>
-      fresh(async () => {
-        const raw = await io.get(SYNC_DIRTY_KEY);
-        return Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
-      }),
-    writeDirty: (slots) =>
-      fresh(async () => {
-        await io.set(SYNC_DIRTY_KEY, slots);
-        await io.save();
-      }),
     readStatus: () => fresh(async () => object(await io.get(SYNC_STATUS_KEY), EMPTY_SYNC_STATUS)),
     writeStatus: (status) =>
       fresh(async () => {
@@ -153,3 +93,60 @@ export function createSyncSettingsStore(io: SyncStoreIo): SyncSettingsStore {
       }),
   };
 }
+
+/**
+ * What the status bar and the settings form read, mirrored into zustand.
+ *
+ * A MIRROR, not the source of truth: the file is, and the main window writes it.
+ * `hydrate` fills this once so a pill that mounts before the first pass still
+ * shows the last session's figures.
+ */
+type SyncStoreState = {
+  config: SyncConfig;
+  status: SyncStatus;
+  phase: SyncPhase;
+  /** Read the file once. Idempotent; safe to call from more than one place. */
+  hydrate(): Promise<void>;
+  setConfig(config: SyncConfig): void;
+  setStatus(status: SyncStatus): void;
+  setPhase(phase: SyncPhase): void;
+};
+
+/** The file this mirror reads from, injected once by `startSync`. */
+let settings: SyncSettingsStore | null = null;
+
+/** Point the mirror at the store the main window reads and writes. */
+export function setSyncSettingsStore(next: SyncSettingsStore): void {
+  settings = next;
+}
+
+let hydrated: Promise<void> | null = null;
+
+export const useSyncStore = create<SyncStoreState>((set) => ({
+  config: DEFAULT_SYNC_CONFIG,
+  status: EMPTY_SYNC_STATUS,
+  phase: "idle",
+  hydrate: async () => {
+    const source = settings;
+    // Nothing to read from yet: `startSync` injects the store before hydrating,
+    // so this only happens for a caller in a webview that never started sync.
+    if (!source) return;
+    if (!hydrated) {
+      hydrated = Promise.all([source.readConfig(), source.readStatus()])
+        .then(([config, status]) => {
+          set({ config, status });
+        })
+        .catch((e: unknown) => {
+          // Reset on failure, or one rejection is permanent for the session: the
+          // memoized promise would reject on every later call. The store layer
+          // one level down resets for the same reason.
+          hydrated = null;
+          throw e;
+        });
+    }
+    await hydrated;
+  },
+  setConfig: (config) => set({ config }),
+  setStatus: (status) => set({ status }),
+  setPhase: (phase) => set({ phase }),
+}));

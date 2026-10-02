@@ -1,7 +1,7 @@
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEffect, useRef, useState } from "react";
-import { clamp01, HEX6_RE, hexToHsv, hsvToHex, type Hsv } from "./colorMath";
+import { clamp01, HEX6_RE, hexToHsv, hsvToHex, type Hsv } from "@/lib/color";
 
 /**
  * Saturation/brightness square. Drag (or click) anywhere inside to set S (x
@@ -116,7 +116,7 @@ export function ColorSwatch({
   const isValid = HEX6_RE.test(draft);
 
   // Re-seed local draft + HSV when the parent value changes externally (preset
-  // switch, .tervia import). Skip the draft while the hex input is focused so
+  // switch, .subclave import). Skip the draft while the hex input is focused so
   // typing isn't clobbered. The HSV is only re-derived when it actually
   // diverges from `safeValue`, so a value that round-tripped through our own
   // commit doesn't reset the hue mid-drag.

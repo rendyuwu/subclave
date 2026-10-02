@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/toast";
@@ -7,23 +8,15 @@ import { IPC_EVENTS } from "@/lib/ipc";
 import type { SettingsTab } from "@/modules/settings/openSettingsWindow";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { type ComponentType, lazy, Suspense, useEffect, useState } from "react";
 import {
-  Component,
-  type ComponentType,
-  type ErrorInfo,
-  type ReactNode,
-  lazy,
-  Suspense,
-  useEffect,
-  useState,
-} from "react";
-import {
-  Code,
+  Globe,
   Info,
   Keyboard,
   Palette,
   RefreshCw,
   Settings,
+  ShieldCheck,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -31,8 +24,11 @@ import {
 const GeneralSection = lazy(() =>
   import("./sections/GeneralSection").then((m) => ({ default: m.GeneralSection })),
 );
-const CodeEditorSection = lazy(() =>
-  import("./sections/CodeEditorSection").then((m) => ({ default: m.CodeEditorSection })),
+const SecuritySection = lazy(() =>
+  import("./sections/SecuritySection").then((m) => ({ default: m.SecuritySection })),
+);
+const SyncSection = lazy(() =>
+  import("./sections/SyncSection").then((m) => ({ default: m.SyncSection })),
 );
 const ThemeSection = lazy(() =>
   import("./sections/ThemeSection").then((m) => ({ default: m.ThemeSection })),
@@ -40,8 +36,8 @@ const ThemeSection = lazy(() =>
 const ShortcutsSection = lazy(() =>
   import("./sections/ShortcutsSection").then((m) => ({ default: m.ShortcutsSection })),
 );
-const SyncSection = lazy(() =>
-  import("./sections/SyncSection").then((m) => ({ default: m.SyncSection })),
+const BrowserSection = lazy(() =>
+  import("./sections/BrowserSection").then((m) => ({ default: m.BrowserSection })),
 );
 const AboutSection = lazy(() =>
   import("./sections/AboutSection").then((m) => ({ default: m.AboutSection })),
@@ -54,10 +50,11 @@ const TABS: {
   component: ComponentType;
 }[] = [
   { id: "general", label: "General", icon: Settings, component: GeneralSection },
-  { id: "code-editor", label: "Code Editor", icon: Code, component: CodeEditorSection },
+  { id: "security", label: "Security", icon: ShieldCheck, component: SecuritySection },
+  { id: "sync", label: "Sync", icon: RefreshCw, component: SyncSection },
   { id: "theme", label: "Theme", icon: Palette, component: ThemeSection },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard, component: ShortcutsSection },
-  { id: "sync", label: "Sync", icon: RefreshCw, component: SyncSection },
+  { id: "browser", label: "Browser", icon: Globe, component: BrowserSection },
   { id: "about", label: "About", icon: Info, component: AboutSection },
 ];
 
@@ -69,55 +66,6 @@ function readInitialTab(): SettingsTab {
   const t = url.searchParams.get("tab");
   if (t && (VALID_TABS as string[]).includes(t)) return t as SettingsTab;
   return "general";
-}
-
-/**
- * Catches render-time errors inside a settings tab so a single broken
- * section does not blank the whole window. Resets when the active tab
- * changes (so flipping tabs after fixing data clears the error).
- */
-class SectionErrorBoundary extends Component<
-  { tabId: string; children: ReactNode },
-  { error: Error | null; prevTabId: string }
-> {
-  state = { error: null as Error | null, prevTabId: this.props.tabId };
-
-  static getDerivedStateFromError(error: Error): { error: Error | null } {
-    return { error };
-  }
-
-  static getDerivedStateFromProps(
-    props: { tabId: string },
-    state: { error: Error | null; prevTabId: string },
-  ): { error: Error | null; prevTabId: string } | null {
-    if (props.tabId !== state.prevTabId) {
-      return { error: null, prevTabId: props.tabId };
-    }
-    return null;
-  }
-
-  componentDidCatch(error: Error, info: ErrorInfo): void {
-    console.error("Settings section crashed", error, info.componentStack);
-  }
-
-  render() {
-    if (this.state.error) {
-      return (
-        <div className="border-destructive/40 bg-destructive/5 flex flex-col gap-2 border p-4">
-          <span className="text-destructive text-[12px] font-semibold">
-            This section failed to render.
-          </span>
-          <pre className="text-muted-foreground max-h-40 overflow-auto font-mono text-[10.5px] whitespace-pre-wrap">
-            {this.state.error.message}
-          </pre>
-          <span className="text-muted-foreground text-[10.5px]">
-            Switch to another tab and back to retry, or report the issue with the message above.
-          </span>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
 }
 
 export function SettingsApp() {
@@ -152,7 +100,7 @@ export function SettingsApp() {
             lives in the body below (not the header), also like Debug. */}
         <header
           data-tauri-drag-region
-          className={`border-border/60 bg-card flex h-11 shrink-0 items-center gap-2 border-b ${
+          className={`border-border/60 bg-card flex h-9 shrink-0 items-center gap-2 border-b ${
             IS_MAC ? "pr-3 pl-22" : "pr-0 pl-3"
           }`}
         >
@@ -200,9 +148,27 @@ export function SettingsApp() {
           </Tabs>
           <div className="themed-scroll min-h-0 flex-1 overflow-auto px-8 pt-4 pb-7">
             <div className="mx-auto w-full max-w-3xl">
-              <SectionErrorBoundary tabId={active}>
+              {/* keyed on the tab so a crash clears when the user flips tabs,
+                  matching the reset the section boundary used to do by hand. */}
+              <ErrorBoundary
+                key={active}
+                fallback={(error) => (
+                  <div className="border-destructive/40 bg-destructive/5 flex flex-col gap-2 border p-4">
+                    <span className="text-destructive text-[12px] font-semibold">
+                      This section failed to render.
+                    </span>
+                    <pre className="text-muted-foreground max-h-40 overflow-auto font-mono text-[10.5px] whitespace-pre-wrap">
+                      {error.message}
+                    </pre>
+                    <span className="text-muted-foreground text-[10.5px]">
+                      Switch to another tab and back to retry, or report the issue with the message
+                      above.
+                    </span>
+                  </div>
+                )}
+              >
                 <Suspense fallback={null}>{ActiveSection && <ActiveSection />}</Suspense>
-              </SectionErrorBoundary>
+              </ErrorBoundary>
             </div>
           </div>
         </main>

@@ -1,485 +1,116 @@
-// The vault: named credentials, owned by nobody and referenced by hosts.
-//
-// Two records in one store file. A VaultIdentity is "who I log in as"; a VaultKey
-// is a private key, stored ONCE and shared by every identity that uses it.
-//
-// What this buys is FEWER COPIES of the same secret, not a stronger secret. On
-// Linux a private key sits in a mode-0600 JSON file before and after this work.
-// Nothing here changes that.
+// Canonical TypeScript mirrors of the vault projections and drafts in
+// `src-tauri/src/modules/vault/model/mod.rs`. Field for field, camelCase, enums
+// lowercase; a rename on one side is a compile error on the other, which is
+// the point.
 
-export const VAULT_STORE_PATH = "tervia-vault.json";
-export const VAULT_IDENTITIES_KEY = "identities";
-export const VAULT_KEYS_KEY = "keys";
-
-/** Secret service for everything the vault owns. */
-export const VAULT_KEYRING_SERVICE = "tervia-vault";
+export type EntryColor = "red" | "yellow" | "green" | "cyan" | "blue" | "magenta";
+export type MatchMode = "domain" | "host" | "exact";
+export type VersionReason = "edit" | "restore" | "conflict";
 
 /**
- * Secret service for credentials a HOST owns itself (an inline binding).
- *
- * Declared here rather than in the host module because `resolve.ts` owns the
- * binding union and is the thing that dereferences these accounts; the host store
- * imports the constant from here so there is exactly one spelling of it.
+ * The field `vault_entry_reveal` and `clip_copy_field` accept. `custom:<name>`
+ * reaches one custom field's value; `history:<updatedAt>:password` a history
+ * version's password.
  */
-export const HOST_KEYRING_SERVICE = "tervia-hosts";
+export type RevealField =
+  "password" | "totp" | "username" | `custom:${string}` | `history:${number}:password`;
 
-/** Vault-owned fields. */
-export const IDENTITY_PASSWORD_FIELD = "password";
-export const KEY_PRIVATE_KEY_FIELD = "privateKey";
-export const KEY_PASSPHRASE_FIELD = "passphrase";
+/** Mirrors `vault::VaultStatus`. */
+export type VaultStatus = {
+  exists: boolean;
+  locked: boolean;
+  savePending: boolean;
+  /** True while the payload came from the `.bak` and every save is refused. */
+  saveBlocked: boolean;
+  /** Epoch ms mtime of the `.bak`, `null` when there is none. */
+  backupAt: number | null;
+  /** Ms until the idle deadline; `null` while locked or when auto-lock is off. */
+  locksInMs: number | null;
+};
 
-/**
- * Host-owned SSH fields. Note the passphrase: `keyPassphrase` here, plain
- * `passphrase` on a vault key.
- *
- * The two differ on purpose: an account is named after the presence flag that
- * tracks it, so `hasKeyPassphrase` -> `keyPassphrase` on a host and
- * `hasPassphrase` -> `passphrase` on a key. That keeps the mapping mechanical on
- * both sides instead of memorable on one.
- */
-export const HOST_SSH_PASSWORD_FIELD = "password";
-export const HOST_SSH_PRIVATE_KEY_FIELD = "privateKey";
-export const HOST_SSH_KEY_PASSPHRASE_FIELD = "keyPassphrase";
+/** The wire field is literally `match` (a Rust keyword there). */
+export type EntryUrl = { url: string; match: MatchMode };
 
-/**
- * Host-owned RDP password field. Same VALUE as the SSH one today, and a separate
- * constant because a merged host row can carry both protocols: if it ever turns
- * out that one machine needs a different password per protocol, this is the one
- * line that changes rather than every call site.
- */
-export const HOST_RDP_PASSWORD_FIELD = "password";
-
-/**
- * Every keychain field one identity can own, and every field one key can own,
- * each in one list so a caller that has to enumerate them cannot miss one. Same
- * reason `SSH_SECRET_FIELDS` exists, and the same caller will need these: an
- * export builds a keychain reference per field, and a field left out simply does
- * not travel.
- */
-export const VAULT_IDENTITY_SECRET_FIELDS = [IDENTITY_PASSWORD_FIELD] as const;
-export const VAULT_KEY_SECRET_FIELDS = [KEY_PRIVATE_KEY_FIELD, KEY_PASSPHRASE_FIELD] as const;
-
-/**
- * `<id>::<field>`, the app-wide keychain account shape. Exported because
- * `resolve.ts` hands the RDP path a REFERENCE instead of a value, so the string
- * itself travels; `secrets_get_all` batching also depends on nothing more than
- * the account list being enumerable.
- */
-export function vaultAccount(id: string, field: string): string {
-  return `${id}::${field}`;
-}
-
-/**
- * How an identity proves who it is.
- *
- * The same three modes the SSH connection store names, and kept in step BY HAND:
- * nothing here imports from `modules/ssh` and nothing there imports from here, so
- * NO compiler check spans the two. Claiming one would be worse than admitting
- * there isn't one.
- *
- * What is checked is narrower and entirely local: every switch over this union in
- * `resolve.ts` ends in a `never` assignment, so adding a mode HERE fails to
- * compile until each mapping handles it. A mode added on the SSH side alone is
- * invisible to `tsc` and has to be caught in review.
- *
- * RDP only ever uses a password.
- */
-export type VaultAuthMode = "password" | "key" | "agent";
-
-/** A named way of proving who you are. Referenced by hosts, never owned by one. */
-export type VaultIdentity = {
+export type EntrySummary = {
   id: string;
-  /** Shown wherever a host names its credential ("root @ prod", "rendy (admin)"). */
-  name: string;
+  groupId: string;
+  title: string;
   username: string;
-  /** NetBIOS/DNS domain. RDP only; absent for a local account or a UPN username. */
-  domain?: string;
-  authMode: VaultAuthMode;
-  /**
-   * Password at `tervia-vault :: <id>::password`.
-   *
-   * Independent of `authMode` on purpose: one identity can be a key over SSH and
-   * the same account's password over RDP, which is the whole point of sharing it
-   * across protocols.
-   */
+  primaryHost: string | null;
+  tags: string[];
+  icon: string | null;
+  color: EntryColor | null;
+  favorite: boolean;
   hasPassword: boolean;
-  /** Set when `authMode === "key"`. Names a {@link VaultKey}. */
-  keyId?: string;
-  description?: string;
-  /** Unix ms of the last change, stamped by the store on every write. Absent is
-   *  not zero and is never backfilled on read - `HostBase.updatedAt` in
-   *  `modules/hosts/types.ts` carries the full reasoning, and this field means
-   *  exactly the same thing. */
-  updatedAt?: number;
-  /** Unix ms of the last successful connect that authenticated as this identity,
-   *  FROM THIS DEVICE. Written only by `markIdentityConnected` in
-   *  `src/modules/vault/store.ts`. Never synced (`DEVICE_LOCAL_FIELDS` strips it by
-   *  name), never folded into `updatedAt`, and not restored by a backup import
-   *  (KNOWN-LIMITS.md). */
-  lastConnectedAt?: number;
+  hasTotp: boolean;
+  expiresAt: number | null;
+  updatedAt: number;
+  lastUsedAt: number | null;
 };
 
-/** What `ssh_key_inspect` reports. Display only. */
-export type VaultKeyType = "rsa" | "ed25519" | "ecdsa" | "unknown";
+export type DetailCustomField = { name: string; hidden: boolean; value: string | null };
+export type DetailVersion = { updatedAt: number; reason: VersionReason; changed: string[] };
 
-/**
- * What kind of vault key this is. Absent means today's shape: a PEM body,
- * stored exactly as before - read-time adoption, no migration.
- *
- * - `"cert"`: the signing private key is stored exactly like a `pem` key
- *   (same `hasPrivateKey`/`hasPassphrase` accounts, same `decode_secret_key`
- *   at dial time), plus an OpenSSH certificate. The certificate is PUBLIC,
- *   so it lives in `certificate` below, never in the keychain.
- * - `"hardware"`: no secret at all. `hasPrivateKey`/`hasPassphrase` stay
- *   `false` forever; `fingerprint` is the identifying fact, matched against
- *   the OS ssh-agent at dial time (`resolveSshAuth`, `src/modules/vault/resolve.ts`).
- */
-export type VaultKeyKind = "cert" | "hardware";
+export type EntryDetail = EntrySummary & {
+  urls: EntryUrl[];
+  notes: string;
+  /** Hidden values are masked to `null`: the detail never carries them. */
+  customFields: DetailCustomField[];
+  history: DetailVersion[];
+  createdAt: number;
+};
 
-/** A private key, stored once and shared by every identity that uses it. */
-export type VaultKey = {
+export type DraftCustomField = { name: string; hidden: boolean; value?: string | null };
+
+export type EntryDraft = {
+  id: string | null;
+  groupId: string;
+  title: string;
+  username: string;
+  /** Omitted keeps the stored password; the create arm needs a value. */
+  password?: string;
+  urls: EntryUrl[];
+  notes: string;
+  /** `undefined` = unchanged, `null` = clear, a URI = set. */
+  totp?: string | null;
+  customFields: DraftCustomField[];
+  tags: string[];
+  icon: string | null;
+  color: EntryColor | null;
+  favorite: boolean;
+  expiresAt: number | null;
+};
+
+export type Group = {
   id: string;
-  /** See {@link VaultKeyKind}. */
-  kind?: VaultKeyKind;
-  /** Referenced by NAME across many hosts, so a duplicate is a real usability
-   *  failure - see the collision warning in `store.ts`. */
+  parentId: string | null;
   name: string;
-  keyType?: VaultKeyType;
-  /** `SHA256:<base64, unpadded>` of the public half. Display, and duplicate
-   *  detection at import. */
-  fingerprint?: string;
-  /** Non-secret, so it lives in the store: shown, copyable, pasteable straight
-   *  into `authorized_keys`. */
-  publicKey?: string;
-  /** Private key at `tervia-vault :: <id>::privateKey`. */
-  hasPrivateKey: boolean;
-  /** Passphrase at `tervia-vault :: <id>::passphrase`. */
-  hasPassphrase: boolean;
-  /**
-   * Whether the stored key BODY is passphrase-encrypted, as an inspection
-   * answered it.
-   *
-   * THREE-STATE, and absent is not `false`. Absent means no inspection has ever
-   * answered this - the truth for every record written before this field
-   * existed, and for every record an import builds, since `sanitizeKey` in
-   * `modules/backup/file.ts` reads a file and inspects nothing. `false` is the
-   * stronger claim that something looked and the body is not encrypted.
-   * Collapsing the two would have a record assert an inspection it never had,
-   * which is the class of false statement this field exists to remove -
-   * `keyInspect.ts` draws the same line between "we looked and the answer is X"
-   * and "we could not look" for `keyType`.
-   *
-   * WHAT IT IS FOR. Without it, `hasPrivateKey: true` with
-   * `hasPassphrase: false` describes two states nothing can tell apart: a key
-   * that legitimately has no passphrase, and an ENCRYPTED key whose passphrase
-   * is not stored. The second fails every connect, and an `openssh-key-v1` body
-   * inspected WITHOUT its passphrase still answers with a real type, fingerprint
-   * and public half - so the broken record looks exactly as complete as the
-   * working one. `keyNeedsPassphrase` in `refs.ts` is the question this field
-   * exists to be asked.
-   *
-   * The state is RECOVERABLE, and this field is what makes the recovery
-   * findable rather than what stands in for it: `keySecretsForSave` in
-   * `editor/draft.ts` forwards a lone passphrase, so typing one into the key
-   * editor over a blank body adds it to the stored key. The problem this field
-   * solves is that nothing could say WHICH rows need that done.
-   */
-  encrypted?: boolean;
-  description?: string;
-  /** Unix ms of the last change, on the same terms as
-   *  {@link VaultIdentity.updatedAt}. */
-  updatedAt?: number;
-  /** The last successful SSH connect that authenticated with this key, on the
-   *  terms of {@link VaultIdentity.lastConnectedAt}. */
-  lastConnectedAt?: number;
-  /**
-   * `kind === "cert"` only: the OpenSSH certificate text
-   * (`ssh-ed25519-cert-v01@openssh.com ...`). Public - the certified key's
-   * own private half is what is secret, and that is `hasPrivateKey` above,
-   * unchanged from a `pem` key.
-   */
-  certificate?: string;
-  /** `kind === "cert"` only, parsed from `certificate` by `ssh_key_classify`
-   *  at save time: the signing CA's own fingerprint. */
-  certCaFingerprint?: string;
-  /** `kind === "cert"` only: the certificate's `key_id`, a CA-chosen label. */
-  certKeyId?: string;
-  /** `kind === "cert"` only: the usernames/hostnames this certificate is
-   *  valid for. */
-  certPrincipals?: string[];
-  /** `kind === "cert"` only, unix seconds. */
-  certValidAfter?: number;
-  /** `kind === "cert"` only, unix seconds - absent means the certificate
-   *  never expires (OpenSSH's `u64::MAX` "forever" sentinel). */
-  certValidBefore?: number;
+  icon: string | null;
+  color: EntryColor | null;
+  createdAt: number;
+  updatedAt: number;
 };
 
-/**
- * What an identity and a key are called in a tombstone's `kind`.
- *
- * Both kinds share ONE tombstone list, because both live in one file and `kind`
- * is what tells them apart.
- */
-export const IDENTITY_TOMBSTONE_KIND = "identity";
-export const KEY_TOMBSTONE_KIND = "key";
-
-/** A reference to a shared vault identity. */
-export type VaultIdentityBinding = { kind: "identity"; identityId: string };
-
-/**
- * SSH credentials one host owns alone. Flags only - the secrets themselves live
- * under `tervia-hosts :: <hostId>::<field>`.
- *
- * `hostId` is part of the binding rather than a second argument alongside it,
- * which removes the RESOLVE-time mismatch entirely: no call site can hand the
- * resolver one host's binding and another host's id.
- *
- * It does NOT remove the mismatch, it moves it to write time, where nothing in
- * the type system catches it. The live hazard is a spread copy: a duplicate-host
- * action written as `{ ...source, id: newId() }` carries `hostId` verbatim, so the
- * copy's binding names the SOURCE host. Resolution then reads the source's
- * accounts while the copy's own secrets sit under the new id, unread - rotating
- * the source's password changes the copy's, and deleting the source deletes what
- * the copy authenticates with. No error anywhere.
- *
- * So the pair is enforced on WRITE, by the host store, which must call
- * {@link assertBindingOwner} on every upsert; a duplicate must rewrite `hostId`
- * alongside `id`. This type is not the enforcement and cannot be.
- */
-export type SshInlineCredentials = {
-  kind: "inline";
-  /** The host these accounts belong to. See the note above. */
-  hostId: string;
-  user: string;
-  authMode: VaultAuthMode;
-  hasPassword: boolean;
-  hasPrivateKey: boolean;
-  hasKeyPassphrase: boolean;
+export type GroupDraft = {
+  id: string | null;
+  parentId: string | null;
+  name: string;
+  icon: string | null;
+  color: EntryColor | null;
 };
 
-/** RDP credentials one host owns alone. Carries its `hostId` for the same reason
- *  {@link SshInlineCredentials} does. */
-export type RdpInlineCredentials = {
-  kind: "inline";
-  hostId: string;
-  username: string;
-  domain?: string;
-  hasPassword: boolean;
+export type Strength = { score: number; warning: string | null };
+
+export type GeneratorOptions = {
+  length: number;
+  lower: boolean;
+  upper: boolean;
+  digits: boolean;
+  symbols: boolean;
+  excludeAmbiguous: boolean;
 };
 
-/**
- * How a host proves who it is: a shared identity, or credentials it owns itself.
- *
- * These live HERE, not in the host module, and the host module imports them:
- * `resolve.ts` is what turns one of these into something the connect path can use,
- * so it owns them. The inline arm is protocol-specific because the two protocols
- * have genuinely different invariants - SSH needs an auth mode, RDP needs a domain.
- *
- * Two unions, and deliberately NO third one combining them: both inline arms carry
- * `kind: "inline"`, so a combined union does not narrow - a `kind === "inline"`
- * guard over it leaves `SshInlineCredentials | RdpInlineCredentials`, where `user`
- * and `username` are each a type error. A host record holds one of each instead.
- */
-export type SshCredentialBinding = VaultIdentityBinding | SshInlineCredentials;
-export type RdpCredentialBinding = VaultIdentityBinding | RdpInlineCredentials;
+export type TotpCode = { code: string; period: number; remaining: number };
 
-/**
- * Refuse a binding whose `hostId` names a host other than the one storing it.
- *
- * The write-time half of the invariant {@link SshInlineCredentials} describes, and
- * the only half there is: call this on EVERY host upsert, for every binding the
- * record carries. Nothing else can catch a spread copy that took `hostId` along.
- *
- * `ownerId` is a required parameter for the reason {@link IdentityHostRefs} is:
- * a caller allowed to omit it would skip the guard silently, and the guard is the
- * only thing standing between a duplicated host and secrets it shares with the
- * original without saying so. Both ids must be present - `"" === ""` would
- * otherwise pass a half-built record straight through.
- */
-export function assertBindingOwner(
-  binding: SshCredentialBinding | RdpCredentialBinding,
-  ownerId: string,
-): void {
-  if (binding.kind !== "inline") return;
-  if (!ownerId || !binding.hostId) {
-    throw new Error("vault: inline credentials need a host id on both sides to be checked");
-  }
-  if (binding.hostId !== ownerId) {
-    throw new Error(
-      `vault: inline credentials belong to host ${binding.hostId} but are being stored on ` +
-        `host ${ownerId} - a copy that did not rewrite hostId reads the ORIGINAL host's secrets`,
-    );
-  }
-}
-
-/** Something that holds a reference, named well enough for a refusal to be
- *  actionable rather than merely correct. */
-export type VaultRef = { id: string; name: string };
-
-/**
- * Every host bound to one identity, plus every group naming it as a default -
- * everything `deleteIdentity` refuses to delete over.
- *
- * INJECTED, never imported. `modules/hosts` imports
- * {@link SshCredentialBinding} and {@link RdpCredentialBinding} from
- * this module, so a vault -> hosts import would close a cycle. The wiring is
- * `(id) => [...hostsUsingIdentity(hosts, id), ...groupsUsingIdentity(groups, id)]`
- * (`modules/vault/refs.ts`).
- *
- * Required, never optional: a caller allowed to pass nothing would silently skip
- * the guard, and the guard is the only thing between one confirmed delete and a
- * host - or a group's default - that can no longer name what it claims to.
- */
-export type IdentityHostRefs = (identityId: string) => VaultRef[] | Promise<VaultRef[]>;
-
-/**
- * A delete refused because something still points at the record, naming what.
- *
- * Refuse, never cascade. Cascading turns one confirmed delete into silent
- * breakage of hosts the user was not looking at, and re-entering a credential
- * costs far more than clearing the references first.
- */
-export class VaultInUseError extends Error {
-  readonly holders: VaultRef[];
-
-  constructor(subject: string, holderKind: "identity" | "host", holders: VaultRef[]) {
-    const noun =
-      holders.length === 1 ? holderKind : holderKind === "identity" ? "identities" : "hosts";
-    const named = holders.map((h) => h.name || h.id).join(", ");
-    super(`cannot delete ${subject}: still used by ${holders.length} ${noun} (${named})`);
-    this.name = "VaultInUseError";
-    this.holders = holders;
-  }
-}
-
-/** The value {@link vaultKeyStamp} and {@link vaultIdentityStamp} report for a
- *  record that is not in the store at all. */
-export const VAULT_STAMP_ABSENT = "absent";
-
-/**
- * What a key's SECRET MATERIAL is, as one comparable string.
- *
- * A string rather than a structural comparison for the reason `modules/hosts`'s
- * own `credentialStamp` gives: the only question anyone asks of it is "is this
- * still the same thing it was", and a string makes that one `!==` at the write
- * instead of a deep compare each caller writes for itself.
- *
- * Deliberately NOT a hash of the whole record. It answers one question - has the
- * secret material moved under a form that loaded this record - and widening it to
- * every field would refuse ordinary concurrent RENAMES, which last-write-wins
- * already handles correctly. So `name`, `description`, `keyType` and `publicKey`
- * are all outside it, on purpose.
- *
- * The fingerprint IS inside it, and is not a rename in disguise: it is what the
- * stored private key is, so a change to it means the material this record names
- * is a different key.
- *
- * THE ENCRYPTION STATE IS INSIDE IT TOO, as a third flag character, and the
- * fingerprint does not already cover it: a RE-ENCRYPTED COPY OF ONE KEY KEEPS
- * ITS FINGERPRINT. The fingerprint is of the public half, which changing or
- * removing a passphrase does not touch - the host editor's key-reuse copy says
- * exactly that in the sentence it shows the user, and `credentialMove.ts` in
- * `modules/hosts` repeats it. So a stored body swapped for a decrypted copy of
- * itself is a move in the secret material with an unchanged fingerprint, and
- * without this character the stamp calls the two records identical.
- *
- * Three states rather than a second `0`/`1`, because {@link VaultKey.encrypted}
- * is three-state: `-` is "no inspection has answered this", which is a
- * different record from one an inspection found unencrypted, and folding them
- * together would hide the first inspection of an imported key.
- *
- * `=== true` and `=== false`, never a truthiness test, and every OTHER value
- * stamps as `-`. The field is typed `boolean | undefined` but the store reads
- * `tervia-vault.json` without re-validating it, so a hand-edited file can put
- * `null` or a string there - and `-` is what those are: not an answer. A
- * truthiness test made `"yes"` stamp identically to `true` while
- * `keyNeedsPassphrase` in `refs.ts` answered `false` for it, which is one
- * three-state field read by two rules; and it made `null` stamp as `0`, the
- * STRONGER claim that something looked and found the body unencrypted. Both
- * readers now test `=== true` for the encrypted answer.
- *
- * `kind` and, for a `cert` key, `certificate` itself are appended for the
- * same reason the fingerprint is included: a `cert` record whose signing key
- * stays untouched but whose `certificate` field is swapped for a DIFFERENT
- * certificate over the SAME key is a materially different authentication
- * fact (a different validity window, different principals) that none of the
- * fields above would otherwise notice, since the fingerprint they hash is
- * the signing key's, not the certificate's. `kind` alone guards a record
- * changing shape entirely - `pem` to `hardware`, say - from ever reading as
- * unchanged.
- */
-export function vaultKeyStamp(key: VaultKey | null | undefined): string {
-  if (!key) return VAULT_STAMP_ABSENT;
-  const encrypted = key.encrypted === true ? "1" : key.encrypted === false ? "0" : "-";
-  const kind = key.kind ?? "pem";
-  const cert = key.kind === "cert" ? (key.certificate ?? "") : "";
-  return `key:${kind}:${key.hasPrivateKey ? 1 : 0}${key.hasPassphrase ? 1 : 0}${encrypted}:${key.fingerprint ?? ""}:${cert}`;
-}
-
-/**
- * The same, for an identity: the password flag, the auth mode, and the key it
- * names.
- *
- * `authMode` and `keyId` sit alongside the flag because both decide WHICH secret
- * a connect reaches for - a mode flipped to `key` under a form that loaded
- * `password`, or a `keyId` re-pointed at another key, moves the material this
- * record authenticates with as surely as clearing the password does. `name`,
- * `username`, `domain` and `description` stay outside it, for the narrowness
- * {@link vaultKeyStamp} states.
- */
-export function vaultIdentityStamp(identity: VaultIdentity | null | undefined): string {
-  if (!identity) return VAULT_STAMP_ABSENT;
-  return `identity:${identity.hasPassword ? 1 : 0}:${identity.authMode}:${identity.keyId ?? ""}`;
-}
-
-/** The stamp in words, so a refusal names what changed rather than printing an
- *  internal token at the user. */
-function describeVaultStamp(stamp: string): string {
-  return stamp === VAULT_STAMP_ABSENT ? "deleted" : "holding different secret material";
-}
-
-/**
- * A save refused because the stored record's secret material is no longer the
- * one the caller loaded.
- *
- * Refuse, never overwrite. The write this stops is silent and unrecoverable:
- * an editor loads a key; another writer DELETES that key underneath it; the
- * stale form saves with a blank body, which means "leave the stored secret
- * alone", so the store reads both presence flags off the record as it stands
- * NOW - which is nothing - and writes them back as `false`, while the form's own
- * draft still carries the deleted key's fingerprint and public half. The row
- * comes back from the dead naming a private key nobody holds, with no error
- * anywhere. That resurrection is why {@link VAULT_STAMP_ABSENT} is a distinct
- * value and not folded into "no match".
- *
- * Reached today by: opening a key or identity in the Vault page's editor, having
- * that record deleted or its secret material replaced in the meantime - another
- * window, the Hosts page's credential picker, or a v3 import - and then pressing
- * Save.
- *
- * Carries `recordId` so a caller can re-read the record it was refused against
- * without having to hold one, and both stamps so it can tell a deleted record
- * from a changed one: the two need different advice.
- */
-export class VaultRecordChangedError extends Error {
-  readonly recordId: string;
-  readonly expected: string;
-  readonly actual: string;
-
-  constructor(
-    kind: "key" | "identity",
-    recordId: string,
-    recordName: string,
-    expected: string,
-    actual: string,
-  ) {
-    super(
-      `vault: the ${kind} "${recordName}" changed while this editor was open - it is now ` +
-        `${describeVaultStamp(actual)}. Nothing was saved.`,
-    );
-    this.name = "VaultRecordChangedError";
-    this.recordId = recordId;
-    this.expected = expected;
-    this.actual = actual;
-  }
-}
+/** Mirrors `clipboard::ClearResult`. */
+export type ClearResult = { clearsAt: number | null };

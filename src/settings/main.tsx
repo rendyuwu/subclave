@@ -1,42 +1,15 @@
-import "../lib/tauri-browser-shim";
-
-import "../styles/globals.css";
-
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { bootWindow } from "@/lib/boot";
 import ReactDOM from "react-dom/client";
 import { ThemeProvider } from "@/modules/theme";
-import { USE_CUSTOM_WINDOW_CONTROLS } from "@/lib/platform";
-import { applyBrandColorFastPath } from "@/modules/settings/brandColor";
-import { applyCustomThemeFastPath } from "@/modules/settings/customTheme";
 import { SettingsApp } from "./SettingsApp";
 
-if (USE_CUSTOM_WINDOW_CONTROLS) {
-  document.documentElement.dataset.chrome = "borderless";
-}
+const root = bootWindow({ rootId: "settings-root" });
 
-applyBrandColorFastPath();
-applyCustomThemeFastPath();
-
-ReactDOM.createRoot(document.getElementById("settings-root") as HTMLElement).render(
+ReactDOM.createRoot(root).render(
   <ThemeProvider>
     <SettingsApp />
   </ThemeProvider>,
 );
-
-// Reveal after one painted frame - avoids the transparent window-shadow flash
-// on Windows/Linux without the old 500ms wall-clock delay. Two RAFs guarantees
-// at least one commit has reached the compositor.
-let shown = false;
-const showWindow = () => {
-  if (shown) return;
-  shown = true;
-  getCurrentWindow()
-    .show()
-    .catch((e) => console.error("settings show failed:", e));
-};
-requestAnimationFrame(() => requestAnimationFrame(showWindow));
-// Safety net if the tab is backgrounded before the second RAF fires.
-setTimeout(showWindow, 250);
 
 // Mono font is only used by a handful of inputs/labels - load it after the
 // first paint so it doesn't block the initial render of the settings shell.

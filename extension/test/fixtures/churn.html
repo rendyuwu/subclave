@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Two-step login on a page that never stops changing</title>
+  </head>
+  <body>
+    <!-- A ticker toggles a class every 50 ms, faster than the detection
+         debounce, for the life of the page. -->
+    <div id="ticker">Live</div>
+    <form>
+      <input id="username" type="email" autocomplete="username" />
+      <button id="next" type="button">Next</button>
+      <input id="password" type="password" autocomplete="current-password" hidden />
+    </form>
+    <script>
+      const ticker = document.getElementById("ticker");
+      setInterval(() => ticker.classList.toggle("on"), 50);
+      document.getElementById("next").addEventListener("click", () => {
+        document.getElementById("password").hidden = false;
+      });
+    </script>
+  </body>
+</html>

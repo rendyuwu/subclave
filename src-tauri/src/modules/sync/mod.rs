@@ -1,18 +1,17 @@
 //! Cross-device sync: the wire format, the merge, the crypto that wraps both,
 //! and the port to whatever storage the user chose.
 //!
-//! WHAT IS NOT HERE, and is not an oversight. No store write and no keychain
-//! write: `KNOWN-LIMITS.md` records that every integrity rule lives in the
-//! store layer and that a pull has to go through it, and the stores are
-//! TypeScript - so this module decides and `src/modules/sync/` applies. No
-//! settings surface either: `sync_configure` in
-//! `src-tauri/src/modules/sync/engine.rs` is handed a passphrase and a provider
-//! configuration, and never goes looking for them. `SyncState` there is empty
-//! on every launch and nothing persists it, so every other command answers "no
-//! configuration" until a caller has opened one.
+//! WHAT IS NOT HERE, and is not an oversight. No trigger and no scheduler: the
+//! webview owns when a pull or a push happens (see `src/modules/sync/`), and
+//! this module owns every decision and every write. No settings surface either:
+//! `sync_configure` in `src-tauri/src/modules/sync/engine/commands.rs` is handed a
+//! passphrase and a provider configuration, and never goes looking for them.
+//! `SyncState` there is empty on every launch and nothing persists it, so every
+//! other command answers "no configuration" until a caller has opened one.
 //!
-//! `engine.rs` is where an object key is composed, which `crypto.rs` and
-//! `provider.rs` both decline for their own reasons.
+//! `src-tauri/src/modules/sync/engine/layout.rs` is where an object key is
+//! composed, which `crypto.rs` and `provider.rs` both decline for their own
+//! reasons.
 //!
 //! `src-tauri/src/modules/sync/model.rs` and
 //! `src-tauri/src/modules/sync/crypto.rs` are pure, and so is every decision in
@@ -34,6 +33,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 
+use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 /// Name of the file holding this installation's device id, inside the app data
@@ -42,9 +42,9 @@ const DEVICE_ID_FILE: &str = "sync-device-id";
 
 /// This installation's device id, creating it on first call.
 ///
-/// Stamped on every envelope as provenance. Never transmitted outside a sealed
-/// envelope, and never used as an ordering input - see `ordering_key` in
-/// `src-tauri/src/modules/sync/model.rs` for why the merge must not read it.
+/// Stamped on every pushed envelope as provenance. Never transmitted outside a
+/// sealed envelope, and never used as an ordering input: the merge key in
+/// `src-tauri/src/modules/sync/model.rs` must not read it.
 ///
 /// Split from [`device_id`] so the logic and the race are testable without a
 /// real app data directory.
@@ -67,12 +67,12 @@ const DEVICE_ID_FILE: &str = "sync-device-id";
 /// reads the winner, so the recovery converges the same way the normal path
 /// does.
 pub fn device_id_at(dir: &Path) -> Result<String, String> {
-    match create_or_read(dir)? {
-        Some(id) => Ok(id),
-        None => create_or_read(dir)?.ok_or_else(|| {
-            "sync: the device id file could not be initialized after one retry".to_string()
-        }),
+    // Exactly one retry: the first call clears an unusable file and answers
+    // `None`, the second takes the ordinary create path.
+    if let Some(id) = create_or_read(dir)? {
+        return Ok(id);
     }
+    create_or_read(dir)?.ok_or_else(|| "sync: the device id file could not be created".to_string())
 }
 
 /// `Ok(None)` means "the file was unusable and has been cleared, try again".
@@ -128,17 +128,27 @@ fn create_or_read(dir: &Path) -> Result<Option<String>, String> {
 
 /// [`device_id_at`] rooted at the real per-user app data directory.
 ///
-/// The `None` arm of `app_data_dir` in `src-tauri/src/modules/ids.rs` - the OS
-/// data directory cannot be resolved - becomes an error rather than a panic or
-/// a silent default, because a default would have every such machine share one
-/// device id.
+/// The same directory the vault file lives in, so the device id rides the
+/// `.dev` suffix from `tauri.dev.conf.json` in a development run. An
+/// unresolvable data directory becomes an error rather than a panic, or a
+/// silent default would have every such machine share one device id.
 ///
 /// No caching. A `OnceLock` belongs here the day a push path calls this per
 /// record rather than per run.
-pub fn device_id() -> Result<String, String> {
-    let dir = crate::modules::ids::app_data_dir()
-        .ok_or_else(|| "sync: the OS data directory could not be resolved".to_string())?;
-    device_id_at(&dir)
+pub fn device_id(app: &AppHandle) -> Result<String, String> {
+    device_id_at(&crate::modules::vault::vault_dir(app)?)
+}
+
+/// Drop the in-memory sync session, if one is open.
+///
+/// Called from every lock path in `src-tauri/src/modules/vault/mod.rs` through
+/// `emit_locked`, so an idle timeout, a manual lock, a minimize and the tray
+/// all tear the session down the same way. The vault payload keeps the
+/// credentials, so the next unlock re-opens one.
+pub(crate) fn session_closed(app: &AppHandle) {
+    if let Some(state) = app.try_state::<crate::modules::sync::engine::SyncState>() {
+        state.clear();
+    }
 }
 
 #[cfg(test)]
@@ -149,7 +159,7 @@ mod tests {
     /// `create_dir_all`. No `[dev-dependencies]` in this crate, hence
     /// `temp_dir` plus a uuid rather than a temp-directory crate.
     fn scratch() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("tervia-sync-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("subclave-sync-{}", Uuid::new_v4()))
     }
 
     #[test]

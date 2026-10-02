@@ -3,8 +3,7 @@ import type { StoreRecovery } from "@/lib/storeRecovery";
 /**
  * Turning a store's crash-recovery notice into something the user is told.
  *
- * Split from the hook that mounts it (`app/hooks/useStoreRecoveryNotices.ts`)
- * for the same reason `app/lib/sectionOrder.ts` is split from the right column:
+ * Split from the hook that mounts it (`app/hooks/useStoreRecoveryNotices.ts`):
  * the policy - what gets said, how loudly, and how many times each store is
  * asked - is the part worth pinning down, and it is checkable on its own only
  * while it depends on neither React nor the real stores.
@@ -31,27 +30,12 @@ export type RecoveryToast = {
 export type Say = (t: RecoveryToast) => void;
 
 /**
- * The divergence a restore leaves behind, in the app's own words.
- *
- * Said only on the branch where a file actually WAS rolled back, because that is
- * the only branch where it is true. It states what was not done and stops: the
- * app did not reconcile anything, did not read the keychain to find out, and must
- * not imply either. Enumeration is possible - `secrets_list` exists - but it
- * answers the opposite question: it names accounts no record claims, where what
- * diverges here is a record claiming an account that has gone.
- */
-const KEYCHAIN_DIVERGENCE =
-  "Stored passwords and keys were not rolled back with it, so a restored record " +
-  "can describe material that is no longer there.";
-
-/**
  * What to say for one notice, or null when there is nothing to say.
  *
  * Deliberately reports only what happened to the FILE. A recovered store is not
  * a safer store and must not be described as one: the snapshot is metadata from
- * the last process start while the keychain is current, so the two can come back
- * disagreeing (see the note in `lib/storeRecovery.ts`, and the entry in
- * `KNOWN-LIMITS.md` that accepts it). The notice's own `note` is passed through
+ * the last process start, so a restore is not a freshness guarantee. The
+ * notice's own `note` is passed through
  * rather than paraphrased - it names the file and the snapshot, which is what
  * anyone digging further needs, and paraphrasing it here would be a second copy
  * of wording that lives in `lib/storeRecovery.ts`.
@@ -60,14 +44,13 @@ export function recoveryToast(label: string, notice: StoreRecovery): RecoveryToa
   if (!notice.note) return null;
   if (notice.recovered) {
     return {
-      message: `${label}: recovered from a backup copy. ${notice.note}. ${KEYCHAIN_DIVERGENCE}`,
+      message: `${label}: recovered from a backup copy. ${notice.note}.`,
       variant: "warning",
     };
   }
   // No recovery, but something to report: the primary could not be checked or
   // restored, or the `.bak` beside it could not be written. Each is something
-  // the app could NOT do - the same split `purgeLegacySecrets` uses for its
-  // "finished with notes" vs "could not finish" toasts.
+  // the app could NOT do, so it is said as an error rather than a warning.
   return { message: `${label}: ${notice.note}`, variant: "error" };
 }
 
