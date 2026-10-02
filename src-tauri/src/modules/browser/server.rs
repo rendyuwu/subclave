@@ -454,6 +454,9 @@ pub(crate) async fn dispatch(
         protocol::ACTION_GET_LOGINS if authed => {
             to_reply(req, actions::get_logins(vault, &req.params))
         }
+        protocol::ACTION_CHECK_LOGIN if authed => {
+            to_reply(req, actions::check_login(vault, &req.params))
+        }
         protocol::ACTION_GET_CREDENTIAL if authed => {
             to_reply(req, actions::get_credential(vault, host, dir, &req.params))
         }

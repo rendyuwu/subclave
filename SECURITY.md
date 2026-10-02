@@ -22,7 +22,30 @@ Until `1.0.0`, only the latest minor gets security fixes.
 - **Web pages.** A malicious or compromised site must not trigger a fill,
   get a credential for another site, or read the vault.
   - The content script runs in the top frame only. It never reads extension
-    storage, and it holds a credential only after a guarded pick.
+    storage. It holds a credential only after a guarded pick, and reads the
+    login the user typed only on a submit that is trusted and follows a user
+    gesture.
+  - The service worker keeps that typed pair in `chrome.storage.session`,
+    for its tab only, until the save prompt is answered, the tab closes, the
+    tab's third page load passes, or the first page load after 5 minutes.
+    The save URL is the browser-stamped `MessageSender.url` of the submit.
+    The prompt shows only on a page of the submit's site: Rust compares the
+    asking page's `MessageSender.url` with the submit's URL by the Domain rule
+    (`check_login`). `check-login` sees the submitted host's exact-host
+    entries only and never returns a password. Add and Update pass the six
+    guards and save only the pair the prompt shows: the pair's id goes back
+    with the click, and a new submit closes a prompt that is showing.
+    Residual risk:
+    - After a user gesture, a page can plant values in its own form and
+      submit them. It can then learn whether a planted pair matches an entry
+      for its own exact host (whether the prompt shows), and offer the user an
+      Update the user must still click; the overwritten password stays in the
+      entry's history.
+    - When the tab moves to another host of the same site (`login.example.com`
+      to `www.example.com`), that host's page shows the prompt with the
+      submitted host's entry titles and usernames, inside the closed shadow
+      root. Its Add and Update can only save the pair the user typed to the
+      submitted host.
   - The inline picker offers only exact-host matches. The scheme and port
     rules still apply.
     Wider matches (subdomains, parent domain) are reachable only from

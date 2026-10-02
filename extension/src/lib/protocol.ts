@@ -22,6 +22,7 @@ export type NmAction =
   | "hello"
   | "auth"
   | "get-logins"
+  | "check-login"
   | "get-credential"
   | "save-login"
   | "generate-password";
@@ -64,6 +65,11 @@ export type LoginSummary = {
 export type GetLoginsResult = { entries: LoginSummary[]; otherMatches: number; domain: string };
 export type CredentialResult = { username: string; password: string };
 export type SaveLoginResult = { id: string; created: boolean };
+export type SaveCandidate = { id: string; title: string; username: string };
+export type CheckLoginResult = {
+  state: "new" | "changed" | "unchanged" | "other-site";
+  entries: SaveCandidate[];
+};
 export type GenerateResult = { password: string };
 export type PairResult = { clientId: string; secret: string };
 export type HelloResult = { appNonce: string; appProof: string };

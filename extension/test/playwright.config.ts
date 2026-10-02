@@ -11,8 +11,9 @@ import { FIXTURE_PORT } from "./support/harness";
 //                                           chrome.scripting.executeScript
 //                                           fallback)
 //
-// `inline.spec.ts` and `guard.spec.ts` run under `chrome` only: the inline UI
-// lives in the declarative content script, which `chrome-inject` does not have.
+// `inline.spec.ts`, `guard.spec.ts` and `save.spec.ts` run under `chrome` only:
+// the inline UI lives in the declarative content script, which `chrome-inject`
+// does not have.
 //
 // Both carry the same manifest `key`, so the extension id, and therefore the
 // native host name, are identical.
@@ -59,7 +60,7 @@ export default defineConfig({
     { name: "chrome", testIgnore: ["**/sites.spec.ts"] },
     {
       name: "chrome-inject",
-      testIgnore: ["**/inline.spec.ts", "**/guard.spec.ts", "**/sites.spec.ts"],
+      testIgnore: ["**/inline.spec.ts", "**/guard.spec.ts", "**/save.spec.ts", "**/sites.spec.ts"],
     },
   ],
 });

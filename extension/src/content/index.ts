@@ -62,7 +62,8 @@ if (!scope.subclaveContent) {
   });
 
   // A page load reads one setting from storage and draws icons; no native
-  // connection opens until the user opens the picker.
+  // connection opens until the user opens the picker, unless the tab has a
+  // sign-in waiting for the save prompt.
   const askSettings = (): void => {
     sendToBackground<SwResponse>({ type: "inline-settings" }).then(
       (response) => {

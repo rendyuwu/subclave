@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Save login</title>
+  </head>
+  <body>
+    <form method="post" action="landing.html">
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button id="submit" type="submit">Sign in</button>
+      <!-- After #submit, so #submit stays the form's default button. -->
+      <button id="reveal" type="button">Show</button>
+    </form>
+    <script>
+      window.__untrustedSubmit = () =>
+        document.querySelector("form").dispatchEvent(new Event("submit", { cancelable: true }));
+      document.getElementById("reveal").addEventListener("click", () => {
+        const field = document.getElementById("password");
+        field.type = field.type === "password" ? "text" : "password";
+      });
+    </script>
+  </body>
+</html>

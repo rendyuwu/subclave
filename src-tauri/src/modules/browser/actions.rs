@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
+use url::Url;
 
 use crate::modules::browser::host::Host;
 use crate::modules::browser::matching;
@@ -12,7 +13,7 @@ use crate::modules::generator;
 use crate::modules::prefs;
 use crate::modules::vault::entry_commands::vault_entry_upsert_inner;
 use crate::modules::vault::model::{
-    DraftCustomField, EntryDraft, EntryUrl, MatchMode, VaultPayload, BROWSER_ID,
+    DraftCustomField, Entry, EntryDraft, EntryUrl, MatchMode, VaultPayload, BROWSER_ID,
 };
 use crate::modules::vault::query::in_trash;
 use crate::modules::vault::state::{commit, now_ms, VaultState};
@@ -67,6 +68,21 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, Failure> {
         .ok_or_else(|| Failure::code(NmError::BadRequest))
 }
 
+/// `None` when no URL of `entry` matches `page`; else whether one of the
+/// matching URLs is on the page's exact host (`matching::same_host`).
+fn page_match(page: &Url, entry: &Entry) -> Option<bool> {
+    let mut found = None;
+    for url in &entry.urls {
+        let Some(entry_url) = matching::parse_entry(&url.url) else {
+            continue;
+        };
+        if matching::matches(page, &entry_url, url.match_mode.clone()) {
+            found = Some(found == Some(true) || matching::same_host(page, &entry_url));
+        }
+    }
+    found
+}
+
 /// `get-logins { url, scope }`: the entries whose URL rules match the page,
 /// plus `domain`, the page's registrable domain (or its host) for the picker
 /// footer. Never returns a password.
@@ -87,22 +103,9 @@ pub(crate) fn get_logins(vault: &VaultState, params: &Value) -> Result<Value, Fa
         if in_trash(payload, &entry.group_id) {
             continue;
         }
-        let mut any_match = false;
-        let mut any_host = false;
-        for url in &entry.urls {
-            let Some(entry_url) = matching::parse_entry(&url.url) else {
-                continue;
-            };
-            if matching::matches(&page, &entry_url, url.match_mode.clone()) {
-                any_match = true;
-                if matching::same_host(&page, &entry_url) {
-                    any_host = true;
-                }
-            }
-        }
-        if !any_match {
+        let Some(any_host) = page_match(&page, entry) else {
             continue;
-        }
+        };
         let row = json!({
             "id": entry.id,
             "title": entry.title,
@@ -131,6 +134,55 @@ pub(crate) fn get_logins(vault: &VaultState, params: &Value) -> Result<Value, Fa
         .map(|h| matching::registrable(h).unwrap_or_else(|| h.to_ascii_lowercase()))
         .unwrap_or_default();
     Ok(json!({ "entries": entries, "otherMatches": other_matches, "domain": domain }))
+}
+
+/// `check-login { url, pageUrl, username, password }`: against the exact-host
+/// entries of `url`, the page the login was submitted on (the inline rule),
+/// whether it is already stored (`unchanged`), a new password for a stored
+/// username (`changed`), or neither (`new`), plus those entries for an update
+/// to target. `other-site` when `pageUrl`, the page that would show the
+/// prompt, is not on the submitted page's site by the Domain rule: the prompt
+/// never shows one site's logins on another. Never returns a password.
+pub(crate) fn check_login(vault: &VaultState, params: &Value) -> Result<Value, Failure> {
+    let raw_url = required_str(params, "url")?;
+    let raw_showing = required_str(params, "pageUrl")?;
+    let username = required_str(params, "username")?;
+    let password = required_str(params, "password")?;
+    let page = matching::parse_page(raw_url).ok_or_else(|| Failure::code(NmError::BadRequest))?;
+    let showing =
+        matching::parse_page(raw_showing).ok_or_else(|| Failure::code(NmError::BadRequest))?;
+    if !matching::matches(&showing, &page, MatchMode::Domain) {
+        return Ok(json!({ "state": "other-site", "entries": [] }));
+    }
+
+    let guard = vault.access().map_err(|_| locked_failure())?;
+    let unlocked = guard.as_ref().ok_or_else(locked_failure)?;
+    let payload = &unlocked.payload;
+
+    let mut unchanged = false;
+    let mut changed = false;
+    let mut entries = Vec::new();
+    for entry in &payload.entries {
+        // A Domain-only match is skipped entirely, so a page on another host
+        // of the domain cannot probe that entry through the prompt's presence.
+        if in_trash(payload, &entry.group_id) || page_match(&page, entry) != Some(true) {
+            continue;
+        }
+        if entry.username == username && entry.password == password {
+            unchanged = true;
+        } else if entry.username == username {
+            changed = true;
+        }
+        entries.push(json!({ "id": entry.id, "title": entry.title, "username": entry.username }));
+    }
+    let state = if unchanged {
+        "unchanged"
+    } else if changed {
+        "changed"
+    } else {
+        "new"
+    };
+    Ok(json!({ "state": state, "entries": entries }))
 }
 
 /// `get-credential { id, url, via }`: release one credential, stamp its use,
@@ -785,6 +837,93 @@ mod tests {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, Failure> {
         get_logins(vault, params)
+    }
+
+    #[tokio::test]
+    async fn check_login_states() {
+        let (vault, dir, _host) = setup("checklogin");
+        let page = "https://accounts.example.com/login";
+
+        let h = vault_entry_upsert_inner(
+            &vault,
+            &dir.0,
+            draft_with_url(
+                ROOT_ID,
+                "H",
+                "https://accounts.example.com",
+                MatchMode::Host,
+            ),
+        )
+        .unwrap();
+        let mut d = draft_with_url(ROOT_ID, "D", "https://example.com", MatchMode::Domain);
+        d.username = "dom".into();
+        d.password = Some("dom-pw".into());
+        vault_entry_upsert_inner(&vault, &dir.0, d).unwrap();
+        let mut t = draft_with_url(
+            ROOT_ID,
+            "T",
+            "https://accounts.example.com",
+            MatchMode::Host,
+        );
+        t.username = "gone".into();
+        t.password = Some("gone-pw".into());
+        let t = vault_entry_upsert_inner(&vault, &dir.0, t).unwrap();
+        vault_entry_trash_inner(&vault, &dir.0, vec![t.id.clone()]).unwrap();
+
+        let check_on = |url: &str, showing: &str, username: &str, password: &str| {
+            check_login(
+                &vault,
+                &json!({
+                    "url": url,
+                    "pageUrl": showing,
+                    "username": username,
+                    "password": password,
+                }),
+            )
+            .unwrap()
+        };
+        let check =
+            |url: &str, username: &str, password: &str| check_on(url, url, username, password);
+        let ids = |reply: &serde_json::Value| -> Vec<String> {
+            reply["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(check(page, "user", "pw-1")["state"], "unchanged");
+
+        let changed = check(page, "user", "new-pw");
+        assert_eq!(changed["state"], "changed");
+        assert_eq!(ids(&changed), vec![h.id.clone()]);
+        // A password never crosses the wire.
+        assert!(changed["entries"][0].get("password").is_none());
+
+        // A Domain-only match neither suppresses the prompt nor becomes a candidate.
+        let domain = check(page, "dom", "dom-pw");
+        assert_eq!(domain["state"], "new");
+        assert_eq!(ids(&domain), vec![h.id.clone()]);
+
+        // A trashed entry is ignored.
+        assert_eq!(check(page, "gone", "gone-pw")["state"], "new");
+
+        let fresh = check("https://fresh.example/", "user", "pw-1");
+        assert_eq!(fresh["state"], "new");
+        assert!(fresh["entries"].as_array().unwrap().is_empty());
+
+        // Another host of the same site may show the prompt, with the
+        // submitted host's entries; another site never sees them.
+        let sibling = check_on(page, "https://www.example.com/home", "user", "new-pw");
+        assert_eq!(sibling["state"], "changed");
+        assert_eq!(ids(&sibling), vec![h.id.clone()]);
+        let elsewhere = check_on(page, "https://other.test/", "user", "new-pw");
+        assert_eq!(elsewhere["state"], "other-site");
+        assert!(elsewhere["entries"].as_array().unwrap().is_empty());
+
+        let missing = check_login(&vault, &json!({ "url": page, "username": "user" }));
+        assert_eq!(missing.unwrap_err().code, NmError::BadRequest);
     }
 
     #[tokio::test]

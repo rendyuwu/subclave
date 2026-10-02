@@ -14,6 +14,7 @@ pub const ACTION_ASSOCIATE: &str = "associate";
 pub const ACTION_HELLO: &str = "hello";
 pub const ACTION_AUTH: &str = "auth";
 pub const ACTION_GET_LOGINS: &str = "get-logins";
+pub const ACTION_CHECK_LOGIN: &str = "check-login";
 pub const ACTION_GET_CREDENTIAL: &str = "get-credential";
 pub const ACTION_SAVE_LOGIN: &str = "save-login";
 pub const ACTION_GENERATE_PASSWORD: &str = "generate-password";

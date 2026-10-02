@@ -79,6 +79,7 @@ async function readNumber(key: string): Promise<number> {
 /** The actions the app only serves on an authenticated connection. */
 const AUTHED_ACTIONS: Record<string, true> = {
   "get-logins": true,
+  "check-login": true,
   "get-credential": true,
   "save-login": true,
   "generate-password": true,
@@ -183,6 +184,27 @@ export function createFakeTransport(): Transport {
           return ok({ entries: [], otherMatches: hostScope ? 1 : 0, domain: FAKE_DOMAIN });
         }
         return ok({ entries: FAKE_ENTRIES, otherMatches: hostScope ? 2 : 0, domain: FAKE_DOMAIN });
+      }
+      case "check-login": {
+        // Mirrors Rust's `required_str`; the site rule is reduced to the origin,
+        // which is enough for the fixtures (Rust unit-tests the real rule).
+        const url = stringParam(params, "url");
+        const pageUrl = stringParam(params, "pageUrl");
+        if (!url || !pageUrl) return error("bad-request", "Missing url or pageUrl");
+        if (new URL(url).origin !== new URL(pageUrl).origin) {
+          return ok({ state: "other-site", entries: [] });
+        }
+        if (mode === "no-fields") return ok({ state: "new", entries: [] });
+        const stored = FAKE_ENTRIES.find(
+          (entry) => entry.username === stringParam(params, "username"),
+        );
+        if (stored && stringParam(params, "password") === FAKE_PASSWORD) {
+          return ok({ state: "unchanged", entries: [] });
+        }
+        return ok({
+          state: stored ? "changed" : "new",
+          entries: FAKE_ENTRIES.map(({ id, title, username }) => ({ id, title, username })),
+        });
       }
       case "get-credential": {
         const delay = await readNumber(CREDENTIAL_DELAY_KEY);
