@@ -16,8 +16,8 @@ type Props = {
   /** Trailing buttons before the lock button; the unlocked shell passes the
    *  import and export menu. */
   actions?: ReactNode;
-  /** Middle slot, between the app name and the trailing icon cluster. The
-   *  unlocked shell puts the search field here. */
+  /** Slot right before the trailing actions. The unlocked shell puts the
+   *  search field here. */
   children?: ReactNode;
 };
 
@@ -83,8 +83,8 @@ function HeaderImpl({ onOpenSettings, onLock, actions, children }: Props) {
       data-subclave-header
       className="border-border/60 bg-card flex shrink-0 flex-col border-b select-none"
     >
-      {/* One row: the app mark, the app name, the middle slot, the drag spacer,
-          the trailing actions, the lock and settings buttons and the window
+      {/* One row: the app mark, the app name, the drag spacer, the slot, the
+          trailing actions, the lock and settings buttons and the window
           controls. */}
       <div
         data-tauri-drag-region
@@ -100,12 +100,13 @@ function HeaderImpl({ onOpenSettings, onLock, actions, children }: Props) {
         />
         <span className="text-[13px] font-semibold">Subclave</span>
 
+        {/* Drag spacer between the app name and the slot, so the slot sits
+            beside the trailing icon cluster. */}
+        <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
+
         {children ? (
           <div className="flex max-w-md min-w-0 flex-1 items-center">{children}</div>
         ) : null}
-
-        {/* Drag spacer between the middle slot and the trailing icon cluster. */}
-        <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
 
         {actions}
 
