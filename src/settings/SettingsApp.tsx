@@ -100,7 +100,7 @@ export function SettingsApp() {
             lives in the body below (not the header), also like Debug. */}
         <header
           data-tauri-drag-region
-          className={`border-border/60 bg-card flex h-11 shrink-0 items-center gap-2 border-b ${
+          className={`border-border/60 bg-card flex h-9 shrink-0 items-center gap-2 border-b ${
             IS_MAC ? "pr-3 pl-22" : "pr-0 pl-3"
           }`}
         >

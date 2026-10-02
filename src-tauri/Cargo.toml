@@ -91,13 +91,15 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # `ring` is the provider the rest of the graph already builds rustls with, so
 # this adds no crate to the build.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# The sync providers' dates. `chrono` is the calendar under `amz_date` and the
-# two strict parsers in `src-tauri/src/modules/sync/providers/sigv4.rs` and
-# `src-tauri/src/modules/sync/providers/webdav/dav_time.rs`. `alloc` is the
-# only feature on: neither parser reads the system clock (`amz_date` takes the
-# instant as an argument), so `clock` is off, and `wasmbind` exists for a
-# target this app does not build for.
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# The sync providers' dates and the import group's local date. `chrono` is the
+# calendar under `amz_date` and the two strict parsers in
+# `src-tauri/src/modules/sync/providers/sigv4.rs` and
+# `src-tauri/src/modules/sync/providers/webdav/dav_time.rs`. `alloc` for the
+# two parsers, and `clock` for the local date in the import group name
+# (`chrono::Local`); `wasmbind` exists for a target this app does not build for.
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+# CSV import and export: KeePassXC, Bitwarden, Chrome and Firefox files.
+csv = "1"
 # The two listing scans, in `src-tauri/src/modules/sync/providers/s3/list_xml.rs`
 # and `src-tauri/src/modules/sync/providers/webdav/dav_xml.rs`. Already in the
 # tree through plist and wayland-scanner. Its default feature set is empty; the

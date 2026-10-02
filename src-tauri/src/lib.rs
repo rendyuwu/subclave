@@ -171,6 +171,13 @@ pub fn run() {
             modules::browser::browser_client_rename,
             modules::browser::browser_client_revoke,
             modules::browser::browser_pairing_respond,
+            modules::import::import_csv_preview,
+            modules::import::import_apply,
+            modules::import::import_delete_csv,
+            modules::import::export_csv,
+            modules::backup::backup_export,
+            modules::backup::backup_import_preview,
+            modules::backup::backup_import_apply,
         ])
         .manage(modules::vault::VaultState::default())
         .manage(modules::browser::BrowserState::default())

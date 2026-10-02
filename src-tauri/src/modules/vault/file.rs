@@ -35,19 +35,16 @@ pub struct VaultFile {
 
 /// The header as associated data: compact JSON of the format, version and KDF
 /// parameters, in declaration order, so the bytes are stable on seal and open.
-fn aad(v: u32, kdf: &Argon2Params) -> Vec<u8> {
+/// Shared by the vault file, the sync keyfile and the backup file, each with
+/// its own `format`.
+pub(crate) fn header_aad(format: &str, v: u32, kdf: &Argon2Params) -> Vec<u8> {
     #[derive(Serialize)]
     struct HeaderAad<'a> {
-        format: &'static str,
+        format: &'a str,
         v: u32,
         kdf: &'a Argon2Params,
     }
-    serde_json::to_vec(&HeaderAad {
-        format: FORMAT,
-        v,
-        kdf,
-    })
-    .expect("header AAD serialization")
+    serde_json::to_vec(&HeaderAad { format, v, kdf }).expect("header AAD serialization")
 }
 
 /// An opened vault. The key is returned with the payload because every later
@@ -64,7 +61,8 @@ pub fn seal_payload(
     kdf: &Argon2Params,
 ) -> Result<VaultFile, String> {
     let json = Zeroizing::new(serde_json::to_vec(payload).map_err(|e| format!("vault: {e}"))?);
-    let (nonce, ciphertext) = aesgcm::seal_with_key(key, &aad(FORMAT_VERSION, kdf), &json)?;
+    let (nonce, ciphertext) =
+        aesgcm::seal_with_key(key, &header_aad(FORMAT, FORMAT_VERSION, kdf), &json)?;
     Ok(VaultFile {
         format: FORMAT.to_string(),
         v: FORMAT_VERSION,
@@ -97,7 +95,7 @@ pub fn open_file(file: &VaultFile, password: &str) -> Result<OpenVault, String> 
         .map_err(|_| "vault: wrong master password, or the vault file is corrupt".to_string())?;
     let plain = aesgcm::open_with_key(
         &key,
-        &aad(file.v, &file.kdf),
+        &header_aad(FORMAT, file.v, &file.kdf),
         &nonce_bytes,
         ciphertext,
         "vault",
@@ -126,20 +124,15 @@ pub fn vault_file_bytes(file: &VaultFile) -> Result<Vec<u8>, String> {
     serde_json::to_vec(file).map_err(|e| format!("vault: {e}"))
 }
 
-/// Atomic write of the primary, then the `.bak`. On Unix both land at mode
-/// 0o600 (the staging temp is opened with the mode before any byte is
-/// written); Windows has no equivalent and takes plain writes.
+/// Atomic write of the primary, then the `.bak`, both through
+/// `atomic_write_private` (mode 0o600 on Unix).
 pub fn save_vault(dir: &Path, file: &VaultFile) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("vault: {e}"))?;
     let bytes = vault_file_bytes(file)?;
     let primary = dir.join(VAULT_FILE_NAME);
     let bak = dir.join(format!("{VAULT_FILE_NAME}.bak"));
-    #[cfg(unix)]
-    let write = |p: &Path| atomic::atomic_write_mode(p, &bytes, 0o600);
-    #[cfg(not(unix))]
-    let write = |p: &Path| atomic::atomic_write(p, &bytes);
-    write(&primary).map_err(|e| format!("vault: {e}"))?;
-    write(&bak).map_err(|e| format!("vault: {e}"))?;
+    atomic::atomic_write_private(&primary, &bytes).map_err(|e| format!("vault: {e}"))?;
+    atomic::atomic_write_private(&bak, &bytes).map_err(|e| format!("vault: {e}"))?;
     Ok(())
 }
 

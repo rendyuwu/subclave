@@ -178,6 +178,7 @@ fn urlencode_svg(s: &str) -> String {
 
 /// Atomic write: stage into a sibling temp file, then rename over the target.
 /// Prevents a partial write from leaving a half-saved file on crash/power loss.
+/// The target's parent directory is created first when it is missing.
 #[tauri::command]
 pub async fn fs_write_file(path: String, content: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || fs_write_file_inner(path, content))
@@ -187,10 +188,17 @@ pub async fn fs_write_file(path: String, content: String) -> Result<(), String> 
 
 fn fs_write_file_inner(path: String, content: String) -> Result<(), String> {
     let target = PathBuf::from(&path);
-    crate::modules::fs::atomic::atomic_write(&target, content.as_bytes()).map_err(|e| {
-        log::warn!("fs_write_file({}) failed: {e}", target.display());
-        e.to_string()
-    })
+    // A store file lives in `appDataDir()`, which nothing creates on a first
+    // run until the vault is saved. `create_dir_all` is `Ok` for a directory
+    // that exists and for the empty parent of a bare file name.
+    target
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| crate::modules::fs::atomic::atomic_write(&target, content.as_bytes()))
+        .map_err(|e| {
+            log::warn!("fs_write_file({}) failed: {e}", target.display());
+            e.to_string()
+        })
 }
 
 #[cfg(test)]
@@ -228,6 +236,26 @@ mod tests {
             err.trim_end().ends_with("(os error 2)") || err.trim_end().ends_with("(os error 3)"),
             "the frontend matches on this suffix; got {err:?}"
         );
+    }
+
+    /// A store file's directory is `appDataDir()`, which nothing creates on a
+    /// first run until the vault is saved, so the write makes the parent itself.
+    /// Without that, every store write before the first vault save failed with
+    /// `os error 3` on Windows (`os error 2` on Unix).
+    #[test]
+    fn write_creates_a_missing_parent_directory() {
+        let dir = std::env::temp_dir().join("subclave-fs-write-parent-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("app-data").join("subclave-sync.json");
+
+        fs_write_file_inner(
+            target.to_string_lossy().into_owned(),
+            "{\"k\":1}".to_string(),
+        )
+        .expect("a write under a missing directory must create it");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"k\":1}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A PuTTY `.reg` export (`regedit.exe`'s default "Export Registry File")

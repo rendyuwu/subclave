@@ -2,8 +2,8 @@
 //! parked seal after a failed save, the idle-lock deadline and the save
 //! machinery that keeps the disk and the parked seal in agreement.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::modules::lockext::lock_or_recover;
@@ -18,11 +18,58 @@ use crate::modules::vault::model::VaultPayload;
 
 pub const LOCKED_ERR: &str = "vault: locked";
 
+/// Where a staged preview came from. A CSV source keeps its path for the
+/// delete that follows an import.
+pub(crate) enum StagedSource {
+    Csv(PathBuf),
+    Backup,
+}
+
+/// Records a preview decoded and holds for its apply (a CSV file's entries,
+/// or a backup's entries and groups). Plaintext, so it lives inside
+/// [`Unlocked`] and is wiped with the payload on every lock. `records` is
+/// `None` once applied.
+pub(crate) struct Staged {
+    pub(crate) handle: u32,
+    pub(crate) source: StagedSource,
+    pub(crate) records: Option<VaultPayload>,
+}
+
+static NEXT_STAGE_HANDLE: AtomicU32 = AtomicU32::new(1);
+
+/// A handle no earlier preview in this process used, so an apply against a
+/// preview that was replaced, or dropped by a lock, is refused.
+pub(crate) fn next_stage_handle() -> u32 {
+    NEXT_STAGE_HANDLE.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Everything held while the vault is unlocked.
 pub struct Unlocked {
     pub(crate) payload: VaultPayload,
     pub(crate) key: Zeroizing<[u8; 32]>,
     pub(crate) kdf: Argon2Params,
+    /// The one staged import or backup preview, if any.
+    pub(crate) staged: Option<Staged>,
+}
+
+impl Unlocked {
+    /// Scrub the payload and any staged preview. Every lock path calls this
+    /// before it drops the session.
+    pub(crate) fn wipe(&mut self) {
+        self.payload.wipe();
+        if let Some(records) = self.staged.as_mut().and_then(|s| s.records.as_mut()) {
+            records.wipe();
+        }
+    }
+}
+
+/// Store a new preview, wiping the one it replaces: one staged preview at a
+/// time, of either kind.
+pub(crate) fn replace_staged(unlocked: &mut Unlocked, staged: Staged) {
+    if let Some(records) = unlocked.staged.as_mut().and_then(|s| s.records.as_mut()) {
+        records.wipe();
+    }
+    unlocked.staged = Some(staged);
 }
 
 /// Managed state. See the field docs for the invariants the save machinery
@@ -93,7 +140,7 @@ impl VaultState {
             && deadline_passed(lock::boot_now_ms(), self.deadline_ms.load(Ordering::SeqCst))
         {
             if let Some(unlocked) = guard.as_mut() {
-                unlocked.payload.wipe();
+                unlocked.wipe();
             }
             *guard = None;
             // Refresh before the guard is released: the next reader must not
@@ -116,7 +163,7 @@ impl VaultState {
         let mut guard = lock_or_recover(&self.inner);
         let dropped = guard.is_some();
         if let Some(unlocked) = guard.as_mut() {
-            unlocked.payload.wipe();
+            unlocked.wipe();
         }
         *guard = None;
         dropped
@@ -423,5 +470,27 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.title == "Parked"));
+    }
+
+    /// A staged preview is plaintext, so the wipe every lock path runs must
+    /// reach it, not only the payload.
+    #[test]
+    fn wipe_scrubs_the_staged_preview() {
+        let dir = TempDir::new("stagedwipe");
+        let state = VaultState::default();
+        vault_create_inner(&state, &dir.0, "master-pw").unwrap();
+        vault_entry_upsert_inner(&state, &dir.0, draft(None, "Staged")).unwrap();
+        let mut unlocked = lock_or_recover(&state.inner).take().unwrap();
+        let records = unlocked.payload.clone();
+        assert_eq!(records.entries[0].password, "pw-1");
+        unlocked.staged = Some(Staged {
+            handle: next_stage_handle(),
+            source: StagedSource::Backup,
+            records: Some(records),
+        });
+        unlocked.wipe();
+        let staged = unlocked.staged.as_ref().unwrap().records.as_ref().unwrap();
+        assert_eq!(staged.entries[0].password, "");
+        assert_eq!(unlocked.payload.entries[0].password, "");
     }
 }

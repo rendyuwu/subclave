@@ -32,7 +32,7 @@ export function JoinSyncScreen({ onCreateInstead }: { onCreateInstead: () => voi
   });
 
   return (
-    <div className="flex h-full items-center justify-center p-6">
+    <div className="flex h-full flex-1 items-center justify-center p-6">
       <form
         onSubmit={submit}
         className="flex max-h-full w-full max-w-sm flex-col gap-4 overflow-y-auto"

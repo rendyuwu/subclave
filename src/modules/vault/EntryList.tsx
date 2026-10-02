@@ -1,7 +1,8 @@
 import { useMemo, useRef, type KeyboardEvent, type ReactNode } from "react";
-import { SquarePlus } from "lucide-react";
+import { FileInput, SquarePlus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { pickCsvImport } from "@/modules/backup/store";
 
 import { defaultGroupForScope } from "./commands";
 import { EntryRow } from "./EntryRow";
@@ -72,10 +73,16 @@ export function EntryList(): ReactNode {
         <EmptyState
           message="Your vault is empty."
           action={
-            <Button variant="outline" size="sm" onClick={newAtRoot}>
-              <SquarePlus strokeWidth={1.75} />
-              New entry
-            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={newAtRoot}>
+                <SquarePlus strokeWidth={1.75} />
+                New entry
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void pickCsvImport()}>
+                <FileInput strokeWidth={1.75} />
+                Import CSV
+              </Button>
+            </div>
           }
         />
       );

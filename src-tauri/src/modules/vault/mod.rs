@@ -6,11 +6,12 @@
 //! Every command shell is `pub async fn` and does its blocking work on
 //! `tauri::async_runtime::spawn_blocking` through [`events::run_blocking`] (on
 //! Windows a sync command runs on the WebView2 UI thread, so blocking there
-//! freezes the window; the `no_new_sync_tauri_commands` test in `lib.rs`
-//! enforces this). `State<'_, _>` is not `'static` and cannot move into that
-//! closure, so `run_blocking` clones the `AppHandle` and resolves the managed
-//! state inside the closure. Inner functions take `&VaultState` plus plain
-//! values, which is what keeps the whole core testable without a Tauri runtime.
+//! freezes the window; the `no_new_sync_tauri_commands` test in
+//! `src-tauri/src/commands.rs` enforces this). `State<'_, _>` is not `'static`
+//! and cannot move into that closure, so `run_blocking` clones the
+//! `AppHandle` and resolves the managed state inside the closure. Inner
+//! functions take `&VaultState` plus plain values, which is what keeps the
+//! whole core testable without a Tauri runtime.
 
 pub mod entry_commands;
 pub mod events;
@@ -70,7 +71,7 @@ pub(crate) use query::resolve_field;
 #[allow(unused_imports)]
 pub(crate) use session::vault_create_inner;
 pub(crate) use session::{install_new_vault, vault_dir, vault_retry_save_inner};
-pub(crate) use state::commit;
+pub(crate) use state::{commit, next_stage_handle, replace_staged, Staged, StagedSource};
 
 /// Shared fixtures for the module's tests. Kept here so the per-module test
 /// suites do not each re-declare the temp directory and the draft builders.

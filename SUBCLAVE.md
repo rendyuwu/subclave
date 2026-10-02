@@ -47,6 +47,15 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   a comment may name a file that is gone when the deletion itself is the
   sentence's subject, in the past tense ("once X was deleted, Y became
   unreachable").
+- **Accepted limits**: an accepted state goes in `KNOWN-LIMITS.md` as three
+  parts: what is accepted, where (file and symbol), and what would change it.
+- **Commands**: every `#[tauri::command]` is `pub async fn` and does its
+  blocking work on the blocking pool, never on the UI thread: vault, import and
+  backup commands through `run_blocking`
+  (`src-tauri/src/modules/vault/events.rs`), sync commands through `blocking`
+  (`src-tauri/src/modules/sync/engine/commands.rs`), the rest through
+  `tauri::async_runtime::spawn_blocking`. The `no_new_sync_tauri_commands`
+  test in `src-tauri/src/commands.rs` fails on a synchronous one.
 
 ## Area rules
 
@@ -91,25 +100,61 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   per guard. `scripts/build.mjs` fails a build whose `content.js` is over
   30 KB.
 
+### Import and backup (`src-tauri/src/modules/import/`, `src-tauri/src/modules/backup.rs`, `src/modules/backup/`)
+
+- A preview stages the decoded records in `Unlocked.staged`
+  (`src-tauri/src/modules/vault/state.rs`), one preview at a time; a new
+  preview replaces and wipes the last, and every lock wipes it with the
+  payload (`Unlocked::wipe`).
+- The webview gets titles, hosts, usernames and counts, never a password.
+  The apply takes the preview's `handle`, not the rows themselves.
+- An apply lands through `commit` with `mark_dirty` on every changed record
+  and emits `subclave:vault-changed` with origin `import`.
+- The backup apply merges each record through `merge_into_payload`
+  (`src-tauri/src/modules/sync/engine/payload.rs`), the path a sync pull lands
+  records through; there is no second merge.
+- A backup holds entries and groups only: no `DeviceState`, no tombstones, no
+  `lastUsedAt`. Writing one refuses a passphrase under zxcvbn score 3, the
+  sync passphrase's rule.
+- CSV export uses Bitwarden's columns, so the file re-imports here and into
+  Bitwarden.
+
 ## Workflow
 
 - CI (`.github/workflows/ci.yml`) runs, frontend job: `pnpm run lint:imports`,
   `pnpm run typecheck:scripts`, `pnpm run format:check`, `pnpm run verify`,
-  `pnpm exec tsc --noEmit`, `pnpm build`; rust job: `cargo fmt --all -- --check`,
-  `cargo check --all-targets --locked`,
+  `pnpm exec tsc --noEmit`, `pnpm run typecheck:extension`, `pnpm build`; rust
+  job: `cargo fmt --all -- --check`,
+  `cargo check --workspace --all-targets --locked`, a `subclave-proxy` check
+  for `x86_64-pc-windows-msvc`,
   `cargo clippy --workspace --all-targets --locked -- -D warnings`,
-  `cargo test --workspace --locked`.
+  `cargo test --workspace --locked`; extension job: type-check, build both
+  targets (`pnpm --filter subclave-extension build --target chrome`, then
+  `--target firefox`), `web-ext lint` on the Firefox build, build the
+  `subclave-proxy` crate, run the Playwright specs under `extension/test/`
+  (all but `sites.spec.ts`, which loads live sites and runs only through
+  `pnpm --filter subclave-extension test:sites`), and package the zips.
+- Docs: `ARCHITECTURE.md` holds the module map and the main flows,
+  `KNOWN-LIMITS.md` the accepted limits, `SECURITY.md` the threat model. A
+  change that moves a module, a flow, a limit or a trust boundary updates the
+  matching file in the same PR.
 - `pnpm run verify [substring]` runs `scripts/*-verify.ts`, auto-globbed by
   `scripts/verify-all.mjs` (a new file needs no registration). Modules meant to
   be exercised here stay free of Tauri imports at module scope, or take their
   IO as an injected port, so plain node can load them.
 - `pnpm tauri:dev` uses `tauri.dev.conf.json` (`dev.rendy.subclave.dev`),
   isolating stores and logs in a `.dev` data dir.
-- Release: a tag matching `v*` triggers `.github/workflows/release.yml`, which
-  builds signed updates and a draft GitHub Release; notes are generated from
-  `CHANGELOG.md` via `scripts/release-notes.mjs`. The file holds only the
-  latest release; every earlier version lives in GitHub Releases, so a new
-  draft replaces the old section instead of stacking on it.
+- Release: feature branch -> PR into `dev` (squash) -> PR `dev` -> `main`
+  (merge commit) -> annotated tag `vX.Y.Z` on `main`. Before the tag, run
+  `extension/test/sites.md` (the automated `test:sites` run, a hand check of
+  the sites it reports blocked, two real-app sign-ins) and record the run in
+  it. The tag (`v*`) triggers
+  `.github/workflows/release.yml`, which builds signed updates and a draft
+  GitHub Release; notes are generated from `CHANGELOG.md` via
+  `scripts/release-notes.mjs`, which reads the heading
+  `## [X.Y.Z] - DD-MM-YYYY`. The file holds only the latest release; every
+  earlier version lives in GitHub Releases, so a new draft replaces the old
+  section instead of stacking on it.
 
 ## Gotchas
 

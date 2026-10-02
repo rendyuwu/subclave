@@ -57,6 +57,20 @@ pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
     })
 }
 
+/// [`atomic_write`] for a file that holds secrets: mode `0o600` on Unix (set
+/// on the staging temp before the first byte), a plain write elsewhere. The
+/// vault file and its `.bak`, backups and CSV exports go through this.
+pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        atomic_write_mode(path, bytes, 0o600)
+    }
+    #[cfg(not(unix))]
+    {
+        atomic_write(path, bytes)
+    }
+}
+
 /// One lock per TARGET FILE, held across the whole stage-fsync-rename sequence.
 /// Filed under [`lock_key`] rather than the path as written, because two
 /// spellings of one file must not take two locks.
@@ -77,13 +91,14 @@ pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 /// registers `tauri-plugin-single-instance`, so a second launch forwards its
 /// argv and exits rather than becoming a second writer.
 ///
-/// Two callers write through this helper today, both Tauri commands, so two
-/// invocations naming one file can overlap - and over a shared staging temp the
-/// loser of the rename race gets `os error 2` rather than a torn file:
-/// `fs_write_file` (editor saves), and `save_vault` in
-/// `modules/vault/file.rs` (the sealed vault file and its `.bak`, which also
-/// serialize one level up through the vault's save lock). Any future caller
-/// that stages through this helper needs the same lock.
+/// Every caller is reached from a Tauri command, so two invocations naming one
+/// file can overlap - and over a shared staging temp the loser of the rename
+/// race gets `os error 2` rather than a torn file: `fs_write_file` (editor
+/// saves), `save_vault` in `modules/vault/file.rs` (the sealed vault file and
+/// its `.bak`, which also serialize one level up through the vault's save
+/// lock), and the backup and CSV exports (`write_file` in
+/// `modules/backup.rs`, `export_csv_inner` in `modules/import/mod.rs`). Any
+/// future caller that stages through this helper needs the same lock.
 static TARGET_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

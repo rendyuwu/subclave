@@ -33,7 +33,7 @@ export function VaultSearchInput() {
   const tokens = getBindingTokens(binding);
 
   return (
-    <InputGroup className="w-full">
+    <InputGroup className="h-7 w-full">
       <InputGroupAddon align="inline-start">
         <Search strokeWidth={2} className="size-4 shrink-0 opacity-50" />
       </InputGroupAddon>
@@ -43,7 +43,7 @@ export function VaultSearchInput() {
         onChange={(e) => void setQuery(e.target.value)}
         placeholder="Search entries"
         aria-label="Search entries"
-        className="text-sm"
+        className="h-full text-sm"
       />
       <InputGroupAddon align="inline-end">
         {query ? (

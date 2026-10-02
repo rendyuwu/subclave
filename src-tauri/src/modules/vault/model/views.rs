@@ -66,8 +66,9 @@ pub struct DetailVersion {
 }
 
 /// Host of a URL, lowercased. Full public-suffix matching belongs to the
-/// browser-integration matcher; this is only the summary's `primaryHost`.
-fn host_of(url: &str) -> Option<String> {
+/// browser-integration matcher; this is the summary's `primaryHost`, and the
+/// host CSV import shows and matches duplicates on.
+pub(crate) fn host_of(url: &str) -> Option<String> {
     Url::parse(url).ok()?.host_str().map(|h| h.to_lowercase())
 }
 

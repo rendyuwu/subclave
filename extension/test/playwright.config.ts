@@ -54,8 +54,12 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     stdout: "ignore",
   },
+  // `sites.spec.ts` loads live sites and runs only under `test/sites.config.ts`.
   projects: [
-    { name: "chrome" },
-    { name: "chrome-inject", testIgnore: ["**/inline.spec.ts", "**/guard.spec.ts"] },
+    { name: "chrome", testIgnore: ["**/sites.spec.ts"] },
+    {
+      name: "chrome-inject",
+      testIgnore: ["**/inline.spec.ts", "**/guard.spec.ts", "**/sites.spec.ts"],
+    },
   ],
 });

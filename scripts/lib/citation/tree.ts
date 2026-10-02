@@ -15,7 +15,7 @@ import { type Violation, violationsIn } from "./violations";
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
-    if (name === "node_modules" || name === "target" || name === "dist" || name === "gen") continue;
+    if (["node_modules", "target", "dist", "gen", "test-results"].includes(name)) continue;
     const full = join(dir, name);
     if (statSync(full).isDirectory()) walk(full, out);
     else if (hasKnownCommentSyntax(name)) out.push(full);

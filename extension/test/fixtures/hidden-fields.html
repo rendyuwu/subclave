@@ -6,9 +6,18 @@
   </head>
   <body>
     <form>
+      <!-- A decoy before the username, as Booking.com has: laid out and
+           opaque, but out of the tab order and the accessibility tree. -->
+      <div aria-hidden="true">
+        <input id="decoy-password" type="password" tabindex="-1" />
+      </div>
       <input id="username" type="text" autocomplete="username" />
       <input id="hidden-password" type="password" style="display: none" />
-      <input id="zero-password" type="password" style="width: 0; height: 0; padding: 0; border: 0" />
+      <input
+        id="zero-password"
+        type="password"
+        style="width: 0; height: 0; padding: 0; border: 0"
+      />
       <input id="password" type="password" autocomplete="current-password" />
     </form>
     <script>

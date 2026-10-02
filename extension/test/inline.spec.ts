@@ -93,6 +93,8 @@ const ICON_CASES: Array<[string, string[], string[]]> = [
   ["vanish.html", ["#username", "#password"], []],
   ["navigate.html", ["#username", "#password"], []],
   ["churn.html", ["#username"], []],
+  // Rendered 2 s after `load`, as single-page apps do.
+  ["late-form.html", ["#username", "#password"], []],
   ...GUARD_FIXTURES.map((name): [string, string[], string[]] => [
     name,
     ["#username", "#password"],
@@ -149,7 +151,7 @@ test("with Show in login fields off there are no icons and the popup still fills
   await expect(page.locator("#password")).toHaveValue(FAKE_PASSWORD);
 });
 
-test("an inline fill never touches hidden or zero-size inputs", async ({}, testInfo) => {
+test("an inline fill never touches hidden, zero-size or decoy inputs", async ({}, testInfo) => {
   harness = await startHarness(testInfo);
   const page = await openFixture(harness, "hidden-fields.html");
   const ui = inlineOf(page);
@@ -159,6 +161,7 @@ test("an inline fill never touches hidden or zero-size inputs", async ({}, testI
   await expect(page.locator("#password")).toHaveValue(FAKE_PASSWORD);
   await expect(page.locator("#hidden-password")).toHaveValue("");
   await expect(page.locator("#zero-password")).toHaveValue("");
+  await expect(page.locator("#decoy-password")).toHaveValue("");
   const events = await page.evaluate(() => window.__events);
   expect(events["hidden:input"]).toBe(0);
   expect(events["zero:change"]).toBe(0);

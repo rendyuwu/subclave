@@ -12,9 +12,9 @@ use crate::modules::generator;
 use crate::modules::prefs;
 use crate::modules::vault::entry_commands::vault_entry_upsert_inner;
 use crate::modules::vault::model::{
-    DraftCustomField, EntryDraft, EntryUrl, MatchMode, VaultPayload, BROWSER_ID, TRASH_ID,
+    DraftCustomField, EntryDraft, EntryUrl, MatchMode, VaultPayload, BROWSER_ID,
 };
-use crate::modules::vault::query::is_descendant;
+use crate::modules::vault::query::in_trash;
 use crate::modules::vault::state::{commit, now_ms, VaultState};
 
 /// An action's failure: an error code, and optionally the verbatim message the
@@ -51,12 +51,6 @@ fn locked_failure() -> Failure {
     Failure::code(NmError::VaultLocked)
 }
 
-/// An entry is hidden from the browser when it sits in Trash or a descendant
-/// of it.
-fn is_trashed(payload: &VaultPayload, group_id: &str) -> bool {
-    group_id == TRASH_ID || is_descendant(payload, TRASH_ID, group_id)
-}
-
 fn group_name(payload: &VaultPayload, group_id: &str) -> String {
     payload
         .groups
@@ -90,7 +84,7 @@ pub(crate) fn get_logins(vault: &VaultState, params: &Value) -> Result<Value, Fa
 
     let mut all = Vec::new();
     for entry in &payload.entries {
-        if is_trashed(payload, &entry.group_id) {
+        if in_trash(payload, &entry.group_id) {
             continue;
         }
         let mut any_match = false;
@@ -167,7 +161,7 @@ pub(crate) fn get_credential(
             .entries
             .iter()
             .find(|e| e.id == id)
-            .map(|e| is_trashed(payload, &e.group_id))
+            .map(|e| in_trash(payload, &e.group_id))
             .unwrap_or(false);
         if trashed {
             return Err(Failure::code(NmError::NoMatch));
@@ -284,7 +278,7 @@ pub(crate) fn save_login(
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| Failure::code(NmError::NoMatch))?;
-            if is_trashed(payload, &entry.group_id) {
+            if in_trash(payload, &entry.group_id) {
                 return Err(Failure::code(NmError::NoMatch));
             }
             let matches_page = entry.urls.iter().any(|u| {
@@ -357,7 +351,7 @@ mod tests {
     use crate::modules::vault::entry_commands::{
         vault_entry_trash_inner, vault_entry_upsert_inner,
     };
-    use crate::modules::vault::model::{EntryUrl, MatchMode, BROWSER_ID, ROOT_ID, TRASH_ID};
+    use crate::modules::vault::model::{EntryUrl, MatchMode, BROWSER_ID, ROOT_ID};
     use crate::modules::vault::session::vault_create_inner;
     use crate::modules::vault::state::VaultState;
     use crate::modules::vault::test_util::{draft, TempDir};
@@ -1037,32 +1031,5 @@ mod tests {
             .sync
             .dirty
             .contains(&format!("entry:{}", entry.id)));
-    }
-
-    #[test]
-    fn trash_descendants_are_hidden() {
-        // `is_trashed` covers Trash itself and any group below it.
-        let mut payload = VaultPayload::default();
-        payload.groups.push(crate::modules::vault::model::Group {
-            id: TRASH_ID.to_string(),
-            parent_id: None,
-            name: "Trash".into(),
-            icon: None,
-            color: None,
-            created_at: 0,
-            updated_at: 0,
-        });
-        payload.groups.push(crate::modules::vault::model::Group {
-            id: "bin".into(),
-            parent_id: Some(TRASH_ID.to_string()),
-            name: "Bin".into(),
-            icon: None,
-            color: None,
-            created_at: 0,
-            updated_at: 0,
-        });
-        assert!(is_trashed(&payload, TRASH_ID));
-        assert!(is_trashed(&payload, "bin"));
-        assert!(!is_trashed(&payload, ROOT_ID));
     }
 }

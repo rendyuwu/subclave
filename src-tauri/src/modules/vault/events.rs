@@ -48,8 +48,10 @@ pub(crate) fn emit_locked(app: &AppHandle, reason: LockReason) {
 }
 
 /// Only called on success; a failed mutation emits `vault-save-failed`
-/// instead. `origin` is `"local"` for every vault-side mutation and `"sync"`
-/// for a pull that landed records.
+/// instead. `origin` is `"local"` for every vault-side mutation, `"sync"` for
+/// a pull that landed records, and `"import"` for a CSV import or backup
+/// apply. The browser channel emits the same event with `"browser"` through
+/// `emit_vault_changed` in `src-tauri/src/modules/browser/host.rs`.
 pub(crate) fn emit_changed(app: &AppHandle, ids: &[String], origin: &str) {
     let _ = app.emit(
         events::VAULT_CHANGED,

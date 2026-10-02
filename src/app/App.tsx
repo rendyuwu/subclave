@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Toaster } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { BackupMenu } from "@/modules/backup/BackupMenu";
 import { PairingDialog } from "@/modules/browser/PairingDialog";
 import { CommandPalette } from "@/modules/commandPalette/CommandPalette";
 import { Header } from "@/modules/header/Header";
@@ -58,7 +59,11 @@ export default function App() {
     <ThemeProvider>
       <TooltipProvider>
         <div className="bg-background text-foreground relative flex h-screen flex-col overflow-hidden">
-          <Header onOpenSettings={openSettings} onLock={locked ? undefined : lock}>
+          <Header
+            onOpenSettings={openSettings}
+            onLock={locked ? undefined : lock}
+            actions={locked ? undefined : <BackupMenu />}
+          >
             {locked ? null : <VaultSearchInput />}
           </Header>
           <SaveFailedBanner />

@@ -20,4 +20,4 @@ pub use records::{
 pub use views::{
     detail_of, summary_of, DetailCustomField, DetailVersion, EntryDetail, EntrySummary,
 };
-pub(crate) use views::{version_changed_names, version_of};
+pub(crate) use views::{host_of, version_changed_names, version_of};
