@@ -29,6 +29,7 @@ pnpm typecheck:scripts
 pnpm format:check        # Prettier (fix: pnpm format)
 pnpm verify              # scripts/*-verify.ts behaviour checks
 pnpm typecheck
+pnpm typecheck:extension
 pnpm build
 pnpm lint:rust           # cargo fmt --check + clippy -D warnings (fix: pnpm fmt:rust)
 cd src-tauri && cargo test --workspace
