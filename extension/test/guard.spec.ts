@@ -169,3 +169,37 @@ test("generate rows pass the same guards", async () => {
     log.some((entry) => entry.action === "generate-password" || entry.action === "save-login"),
   ).toBe(false);
 });
+
+test("save prompt rows pass the same guards", async () => {
+  await setMode(harness, "no-fields");
+  const page = await openFixture(harness, "save-login.html");
+  const ui = inlineOf(page);
+  await expect.poll(() => ui.count(".icon")).toBe(2);
+  await page.locator("#username").fill("newuser");
+  await page.locator("#password").fill("typed-pw");
+  await page.locator("#submit").click();
+  await page.waitForURL("**/landing.html");
+  await waitForOptions(page, ui);
+  await ui.dispatchUntrustedClick(OPTION, 0);
+  await expect.poll(() => ui.pickerText()).toContain("Subclave did not accept that click.");
+  expect(await ui.attr(".message", "data-guard")).toBe("1");
+  expect(await ui.count(OPTION)).toBe(2);
+  expect((await readLog(harness)).some((entry) => entry.action === "save-login")).toBe(false);
+});
+
+test("save prompt Update rows pass the same guards", async () => {
+  const page = await openFixture(harness, "save-login.html");
+  const ui = inlineOf(page);
+  await expect.poll(() => ui.count(".icon")).toBe(2);
+  await page.locator("#username").fill(FAKE_ENTRIES[1].username);
+  await page.locator("#password").fill("new-pw");
+  await page.locator("#submit").click();
+  await page.waitForURL("**/landing.html");
+  await waitForOptions(page, ui);
+  expect(await ui.pickerText()).toContain(`Update ${FAKE_ENTRIES[1].title}`);
+  await ui.dispatchUntrustedClick(OPTION, 0);
+  await expect.poll(() => ui.pickerText()).toContain("Subclave did not accept that click.");
+  expect(await ui.attr(".message", "data-guard")).toBe("1");
+  expect(await ui.count(OPTION)).toBe(3);
+  expect((await readLog(harness)).some((entry) => entry.action === "save-login")).toBe(false);
+});

@@ -13,12 +13,14 @@ import type {
   InlineRequest,
   PairingCodeEvent,
   PopupRequest,
+  SavePrompt,
   SwResponse,
   SwState,
 } from "./lib/messages";
 import { PAIRING_CODE_EVENT } from "./lib/messages";
 import { PROTOCOL_VERSION } from "./lib/protocol";
 import type {
+  CheckLoginResult,
   CredentialResult,
   GenerateResult,
   GetLoginsResult,
@@ -35,6 +37,22 @@ import type { Transport } from "./lib/transport";
 
 const CREDENTIALS_KEY = "subclave.credentials";
 const SHOW_IN_LOGIN_FIELDS_KEY = "subclave.showInLoginFields";
+/** One pending sign-in per tab, in `chrome.storage.session` so it survives a
+ * service worker restart between the submit and the next page load. */
+const PENDING_SAVE_PREFIX = "subclave.pendingSave.";
+/** How long a submitted login waits for its prompt to be answered. */
+const PENDING_SAVE_TTL_MS = 5 * 60_000;
+/** How many page loads in its tab may show the prompt. */
+const PENDING_SAVE_PAGE_LOADS = 3;
+
+type PendingSave = {
+  id: string;
+  url: string;
+  username: string;
+  password: string;
+  at: number;
+  loads: number;
+};
 
 type Credentials = { clientId: string; secret: string };
 type CallResult<T> = { ok: true; result: T } | { ok: false; code: NmErrorCode; message: string };
@@ -59,6 +77,10 @@ const INLINE_REQUEST_TYPES: Record<string, true> = {
   "inline-generate": true,
   "inline-pair": true,
   "inline-focus-app": true,
+  "inline-submitted": true,
+  "inline-pending-save": true,
+  "inline-save": true,
+  "inline-save-cancel": true,
 };
 
 export type BackgroundOptions = {
@@ -452,9 +474,112 @@ export function startBackground(options: BackgroundOptions = {}): void {
     return { type: "focus", ok: response.ok };
   };
 
-  /** Every inline request is answered for the sender's own tab and URL, at
-   * `scope: "host"` and `via: "inline"`, so the picker can never reach another
-   * page's logins or the popup's wider match. */
+  // ponytail: one chain for all tabs; per-tab chains if it ever matters
+  let pendingChain: Promise<unknown> = Promise.resolve();
+  /** Runs `step` after every earlier one. Storage has no transactions, so each
+   * read-modify-write of a pending pair is one step; native calls stay out. */
+  const withPending = <T>(step: () => Promise<T>): Promise<T> => {
+    const result = pendingChain.then(step);
+    pendingChain = result.catch(() => undefined);
+    return result;
+  };
+
+  /** Call inside a `withPending` step. */
+  const readPending = async (tabId: number): Promise<PendingSave | null> => {
+    const key = PENDING_SAVE_PREFIX + tabId;
+    const stored = await chrome.storage.session.get(key);
+    // `inline-submitted` is the only writer of this key.
+    return (stored[key] as PendingSave | undefined) ?? null;
+  };
+
+  /** Drops the tab's pair only if it is still the one named `id`, so a slow
+   * answer never deletes a newer sign-in. */
+  const dropPending = (tabId: number, id: string): Promise<void> =>
+    withPending(async () => {
+      if ((await readPending(tabId))?.id === id) {
+        await chrome.storage.session.remove(PENDING_SAVE_PREFIX + tabId);
+      }
+    });
+
+  /** The prompt for the tab's pending sign-in on the page at `url`, counted as
+   * one of its page loads. Nothing pending never connects to the app; a stored
+   * pair is dropped, and a failed check (locked, not running, unpaired) or a
+   * page on another site keeps it for later. Expiry is checked here only, so a
+   * prompt already showing can still be answered. */
+  const pendingPrompt = async (tabId: number, url: string): Promise<SwResponse> => {
+    const none: SwResponse = { type: "save-prompt", prompt: null };
+    const key = PENDING_SAVE_PREFIX + tabId;
+    const pending = await withPending(async () => {
+      const stored = await readPending(tabId);
+      if (!stored) return null;
+      if (stored.loads >= PENDING_SAVE_PAGE_LOADS || Date.now() - stored.at > PENDING_SAVE_TTL_MS) {
+        await chrome.storage.session.remove(key);
+        return null;
+      }
+      await chrome.storage.session.set({ [key]: { ...stored, loads: stored.loads + 1 } });
+      return stored;
+    });
+    if (!pending) return none;
+    const checked = await call<CheckLoginResult>("check-login", {
+      url: pending.url,
+      pageUrl: url,
+      username: pending.username,
+      password: pending.password,
+    });
+    if (!checked.ok || checked.result.state === "other-site") return none;
+    if (checked.result.state === "unchanged") {
+      await dropPending(tabId, pending.id);
+      return none;
+    }
+    let host = pending.url;
+    try {
+      host = new URL(pending.url).hostname;
+    } catch {
+      // Keep the raw URL as the label.
+    }
+    const prompt: SavePrompt = {
+      id: pending.id,
+      host,
+      username: pending.username,
+      entries: checked.result.entries,
+    };
+    return { type: "save-prompt", prompt };
+  };
+
+  /** Adds the pending sign-in `id` (`entryId` null) or updates that entry with
+   * it; a newer sign-in in the tab answers `no-match`. */
+  const savePending = async (
+    tabId: number,
+    id: string,
+    entryId: string | null,
+  ): Promise<SwResponse> => {
+    const pending = await withPending(() => readPending(tabId));
+    if (pending?.id !== id) {
+      return {
+        type: "save",
+        ok: false,
+        code: "no-match",
+        message: "This sign-in is no longer waiting to be saved.",
+      };
+    }
+    const saved = await call<SaveLoginResult>("save-login", {
+      url: pending.url,
+      username: pending.username,
+      password: pending.password,
+      ...(entryId ? { entryId } : {}),
+      via: "inline",
+    });
+    if (!saved.ok) return { type: "save", ok: false, code: saved.code, message: saved.message };
+    await dropPending(tabId, id);
+    return { type: "save", ok: true };
+  };
+
+  /** Every inline request is answered for the sender's own tab at
+   * `scope: "host"` and `via: "inline"`. Fills and the picker use the sender's
+   * URL, so they never reach another host's logins or the popup's wider match.
+   * The save prompt saves to the browser-stamped URL of the tab's own submitted
+   * sign-in, and shows only on a page of that sign-in's site (`check-login`
+   * decides, by the vault's Domain rule). */
   const handleInline = async (
     message: InlineRequest,
     tabId: number,
@@ -474,6 +599,29 @@ export function startBackground(options: BackgroundOptions = {}): void {
         return pair((event) => sendToTab(tabId, event));
       case "inline-focus-app":
         return focusApp();
+      case "inline-submitted": {
+        // `url` is the browser-stamped `sender.url`; the content script never
+        // names one. A new submit replaces the tab's old pair.
+        const pending: PendingSave = {
+          id: crypto.randomUUID(),
+          url,
+          username: message.username,
+          password: message.password,
+          at: Date.now(),
+          loads: 0,
+        };
+        await withPending(() =>
+          chrome.storage.session.set({ [PENDING_SAVE_PREFIX + tabId]: pending }),
+        );
+        return { type: "submitted" };
+      }
+      case "inline-pending-save":
+        return pendingPrompt(tabId, url);
+      case "inline-save":
+        return savePending(tabId, message.id, message.entryId);
+      case "inline-save-cancel":
+        await dropPending(tabId, message.id);
+        return { type: "save", ok: true };
     }
   };
 
@@ -483,6 +631,10 @@ export function startBackground(options: BackgroundOptions = {}): void {
 
   chrome.commands.onCommand.addListener((command) => {
     if (command === "fill-login") void runFillCommand();
+  });
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    void chrome.storage.session.remove(PENDING_SAVE_PREFIX + tabId);
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

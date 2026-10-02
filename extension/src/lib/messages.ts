@@ -2,7 +2,7 @@
 // worker, between the content script's inline picker and the service worker,
 // and between the service worker and the content script.
 
-import type { LoginSummary, NmErrorCode } from "./protocol";
+import type { LoginSummary, NmErrorCode, SaveCandidate } from "./protocol";
 
 /** Sent service worker -> popup (or the tab whose picker asked to pair) before
  * the pairing response arrives. */
@@ -21,14 +21,27 @@ export type PopupRequest =
   | { type: "fill-command" };
 
 /** Sent by the top-frame content script only; the service worker answers these
- * for the sender's own tab and URL, never for another page. */
+ * for the sender's own tab and its `sender.url`, never a URL the page names.
+ * The save-prompt requests (`inline-pending-save`, `inline-save`,
+ * `inline-save-cancel`) act on the sign-in that same tab submitted: it saves
+ * to the `sender.url` stamped on its `inline-submitted`, and shows only on a
+ * page of that URL's site (`check-login` decides). `id` names the pending
+ * sign-in the prompt shows, so a newer one is never written in its place. */
 export type InlineRequest =
   | { type: "inline-settings" }
   | { type: "inline-logins" }
   | { type: "inline-fill"; entryId: string }
   | { type: "inline-generate"; entryId: string | null }
   | { type: "inline-pair" }
-  | { type: "inline-focus-app" };
+  | { type: "inline-focus-app" }
+  | { type: "inline-submitted"; username: string; password: string }
+  | { type: "inline-pending-save" }
+  | { type: "inline-save"; id: string; entryId: string | null }
+  | { type: "inline-save-cancel"; id: string };
+
+/** A sign-in waiting for the save prompt. `id` is the pending sign-in's own;
+ * `host` is the submitted page's hostname. */
+export type SavePrompt = { id: string; host: string; username: string; entries: SaveCandidate[] };
 
 export type SwState =
   | { state: "locked" }
@@ -54,6 +67,10 @@ export type SwResponse =
   | { type: "generate"; ok: false; code: NmErrorCode; message: string }
   | { type: "settings"; showInLoginFields: boolean }
   | { type: "focus"; ok: boolean }
+  | { type: "submitted" }
+  | { type: "save-prompt"; prompt: SavePrompt | null }
+  | { type: "save"; ok: true }
+  | { type: "save"; ok: false; code: NmErrorCode; message: string }
   | { type: "error"; code: NmErrorCode; message: string };
 
 /** `url` is the page the credential was released for, and `anchored` says the

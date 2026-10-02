@@ -13,5 +13,5 @@ The latest release only. Every earlier version:
 - Entries and nested groups with tags, favourites, expiry dates, search, Trash and per-entry version history.
 - Copy with clipboard auto-clear, TOTP codes, and a password generator with a strength meter.
 - End-to-end encrypted sync to your own S3-compatible bucket or WebDAV share, with a merge that keeps both sides of a conflict.
-- Browser extension for Chromium browsers and Firefox: pairing, an icon and picker inside login fields, popup fill, the fill command, and "Generate for this site".
+- Browser extension for Chromium browsers and Firefox: pairing, an icon and picker inside login fields, popup fill, the fill command, "Generate for this site", and a save prompt that adds or updates a login typed on a page.
 - CSV import from KeePassXC, Bitwarden, Chrome and Firefox, CSV export, and encrypted `.subclave-backup` files.

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Planted submit</title>
+  </head>
+  <body>
+    <form id="planted">
+      <input id="username" type="text" autocomplete="username" />
+      <input id="password" type="password" autocomplete="current-password" />
+      <button type="submit">Sign in</button>
+    </form>
+    <script>
+      // Page script plants a login and submits it; no user gesture ever
+      // reaches this page.
+      const form = document.getElementById("planted");
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        form.reset();
+      });
+      setTimeout(() => {
+        document.getElementById("username").value = "bob";
+        document.getElementById("password").value = "planted";
+        form.requestSubmit();
+        document.title = "submitted";
+      }, 2000);
+    </script>
+  </body>
+</html>

@@ -1,7 +1,9 @@
 // The inline icon and picker: an icon in each detected login field, and a
-// top-layer picker of the page's exact-host logins. A fill, generate or update
-// row runs only after every guard in `guard.ts` passes. Matching, credential
-// release and every write stay in the service worker and Rust.
+// top-layer picker of the page's exact-host logins. After a trusted sign-in
+// submit, the same picker shows the save prompt (Add, Update, Cancel) in the
+// viewport's corner. A fill, generate, update, Add or Update row runs only
+// after every guard in `guard.ts` passes. Matching, credential release and
+// every write stay in the service worker and Rust.
 //
 // Everything is built with `createElement`/`textContent` inside one closed
 // shadow root. Placement goes through `element.style` (CSSOM, which a page CSP
@@ -9,9 +11,19 @@
 // the shadow `<style>` with the colours and fonts is refused.
 
 import { sendToBackground } from "../lib/messages";
-import type { InlineRequest, SwResponse, SwState } from "../lib/messages";
-import type { NmErrorCode } from "../lib/protocol";
+import type { InlineRequest, SavePrompt, SwResponse, SwState } from "../lib/messages";
+import type { NmErrorCode, SaveCandidate } from "../lib/protocol";
 import { scan, topRect } from "./detect";
+import {
+  autocompleteTokens,
+  findAllInputs,
+  hasAutocompleteToken,
+  inputType,
+  isRendered,
+  rootsOf,
+  scopeOf,
+  usernamePartner,
+} from "./fill";
 import { createGuard, otherTopLayer } from "./guard";
 import type { GuardId } from "./guard";
 
@@ -25,6 +37,15 @@ const DETECT_MAX_WAIT_MS = 1000;
  * apps render their form after `load`: Discord, X and Stripe took 1.5 to 2.2 s
  * when this was measured. */
 const SETTLE_AFTER_LOAD_MS = 5000;
+/** How long a page that saw a sign-in waits before showing the prompt
+ * itself; most sign-ins navigate first, and the next page's script shows it. */
+const SUBMIT_PROMPT_DELAY_MS = 1000;
+/** Longer page-supplied values are never captured: they would only fail the
+ * native frame cap and fill `chrome.storage.session`. */
+const MAX_SUBMITTED_LENGTH = 1024;
+/** The controls whose click submits their form. */
+const SUBMIT_BUTTON =
+  'button:not([type]), button[type="submit"], input[type="submit"], input[type="image"]';
 const DETECT_ATTRIBUTES = ["type", "style", "class", "hidden", "open", "autocomplete"];
 const SVG_NS = "http://www.w3.org/2000/svg";
 const KEY_PATH =
@@ -43,6 +64,7 @@ const CSS = `
 .title, .detail { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail, .notes p { color: #555; }
 .notes:empty { display: none; }
+.heading { margin: 0; padding: 6px 10px 2px; font-weight: 600; }
 .notes p { margin: 0; padding: 6px 10px; }
 .notes .code { color: inherit; font: 600 20px/1.4 ui-monospace, monospace; letter-spacing: 0.1em; }
 @media (prefers-color-scheme: dark) {
@@ -111,6 +133,55 @@ function keyGlyph(): SVGSVGElement {
   return svg;
 }
 
+/** The form's rendered inputs in document order, reached the way detection
+ * reaches them (open shadow roots, same-origin iframes). */
+function formInputs(form: HTMLFormElement): HTMLInputElement[] {
+  return findAllInputs(rootsOf(document)).filter((i) => isRendered(i) && scopeOf(i) === form);
+}
+
+/** The rendered username and password `form` holds, or `null` without a
+ * filled password or without a username (a password-only form is the second
+ * step of a two-step login, and an update from it would blank the stored
+ * username). A password is an input detection once saw as one (`seen`), so a
+ * password shown as text at submit still counts; card codes and one-time
+ * codes never do. A change-password form gives its new password: the first
+ * `new-password` field with a value, else the last filled password
+ * (current, new, repeat). */
+function submittedLogin(
+  form: HTMLFormElement,
+  seen: WeakSet<HTMLInputElement>,
+): { username: string; password: string } | null {
+  const own = formInputs(form);
+  const passwords = own.filter(
+    (i) =>
+      (inputType(i) === "password" || seen.has(i)) &&
+      i.value !== "" &&
+      !autocompleteTokens(i).some((token) => token.startsWith("cc-") || token === "one-time-code"),
+  );
+  if (passwords.length === 0) return null;
+  const password = (
+    passwords.find((i) => hasAutocompleteToken(i, "new-password")) ??
+    passwords[passwords.length - 1]
+  ).value;
+  const username = usernamePartner(own, passwords[0])?.value.trim() ?? "";
+  if (
+    username === "" ||
+    username.length > MAX_SUBMITTED_LENGTH ||
+    password.length > MAX_SUBMITTED_LENGTH
+  ) {
+    return null;
+  }
+  return { username, password };
+}
+
+/** A real user gesture within the activation window. `navigator.userActivation`
+ * is Chrome 72+ and Firefox 120+, both below the Popover API floor
+ * `startInline` requires; it is read through a named interface. */
+function userActive(): boolean {
+  const nav: Navigator & { userActivation?: { isActive: boolean } } = navigator;
+  return nav.userActivation?.isActive === true;
+}
+
 function createInline(): Inline {
   let running = true;
 
@@ -138,7 +209,10 @@ function createInline(): Inline {
   notes.className = "notes";
   notes.setAttribute("role", "status");
   notes.setAttribute("aria-live", "polite");
-  picker.append(list, notes);
+  const heading = document.createElement("p");
+  heading.className = "heading";
+  heading.setAttribute("role", "status");
+  picker.append(heading, list, notes);
   // The page field keeps focus while the pointer works the picker.
   picker.addEventListener("mousedown", (event) => event.preventDefault());
   shadow.append(style, picker);
@@ -149,6 +223,9 @@ function createInline(): Inline {
   /** Detected field -> is a new-password field. */
   let fields = new Map<HTMLInputElement, boolean>();
   const wired = new WeakSet<HTMLInputElement>();
+  const wiredForms = new WeakSet<HTMLFormElement>();
+  /** Every input detection ever saw as a password, for `submittedLogin`. */
+  const seenPasswords = new WeakSet<HTMLInputElement>();
   const watched = new WeakSet<Document>();
   let observed = new WeakSet<Document | ShadowRoot>();
   let generation = 0;
@@ -164,6 +241,10 @@ function createInline(): Inline {
   let active = 0;
   let seq = 0;
   let pending: HTMLInputElement | null = null;
+  /** The save prompt on show; `listing` once the user asked to pick the entry
+   * to update. The prompt is the picker open with no anchor. */
+  let saving: { prompt: SavePrompt; listing: boolean } | null = null;
+  let submitSeq = 0;
 
   const isOpen = (): boolean => picker.matches(":popover-open");
 
@@ -173,6 +254,7 @@ function createInline(): Inline {
     anchor = null;
     anchorRect = null;
     rows = [];
+    saving = null;
     seq += 1;
   };
 
@@ -192,7 +274,15 @@ function createInline(): Inline {
   };
 
   const place = (): void => {
-    if (!anchor) return;
+    if (!anchor) {
+      // The save prompt: the viewport's top-right corner, placed again by
+      // `queueReflow` when the viewport resizes.
+      const width = Math.min(PICKER_MIN_WIDTH, innerWidth - 8);
+      picker.style.width = `${width}px`;
+      picker.style.left = `${Math.max(4, document.documentElement.clientWidth - width - 8)}px`;
+      picker.style.top = "8px";
+      return;
+    }
     const rect = topRect(anchor);
     anchorRect = rect;
     const width = Math.min(Math.max(rect.width, PICKER_MIN_WIDTH), innerWidth - 8);
@@ -212,8 +302,9 @@ function createInline(): Inline {
   };
 
   /** Every render while open re-places the picker and restarts guard 1's
-   * timer, so the delay runs from when pickable rows appear. */
-  const render = (next: Row[], lines: HTMLElement[]): void => {
+   * timer, so the delay runs from when pickable rows appear. Visibility of
+   * the heading goes through `hidden`: a page CSP can refuse the `<style>`. */
+  const render = (next: Row[], lines: HTMLElement[], head = ""): void => {
     rows = next;
     active = 0;
     list.replaceChildren(
@@ -238,6 +329,8 @@ function createInline(): Inline {
     );
     if (next.length > 0) list.setAttribute("aria-activedescendant", "subclave-opt-0");
     else list.removeAttribute("aria-activedescendant");
+    heading.textContent = head;
+    heading.hidden = head === "";
     notes.replaceChildren(...lines);
     if (isOpen()) {
       place();
@@ -266,9 +359,17 @@ function createInline(): Inline {
   };
 
   const refuse = (id: GuardId): void => {
-    const message = note("Use the Subclave toolbar button to fill on this page.", "message");
+    const message = note(
+      saving
+        ? "Subclave did not accept that click."
+        : "Use the Subclave toolbar button to fill on this page.",
+      "message",
+    );
     message.dataset.guard = String(id);
-    render([], [message]);
+    // The prompt's rows come back (restarting guard 1's delay) so the user
+    // can try again.
+    if (saving) showPrompt([message]);
+    else render([], [message]);
   };
 
   /** `null` once the extension was updated or reloaded under this page: this
@@ -432,6 +533,98 @@ function createInline(): Inline {
     await loadLogins(mine);
   };
 
+  /** Saves the pending sign-in `id`, the one the prompt shows. */
+  const save = async (id: string, entryId: string | null): Promise<void> => {
+    const mine = seq;
+    const response = await ask({ type: "inline-save", id, entryId });
+    if (!response || mine !== seq) return;
+    if (response.type === "save" && response.ok) close();
+    else if (response.type === "save" || response.type === "error") {
+      showPrompt([note(response.message)]);
+    }
+  };
+
+  const cancelSave = async (id: string): Promise<void> => {
+    close();
+    await ask({ type: "inline-save-cancel", id });
+  };
+
+  /** Add and Update write to the vault, so they pass every guard; "Update an
+   * existing login" and Cancel write nothing and need a trusted event only. */
+  const showPrompt = (lines: HTMLElement[] = []): void => {
+    if (!saving) return;
+    const { prompt, listing } = saving;
+    const update = (entry: SaveCandidate): Row => ({
+      label: `Update ${entry.title}`,
+      detail: entry.username,
+      guarded: true,
+      run: () => save(prompt.id, entry.id),
+    });
+    const add: Row = {
+      label: "Add",
+      detail: prompt.username,
+      guarded: true,
+      run: () => save(prompt.id, null),
+    };
+    const cancel: Row = { label: "Cancel", guarded: false, run: () => cancelSave(prompt.id) };
+    const choose: Row = {
+      label: "Update an existing login",
+      guarded: false,
+      run: async () => {
+        if (saving) {
+          saving.listing = true;
+          showPrompt();
+        }
+      },
+    };
+    const same = prompt.entries.filter((entry) => entry.username === prompt.username);
+    let next: Row[];
+    if (listing) next = [...prompt.entries.map(update), cancel];
+    else if (same.length === 1) next = [update(same[0]), add, cancel];
+    else if (prompt.entries.length > 0) next = [add, choose, cancel];
+    else next = [add, cancel];
+    render(next, lines, `Save login for ${prompt.host}?`);
+  };
+
+  /** Shows the tab's pending sign-in, if the service worker has one to offer.
+   * Never takes focus. */
+  const promptSave = async (): Promise<void> => {
+    const response = await ask({ type: "inline-pending-save" });
+    if (!running || response?.type !== "save-prompt" || !response.prompt) return;
+    // The user is working the picker, or guard 2 would refuse every Add and
+    // Update: the pair stays pending for a later page load.
+    if ((anchor && isOpen()) || otherTopLayer()) return;
+    close();
+    // Before `arm`, so the tamper observer never sees this move.
+    if (document.documentElement.lastElementChild !== host) document.documentElement.append(host);
+    saving = { prompt: response.prompt, listing: false };
+    showPrompt();
+    picker.showPopover();
+    place();
+    guard.arm();
+  };
+
+  const submitted = async (
+    form: HTMLFormElement,
+    login: { username: string; password: string },
+  ): Promise<void> => {
+    // A page can plant values and submit them from its own `mousedown` on a
+    // prompt row: closing in that same task leaves the click nothing to land
+    // on, and the pair id the rows carry backs it up.
+    if (saving) close();
+    // The click-then-submit pair of one sign-in sends two identical messages;
+    // only the last one keeps its timer.
+    const mine = (submitSeq += 1);
+    const response = await ask({ type: "inline-submitted", ...login });
+    if (!response || !running) return;
+    setTimeout(() => {
+      // Still in the form: not signed in yet (a show-password toggle, a refused
+      // password), so only a later page load shows the prompt.
+      const stillTyped = formInputs(form).some((input) => input.value === login.password);
+      if (mine === submitSeq && running && !stillTyped) void promptSave();
+    }, SUBMIT_PROMPT_DELAY_MS);
+  };
+
   const pick = async (
     index: number,
     event: Event,
@@ -508,6 +701,13 @@ function createInline(): Inline {
       if (!running) return;
       positionIcons();
       if (anchor && isOpen() && moved()) close();
+      else if (!anchor && isOpen()) {
+        // The save prompt follows the viewport's corner; moved under the
+        // pointer, guard 1's delay starts over, as for the anchored picker.
+        const { left, width } = picker.style;
+        place();
+        if (picker.style.left !== left || picker.style.width !== width) guard.markShown();
+      }
     });
   };
 
@@ -570,6 +770,29 @@ function createInline(): Inline {
     });
   };
 
+  // `isTrusted` alone is not enough: `requestSubmit()` and `button.click()`
+  // from page script fire a trusted `submit`, so a real user gesture must be
+  // active too. The click path covers sites that sign in by script from the
+  // button's click and never fire `submit`. Nothing here calls
+  // `preventDefault`.
+  const wireForm = (form: HTMLFormElement): void => {
+    const capture = (event: Event): void => {
+      if (!running || !event.isTrusted || !userActive()) return;
+      const login = submittedLogin(form, seenPasswords);
+      if (login) void submitted(form, login);
+    };
+    form.addEventListener("submit", capture, true);
+    form.addEventListener(
+      "click",
+      (event) => {
+        // A click target is always an element.
+        const target = event.target as Element | null;
+        if (target?.closest(SUBMIT_BUTTON)) capture(event);
+      },
+      true,
+    );
+  };
+
   const watch = (doc: Document): void => {
     if (watched.has(doc)) return;
     watched.add(doc);
@@ -612,6 +835,7 @@ function createInline(): Inline {
       icons.delete(input);
     }
     for (const { input } of detected) {
+      if (inputType(input) === "password") seenPasswords.add(input);
       if (!icons.has(input)) {
         const icon = makeIcon(input);
         shadow.append(icon);
@@ -620,6 +844,11 @@ function createInline(): Inline {
       if (!wired.has(input)) {
         wired.add(input);
         wire(input);
+      }
+      const form = input.form;
+      if (form && !wiredForms.has(form)) {
+        wiredForms.add(form);
+        wireForm(form);
       }
       watch(input.ownerDocument);
     }
@@ -664,6 +893,8 @@ function createInline(): Inline {
       { once: true },
     );
   }
+  // A sign-in this tab submitted on an earlier page.
+  void promptSave();
 
   return {
     stop() {

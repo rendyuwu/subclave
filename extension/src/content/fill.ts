@@ -94,8 +94,12 @@ export function scopeOf(input: HTMLInputElement): Node {
 }
 
 /** `autocomplete` is a token list (`"username webauthn"`), not one value. */
+export function autocompleteTokens(input: HTMLInputElement): string[] {
+  return (input.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/);
+}
+
 export function hasAutocompleteToken(input: HTMLInputElement, token: string): boolean {
-  return (input.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/).includes(token);
+  return autocompleteTokens(input).includes(token);
 }
 
 /** The first text-like input before the password field among `inputs`, which
