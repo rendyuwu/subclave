@@ -37,7 +37,7 @@ export function UnlockScreen() {
   };
 
   return (
-    <div className="flex h-full items-center justify-center p-6">
+    <div className="flex h-full flex-1 items-center justify-center p-6">
       <form onSubmit={submit} className="flex w-full max-w-sm flex-col gap-4">
         <div className="flex flex-col items-center gap-2 text-center">
           <img src="/icon.png" alt="" aria-hidden draggable={false} className="size-10" />

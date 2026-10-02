@@ -32,7 +32,7 @@ export function CreateVaultScreen() {
   };
 
   return (
-    <div className="flex h-full items-center justify-center p-6">
+    <div className="flex h-full flex-1 items-center justify-center p-6">
       <form onSubmit={submit} className="flex w-full max-w-sm flex-col gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-lg font-semibold">Create a vault</h1>
