@@ -10,6 +10,7 @@
     "build:e2e": "node scripts/build.mjs --test && node scripts/build.mjs --test --no-content",
     "typecheck": "tsc --noEmit",
     "test": "pnpm run build:e2e && playwright test --config test/playwright.config.ts",
+    "test:sites": "node scripts/build.mjs --test && playwright test --config test/sites.config.ts --headed",
     "zip": "node scripts/zip.mjs",
     "lint:webext": "web-ext lint --source-dir dist/firefox"
   },

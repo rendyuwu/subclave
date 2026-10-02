@@ -45,6 +45,9 @@ const SKIP_DIRS = new Set([
   "dist",
   "node_modules",
   "target",
+  // Playwright's per-run output: browser profiles whose lock symlinks dangle
+  // once the browser is gone, so a stat through them throws.
+  "test-results",
 ]);
 function everyFile(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {

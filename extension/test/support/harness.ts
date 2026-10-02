@@ -41,11 +41,15 @@ const DIST_BY_PROJECT: Record<string, string> = {
  * does load unpacked extensions here (`xvfb-run` is installed too, so a headed
  * run stays available if a runner ever refuses them).
  */
-export function launchExtension(projectName: string, profileDir: string): Promise<BrowserContext> {
+export function launchExtension(
+  projectName: string,
+  profileDir: string,
+  headless: boolean,
+): Promise<BrowserContext> {
   const dist = path.resolve(EXTENSION_DIR, "dist", DIST_BY_PROJECT[projectName] ?? "e2e-chrome");
   return chromium.launchPersistentContext(profileDir, {
     channel: "chromium",
-    headless: true,
+    headless,
     args: [`--disable-extensions-except=${dist}`, `--load-extension=${dist}`],
   });
 }
@@ -64,12 +68,17 @@ export async function openPopup(context: BrowserContext, extensionId: string): P
 
 export type Harness = { context: BrowserContext; worker: Worker; extensionId: string };
 
-/** Launches the extension with a clean store, paired, in mode `ok`. */
+/** Launches the extension with a clean store, paired, in mode `ok`. Headless
+ *  unless the run asked for `--headed`. */
 export async function startHarness(
   testInfo: TestInfo,
   { showInLoginFields = true }: { showInLoginFields?: boolean } = {},
 ): Promise<Harness> {
-  const context = await launchExtension(testInfo.project.name, testInfo.outputPath("profile"));
+  const context = await launchExtension(
+    testInfo.project.name,
+    testInfo.outputPath("profile"),
+    testInfo.project.use.headless !== false,
+  );
   const worker = await serviceWorker(context);
   // The fake app's mode, log and connect count all live in storage because an
   // MV3 worker can be suspended between steps; the credentials are seeded so the
