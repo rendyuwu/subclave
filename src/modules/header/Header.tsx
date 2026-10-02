@@ -89,16 +89,16 @@ function HeaderImpl({ onOpenSettings, onLock, actions, children }: Props) {
       <div
         data-tauri-drag-region
         onMouseDown={onHeaderMouseDown}
-        className={`flex h-11 shrink-0 items-center gap-2 ${IS_MAC ? "pr-2 pl-20" : "pr-0 pl-2"}`}
+        className={`flex h-9 shrink-0 items-center gap-2 ${IS_MAC ? "pr-2 pl-20" : "pr-0 pl-2"}`}
       >
         <img
           src="/icon.png"
           alt=""
           aria-hidden="true"
           draggable={false}
-          className="size-5 shrink-0"
+          className="size-4 shrink-0"
         />
-        <span className="text-sm font-semibold">Subclave</span>
+        <span className="text-[13px] font-semibold">Subclave</span>
 
         {children ? (
           <div className="flex max-w-md min-w-0 flex-1 items-center">{children}</div>
