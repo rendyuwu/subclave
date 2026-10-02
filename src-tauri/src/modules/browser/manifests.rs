@@ -40,7 +40,11 @@ impl Family {
 
 /// The directories the per-OS tables are built from.
 pub struct Roots {
+    /// The home dir; only Linux detection reads it (Snap, Flatpak, `.mozilla`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub home: PathBuf,
+    /// The config dir; only Linux and macOS detection read it.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub config: PathBuf,
     /// The roaming app data dir; only Windows detection reads it.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -208,6 +212,7 @@ fn slots_unix(_roots: &Roots) -> Vec<BrowserSlot> {
 }
 
 /// Add a slot when its browser directory exists.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn push_slot(
     out: &mut Vec<BrowserSlot>,
     family: Family,
