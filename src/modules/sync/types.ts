@@ -81,8 +81,8 @@ export type SyncConfig = {
   prefix: string;
   /** Whether the endpoint honours a conditional write. A STORED USER TOGGLE and
    *  never a probe, see `cas` in `src-tauri/src/modules/sync/provider.rs`. Not
-   *  sent to a provider that has no conditional write to offer, which is why the
-   *  settings section renders no switch for one. */
+   *  sent to a provider that has no conditional write to offer, which is why
+   *  `SyncBehaviour` renders no switch for one. */
   cas: boolean;
 };
 
