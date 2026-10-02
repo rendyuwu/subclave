@@ -38,7 +38,7 @@ fn envelope(kind: &str, id: &str, updated_at: u64, record: Option<Value>) -> Env
 /// envelope it was handed. Stripping here would make every agreed pair look
 /// changed. The strip that matters happens on PUBLISH (`seal_envelope`) and on
 /// a merged envelope before it is compared against a remote copy.
-fn entry_envelope(entry: &Entry) -> Envelope {
+pub(crate) fn entry_envelope(entry: &Entry) -> Envelope {
     envelope(
         ENTRY_KIND,
         &entry.id,
@@ -47,7 +47,7 @@ fn entry_envelope(entry: &Entry) -> Envelope {
     )
 }
 
-fn group_envelope(group: &Group) -> Envelope {
+pub(crate) fn group_envelope(group: &Group) -> Envelope {
     envelope(
         GROUP_KIND,
         &group.id,
@@ -113,7 +113,12 @@ pub fn locals_from_payload(payload: &VaultPayload, now: u64) -> Vec<Envelope> {
 
 /// The stored shape of one slot for the merge, with expired tombstones reading
 /// as absent so this view matches [`locals_from_payload`].
-fn local_envelope(payload: &VaultPayload, kind: &str, id: &str, now: u64) -> Option<Envelope> {
+pub(crate) fn local_envelope(
+    payload: &VaultPayload,
+    kind: &str,
+    id: &str,
+    now: u64,
+) -> Option<Envelope> {
     let envelope = envelope_of_slot(payload, kind, id)?;
     if envelope.deleted {
         let deleted_at = envelope.updated_at.unwrap_or(0);
@@ -252,6 +257,25 @@ fn write_envelope(
     })
 }
 
+/// Merge one incoming envelope into the live payload the way a pull lands a
+/// record: against the stored slot (tombstone included, expired ones read as
+/// absent), then store the result. `Ok(true)` when the stored form changed.
+pub(crate) fn merge_into_payload(
+    payload: &mut VaultPayload,
+    incoming: &Envelope,
+    now: u64,
+) -> Result<bool, String> {
+    let to_store = match local_envelope(payload, &incoming.kind, &incoming.id, now) {
+        Some(local) => {
+            merge(&local, incoming)
+                .map_err(|e| format!("sync: the two copies could not be merged ({e:?})"))?
+                .envelope
+        }
+        None => incoming.clone(),
+    };
+    write_envelope(payload, &to_store, now)
+}
+
 // ---------------------------------------------------------------------------
 // The apply
 // ---------------------------------------------------------------------------
@@ -286,19 +310,7 @@ pub fn apply_pull(payload: &mut VaultPayload, report: &PullReport, now: u64) -> 
                 continue;
             }
         };
-        let to_store = match local_envelope(payload, kind, id, now) {
-            Some(local) => match merge(&local, envelope) {
-                Ok(merged) => merged.envelope,
-                Err(reason) => {
-                    let reason = format!("sync: the two copies could not be merged ({reason:?})");
-                    applied.quarantine.push(quarantine_slot(kind, id, reason));
-                    applied.failed_slots.push(slot(kind, id));
-                    continue;
-                }
-            },
-            None => envelope.clone(),
-        };
-        match write_envelope(payload, &to_store, now) {
+        match merge_into_payload(payload, envelope, now) {
             Ok(changed) => {
                 if changed {
                     applied.landed += 1;

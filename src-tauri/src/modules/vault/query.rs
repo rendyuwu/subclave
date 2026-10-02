@@ -6,7 +6,7 @@ use tauri::AppHandle;
 
 use crate::modules::vault::events::run_blocking;
 use crate::modules::vault::model::{
-    detail_of, summary_of, Entry, EntryDetail, EntrySummary, Group, VaultPayload,
+    detail_of, summary_of, Entry, EntryDetail, EntrySummary, Group, VaultPayload, TRASH_ID,
 };
 use crate::modules::vault::state::{VaultState, LOCKED_ERR};
 
@@ -26,6 +26,12 @@ pub(crate) fn is_descendant(payload: &VaultPayload, ancestor: &str, candidate: &
         }
     }
     false
+}
+
+/// Trash itself or any group below it. Trashed entries are hidden from the
+/// browser, skipped by the CSV import's duplicate check and by the CSV export.
+pub(crate) fn in_trash(payload: &VaultPayload, group_id: &str) -> bool {
+    group_id == TRASH_ID || is_descendant(payload, TRASH_ID, group_id)
 }
 
 /// Shared lookup behind reveal and clipboard copy. `totp_as_code` turns the
@@ -196,6 +202,33 @@ mod tests {
     use crate::modules::vault::model::{self, EntryVersion, ROOT_ID};
     use crate::modules::vault::session::*;
     use crate::modules::vault::test_util::*;
+
+    #[test]
+    fn trash_descendants_are_hidden() {
+        // `in_trash` covers Trash itself and any group below it.
+        let mut payload = VaultPayload::default();
+        payload.groups.push(Group {
+            id: TRASH_ID.to_string(),
+            parent_id: None,
+            name: "Trash".into(),
+            icon: None,
+            color: None,
+            created_at: 0,
+            updated_at: 0,
+        });
+        payload.groups.push(Group {
+            id: "bin".into(),
+            parent_id: Some(TRASH_ID.to_string()),
+            name: "Bin".into(),
+            icon: None,
+            color: None,
+            created_at: 0,
+            updated_at: 0,
+        });
+        assert!(in_trash(&payload, TRASH_ID));
+        assert!(in_trash(&payload, "bin"));
+        assert!(!in_trash(&payload, ROOT_ID));
+    }
 
     #[test]
     fn resolve_field_cases() {

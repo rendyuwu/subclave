@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::modules::aesgcm::{open_with_key, seal_with_key};
+use crate::modules::vault::file::header_aad;
 use crate::modules::vault::kdf::{check_params, derive_key, fresh_params, Argon2Params};
 
 /// The keyfile's own version, DELIBERATELY SEPARATE from `WIRE_VERSION` in
@@ -161,22 +162,10 @@ pub fn expand_root(root: &[u8; 32]) -> Result<SyncKeys, String> {
     })
 }
 
-/// The keyfile header as associated data: compact JSON of the format, version
-/// and KDF parameters, in declaration order, so the bytes are stable on seal
-/// and open. Mirrors `aad` in `src-tauri/src/modules/vault/file.rs`.
+/// The keyfile header as associated data: the shared header AAD
+/// ([`header_aad`]) over the keyfile's own format and version.
 fn kek_aad(kdf: &Argon2Params) -> Vec<u8> {
-    #[derive(Serialize)]
-    struct KeyfileAad<'a> {
-        format: &'static str,
-        v: u32,
-        kdf: &'a Argon2Params,
-    }
-    serde_json::to_vec(&KeyfileAad {
-        format: KEYFILE_FORMAT,
-        v: KEYFILE_VERSION,
-        kdf,
-    })
-    .expect("header AAD serialization")
+    header_aad(KEYFILE_FORMAT, KEYFILE_VERSION, kdf)
 }
 
 /// Mint a brand new root key and wrap it under `passphrase`.

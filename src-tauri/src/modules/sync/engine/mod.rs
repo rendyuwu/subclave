@@ -31,7 +31,7 @@
 
 mod commands;
 mod layout;
-mod payload;
+pub(crate) mod payload;
 mod types;
 
 use std::collections::{BTreeMap, BTreeSet};

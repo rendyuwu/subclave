@@ -1,9 +1,11 @@
 pub mod aesgcm;
+pub mod backup;
 pub mod browser;
 pub mod clipboard;
 pub mod events;
 pub mod fs;
 pub mod generator;
+pub mod import;
 pub mod lockext;
 pub mod prefs;
 pub mod strength;

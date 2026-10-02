@@ -41,7 +41,7 @@ installers for every OS on each PR.
 
 - Branch off `dev`, open the PR against `dev`. `main` only receives `dev`.
 - Prefixes: `feat/`, `fix/`, `chore/`, `docs/`, `perf/`.
-- PRs are squash-merged; the title is the commit, in [Conventional Commits](https://www.conventionalcommits.org/) form: `fix(settings): keep the theme picker focused`.
+- PRs into `dev` are squash-merged; the title is the commit, in [Conventional Commits](https://www.conventionalcommits.org/) form: `fix(settings): keep the theme picker focused`. `dev` merges into `main` with a merge commit.
 - One change per PR. Open an issue first for anything non-trivial.
 - Fill in the PR template.
 

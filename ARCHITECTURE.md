@@ -1,0 +1,121 @@
+# Architecture
+
+Code map. Contributor rules and gotchas: [SUBCLAVE.md](SUBCLAVE.md). Accepted
+limits: [KNOWN-LIMITS.md](KNOWN-LIMITS.md). Threat model:
+[SECURITY.md](SECURITY.md).
+
+## Shape
+
+Subclave is a Tauri 2 app: a Rust core (`src-tauri/`) that owns the vault, its
+key and every file, socket and network call, and two React webviews, main
+(`index.html`, `src/app/`) and Settings (`settings.html`, `src/settings/`),
+that talk to it through `invoke` and `subclave:` events. Beside it ship the
+`subclave-proxy` native messaging sidecar (`src-tauri/subclave-proxy/`), which
+the browser launches, and the MV3 browser extension (`extension/`) for Chromium
+browsers and Firefox.
+
+```text
+extension <-> stdio <-> subclave-proxy <-> socket/pipe <-> app
+app <-> HTTPS <-> S3/WebDAV
+```
+
+## Invariants
+
+- Plaintext lives only in Rust, in `VaultState` (`src-tauri/src/modules/vault/state.rs`). The webview store (`src/modules/vault/store.ts`) holds summaries, never a secret.
+- The webview gets a secret only through `vault_entry_reveal`. `clip_copy_field` copies inside Rust and returns only `clearsAt`.
+- Every `#[tauri::command]` is `pub async fn` and does its blocking work on the blocking pool: vault, browser client, import and backup shells through `run_blocking` (`src-tauri/src/modules/vault/events.rs`), sync commands through the `blocking` helper in `src-tauri/src/modules/sync/engine/commands.rs`, the rest through `spawn_blocking` directly. `no_new_sync_tauri_commands` in `src-tauri/src/commands.rs` fails on a synchronous command.
+- One save path: `commit` seals the payload (`seal_payload`), writes the primary and its `.bak` atomically (`save_vault`), and parks the seal when the write fails (`perform_save_locked`).
+- The sync inventory, the apply, the dirty set and the etags live in Rust (`src-tauri/src/modules/sync/engine/`). The webview only decides when a pass runs (`src/modules/sync/scheduler/policy.ts`).
+- No fill without a user action. The page never supplies the URL: the service worker takes it from the sender or the active tab (`senderKind` in `extension/src/background.ts`), and Rust re-checks every match before it releases a credential (`get_credential` in `src-tauri/src/modules/browser/actions.rs`).
+- Import and backup previews stage their rows in Rust and send the webview titles, hosts, usernames and counts only.
+- `src/app/App.tsx` wires modules together; feature logic lives in `src/modules/<area>/`. Modules import each other through `@/`, never a relative path (`scripts/check-imports.mjs`).
+
+## Backend (`src-tauri/src/modules/`)
+
+| Module                      | Role                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aesgcm.rs`                 | AES-256-GCM seal and open under a key the caller already holds, shared by the vault file, the sync keyfile and backups. Every failed open reports one message.                                                                                                                                                                                                    |
+| `backup.rs`                 | Encrypted `.subclave-backup` files: `seal_backup` and `open_backup` over the shared header AAD, the stamp-only preview, and the apply that merges each record through `merge_into_payload`.                                                                                                                                                                       |
+| `browser/`                  | Browser integration: native messaging manifests and the proxy path (`manifests.rs`), the socket or pipe server and its dispatch (`server.rs`), pairing (`pairing.rs`, `auth.rs`), URL matching (`matching.rs`), the actions the extension calls (`actions.rs`), the wire contract (`protocol.rs`), and the Settings commands (`mod.rs`).                          |
+| `clipboard.rs`              | Concealed secret copies (`clip_copy_field`) and the compare-and-clear auto-clear timer on the boot clock.                                                                                                                                                                                                                                                         |
+| `events.rs`                 | Names of the events Rust emits to the webview, mirrored by `IPC_EVENTS` in `src/lib/ipc.ts`.                                                                                                                                                                                                                                                                      |
+| `fs/`                       | `fs_read_file` and `fs_write_file` for the webview's store and theme files (`file.rs`), and crash-safe writes: temp file, fsync, rename (`atomic.rs`).                                                                                                                                                                                                            |
+| `generator.rs`              | Password generator (`gen_password`): a uniform draw over the enabled sets by rejection sampling, redrawn until every set appears.                                                                                                                                                                                                                                 |
+| `import/`                   | CSV import and export: header detection and the row mapping for KeePassXC, Bitwarden, Chrome and Firefox (`formats.rs`), the staged preview, the apply into an `Imported <date>` group and the delete of the imported file (`mod.rs`), and the Bitwarden-layout export (`export.rs`).                                                                             |
+| `lockext.rs`                | `lock_or_recover`: poison-safe locking for the long-lived shared mutexes.                                                                                                                                                                                                                                                                                         |
+| `mod.rs`                    | The module list and the shared test RNG (`test_rng`).                                                                                                                                                                                                                                                                                                             |
+| `prefs.rs`                  | Reads `subclave-settings.json` for Rust (auto-lock, clipboard clear, lock on minimize, close to tray, browser switches). Never fails: a bad value reads as its default.                                                                                                                                                                                           |
+| `strength.rs`               | zxcvbn score and warning (`gen_strength`, `strength_of`).                                                                                                                                                                                                                                                                                                         |
+| `sync/`                     | Cross-device sync: wire format and merge (`model.rs`), the crypto chain (`crypto.rs`), the provider trait (`provider.rs`), the S3 and WebDAV backends and SigV4 (`providers/`), pull, push, apply and the commands (`engine/`), and the device id (`mod.rs`).                                                                                                     |
+| `totp.rs`                   | `otpauth://` parsing and RFC 6238 codes (`totp_code`, `totp_preview`).                                                                                                                                                                                                                                                                                            |
+| `tray.rs`                   | Tray icon with Open, Lock and Quit.                                                                                                                                                                                                                                                                                                                               |
+| `vault/`                    | `VaultState` and `commit` (`state.rs`), the file format (`file.rs`), Argon2id (`kdf.rs`), the idle lock (`lock.rs`), session commands (`session.rs`), entry and group mutations (`entry_commands.rs`, `group_commands.rs`), queries and reveal (`query.rs`), the history merge (`merge_history.rs`), records (`model/`), events and `run_blocking` (`events.rs`). |
+| `src-tauri/subclave-proxy/` | The native messaging host binary: relays 4-byte-length-prefixed JSON frames between stdio and the app's socket, and answers `app-not-running` itself when the app is closed. Its library half (the framing in `frame.rs`, the socket address in `path.rs`, the client) is shared with the app's server.                                                           |
+
+Outside `modules/`: `src-tauri/src/lib.rs` registers the commands
+(`generate_handler!`) and runs the one background tick
+(`spawn_vault_tick_thread`), `src-tauri/src/windows.rs` handles the main
+window's events, and `src-tauri/src/commands.rs` holds the window commands and
+the command tests. The GUI binary is `SubclaveApp`.
+
+## Frontend (`src/modules/`)
+
+| Module            | Role                                                                                                                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `vault/`          | Vault screens (first run, create, join sync, unlock, workspace), entry list and detail, the editor (`editor/`), the join flow (`join/`), list derivation (`list/derive.ts`), the store (`store.ts`) and command wrappers (`ipc.ts`). |
+| `groups/`         | The group tree pane (`GroupTree.tsx`), the tag strip, group create, rename, move and delete, and Trash.                                                                                                                              |
+| `sync/`           | `startSync`, the scheduler (triggers, push debounce and focus floor in `scheduler/policy.ts`), the sync settings store and the command wrappers.                                                                                     |
+| `browser/`        | The pairing dialog (`PairingDialog.tsx`) and the browser-integration command wrappers.                                                                                                                                               |
+| `backup/`         | The header's import and export menu (`BackupMenu.tsx`), the CSV import dialog, the backup export and import dialog, the CSV export confirmation, the file pickers (`store.ts`) and the command wrappers (`ipc.ts`).                  |
+| `header/`         | The top bar: app name, the search slot, Settings and lock buttons, window controls.                                                                                                                                                  |
+| `statusbar/`      | The bottom bar: lock state and countdown, the sync pill (`SyncPill.tsx`), the entry count, the updater pill.                                                                                                                         |
+| `shortcuts/`      | The shortcut catalogue (`shortcuts.ts`), the global key handler, the command registry and the modal registry.                                                                                                                        |
+| `commandPalette/` | The command palette (`CommandPalette.tsx`).                                                                                                                                                                                          |
+| `settings/`       | Preferences store and schema (`preferences.ts`, `schema.ts`), the settings file loader, the Settings window opener, theme model and presets.                                                                                         |
+| `theme/`          | `ThemeProvider`.                                                                                                                                                                                                                     |
+| `updater/`        | In-app updater (`useUpdater`, `UpdaterPill`, `UpdaterDialog`).                                                                                                                                                                       |
+| `src/settings/`   | The Settings window (`SettingsApp.tsx`): General, Security, Sync, Browser, Theme, Shortcuts and About sections.                                                                                                                      |
+| `src/app/`        | The main-window shell (`App.tsx`): header, `VaultScreen`, status bar, palette and app-wide dialogs, the shortcut handlers (`lib/shortcutHandlers.ts`) and the store recovery notices.                                                |
+
+## Extension (`extension/src/`)
+
+| Path            | Role                                                                                                                                                                                                      |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `background.ts` | The service worker: credentials in `chrome.storage`, the native transport, pairing and the handshake, the popup and inline handlers (routed by `senderKind`), and the fill command (`runFillCommand`).    |
+| `content/`      | The content script (top frame only): field detection (`detect.ts`), the fill (`fill.ts`), the inline icon and picker in a closed shadow root (`inline.ts`), and the six clickjacking guards (`guard.ts`). |
+| `popup/`        | The toolbar popup (`PopupApp.tsx`): status, pairing, the entry list, generate, and the "Show in login fields" switch.                                                                                     |
+| `lib/`          | The wire contract (`protocol.ts`), the pairing code and HMAC handshake (`auth.ts`), the internal message types (`messages.ts`), and the native port (`transport.ts`).                                     |
+
+## Data
+
+App data dir of the bundle id (`dev.rendy.subclave`; `pnpm tauri:dev` uses
+`dev.rendy.subclave.dev`):
+
+| File                     | Holds                                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------------- |
+| `subclave-vault.json`    | The sealed vault (`VAULT_FILE_NAME`), with a `.bak` twin written after it.                |
+| `subclave-settings.json` | Preferences, written by the Settings webview with a `.bak` (`createRecoveredStore`).      |
+| `subclave-sync.json`     | Sync configuration and status (`SYNC_STORE_PATH`). No secrets.                            |
+| `sync-device-id`         | This installation's sync device id (`DEVICE_ID_FILE`).                                    |
+| `browser-hosts/`         | Windows only: the native messaging manifests the HKCU keys point at.                      |
+| `subclave-proxy`         | Linux AppImage only: the proxy copied out of the mounted image (`refresh_appimage_copy`). |
+
+- Logs go to Tauri's app log dir (`tauri_plugin_log`).
+- Native messaging manifests (`dev.rendy.subclave.json`) on Linux and macOS go into each browser's own directory (`slots` in `src-tauri/src/modules/browser/manifests.rs`): `~/.config/<browser>/NativeMessagingHosts/` and `~/.mozilla/native-messaging-hosts/` on Linux, plus the Snap and Flatpak profile paths; `~/Library/Application Support/<browser>/NativeMessagingHosts/` on macOS, Firefox under `Mozilla`. On Windows they are `browser-hosts/<family>/<browser>.json`, registered under `HKCU\Software\...\NativeMessagingHosts\dev.rendy.subclave`.
+- The browser socket (`socket_address` in `src-tauri/subclave-proxy/src/path.rs`): `$XDG_RUNTIME_DIR/dev.rendy.subclave/browser.sock` on Linux, `$TMPDIR/dev.rendy.subclave/browser.sock` on macOS, a fallback under the temp dir named with the uid, and the pipe `\\.\pipe\dev.rendy.subclave-browser-<hash>` on Windows. A debug build appends `.dev`.
+- Remote: `<prefix>/v1/keyfile` (the wrapped root key) and `<prefix>/v1/obj/<64 hex>`, one sealed record per object, named by an HMAC of its kind and id (`src-tauri/src/modules/sync/engine/layout.rs`).
+- Exports the user writes anywhere: `.subclave-backup` files and CSV.
+
+## Flows
+
+1. **Unlock**: `UnlockScreen` calls `useVaultStore.unlock`, then `vault_unlock` runs `vault_unlock_inner`: `load_vault` (the primary, or the `.bak` when the primary is unreadable), `open_file` (`check_params`, `derive_key`, `open_with_key` over `header_aad`), a second try on the `.bak` (`read_bak`) when the primary fails to open, the parked seal in place of the disk copy when one exists, `refresh_deadline`, and finally `Unlocked` into `VaultState`. The store then reads `vault_status` and `vault_list`, and `startSync` sees the vault unlock and calls the scheduler's `onUnlocked`, which queues a pull.
+2. **Edit and save**: `EntryEditorDialog` saves through `useEntryDraft` and `vault_entry_upsert`. `vault_entry_upsert_inner` checks `ensure_writable`, takes the payload through `VaultState::access`, pushes the previous version into `history` as `edit`, calls `mark_dirty`, and runs `commit`: `seal_payload`, then `save_vault` (primary, then `.bak`, mode `0o600` on Unix) under the save lock. A failed write is parked by `perform_save_locked`, `subclave:vault-save-failed` shows `SaveFailedBanner`, and the tick retries it every 10 s (`vault_retry_save_inner`). On success the shell emits `subclave:vault-changed` with origin `local` (`emit_changed`).
+3. **Lock**: manual, from the lock button, the status bar or the `vault.lock` shortcut (`useVaultStore.lock`, `vault_lock`, `lock_inner`); idle, when `spawn_vault_tick_thread` calls `VaultState::access` every 5 s past the deadline that `vault_touch` extends on activity (`drain_auto_lock`); minimize, in `on_main_window_event` when `lock_on_minimize` is set; tray, from the Lock item in `tray.rs`. Every path calls `Unlocked::wipe` and drops the key, then `emit_locked` closes the sync session (`session_closed`), drops every browser connection (`close_all`) and emits `subclave:vault-locked` with the `LockReason`.
+4. **Sync pull and push**: `startSync` builds the scheduler (`createPolicy`). It pulls on unlock and on window focus (`onFocus`, at most once per `FOCUS_INTERVAL_MS`), and pushes `PUSH_DEBOUNCE_MS` after the first change of a burst (`markDirty`, on any `subclave:vault-changed` whose origin is not `sync`). Passes run one at a time (`serialize`) and re-read the switch each time (`readConfig`). Pull: `sync_pull` snapshots `locals_from_payload` and the etags, releases the lock, runs `pull` (list, fetch the objects whose etag moved, `open_envelope`, `merge`, prune this device's expired tombstones), lands the report with `apply_pull` (`merge_into_payload` per record) and `commit`s, then emits origin `sync`. Push: `sync_push` takes `take_dirty_envelopes`, `push` seals each one (`seal_envelope`) and writes it conditionally on its etag where the backend can, re-merging once on a conflict (`retry_merged`), then `finish_push` clears the marks that landed and `commit`s.
+5. **Browser fill**: every request goes service worker, `createNativeTransport`, `subclave-proxy` (`read_frame`, `write_frame`), then the app's `accept_loop`, `handle_conn` and `dispatch` (status, locked check, `hello` and `auth` handshake, then the action).
+   - Inline: `startInline` and `createInline` draw an icon per field found by `scan`. Opening the picker sends `inline-logins`; the service worker answers it in `handleInline` for the sender's own URL at `scope: "host"` (`getState`, `get-logins`, `get_logins`, which returns no password). A pick passes `guard.check` (`createGuard`), then `inline-fill` runs `fillEntry` with `via: "inline"`: `get-credential` (`get_credential` re-runs `matching::matches` and requires `same_host`), then `subclave:fill` to the content script, where `fillTarget` refuses another origin and `fillCredential` fills.
+   - Popup: `PopupApp` asks `get-state` for the active tab at `scope: "all"`, and a pick sends `fill-entry`, which runs `fillEntry` with `via: "popup"` (`ensureContentScript` injects `content.js` when it is missing).
+   - Command: `fill-login` runs `runFillCommand`: `get-logins` for the active tab, then one match fills with `via: "command"`, and several open the popup where `chrome.action.openPopup` exists, or fill the most recently used one.
+   - A released credential stamps `lastUsedAt` and emits `subclave:vault-changed` with origin `browser`.
+6. **CSV import**: the header menu or the empty vault's "Import CSV" button opens the native picker (`pickCsvImport`), and `ImportCsvDialog` calls `import_csv_preview`. `import_csv_preview_inner` reads the file outside the vault mutex, `parse_csv` detects the format and maps each row, the duplicate check runs against the vault outside Trash, and `replace_staged` keeps the entries in `Unlocked.staged` while the webview gets titles, hosts, usernames and the row problems. `import_apply` lands the ticked rows in a new `Imported <date>` group (`import_apply_inner`: `mark_dirty`, `commit`) and emits `subclave:vault-changed` with origin `import`, which the sync scheduler pushes. `import_delete_csv` then deletes the file, only for an applied preview.
+7. **Backup export and import**: `BackupDialog` sends the passphrase to `backup_export`; `backup_export_inner` refuses a weak passphrase (`strength_of`), snapshots entries and groups under the lock, then runs `fresh_params` and `seal_backup` and writes the file outside it. Import: `backup_import_preview` reads the file, `open_backup` checks the header and opens it, each entry is classified on its stamp against `local_envelope` (new, newer, older, identical), and `replace_staged` holds the records. `backup_import_apply` merges groups, then entries, through `merge_into_payload` (the path `apply_pull` uses), marks each changed record dirty, `commit`s, and emits origin `import`.

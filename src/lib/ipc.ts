@@ -25,7 +25,10 @@ export const IPC_EVENTS = {
    * Vault locked (payload: `{ reason: "manual" | "idle" | "minimize" | "tray" }`).
    */
   VAULT_LOCKED: "subclave:vault-locked",
-  /** Vault content changed (payload: `{ ids: string[], origin: "local" }`). */
+  /**
+   * Vault content changed (payload:
+   * `{ ids: string[], origin: "local" | "sync" | "import" | "browser" }`).
+   */
   VAULT_CHANGED: "subclave:vault-changed",
   /**
    * Rust -> main webview: a browser extension asked to pair. Payload:

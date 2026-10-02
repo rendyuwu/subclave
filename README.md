@@ -16,7 +16,7 @@ your machine and syncs end to end through storage you own.
 
 ## Status
 
-Early development. The app is an application shell; the vault, sync and browser extension are not built yet.
+v0.1.0 is the first release: an encrypted vault, sync to your own S3 bucket or WebDAV share, and a browser extension for Chromium browsers and Firefox.
 
 ## Build from source
 
@@ -29,7 +29,43 @@ pnpm tauri:dev     # dev build, separate data dir
 pnpm tauri build   # installers
 ```
 
-Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Design:
+[ARCHITECTURE.md](ARCHITECTURE.md). Accepted limits:
+[KNOWN-LIMITS.md](KNOWN-LIMITS.md). Security: [SECURITY.md](SECURITY.md).
+
+## Uninstall
+
+The Windows uninstaller removes the browser integration itself: the HKCU
+native messaging keys and the manifests under
+`%APPDATA%\dev.rendy.subclave\browser-hosts\`. The `.deb`, `.rpm`, AppImage and
+macOS removals cannot reach per-user files, so before uninstalling there, turn
+off both switches in Settings > Browser. That removes the manifest from every
+browser Subclave still detects.
+
+Per-user files an uninstall leaves behind:
+
+- Linux and macOS: the `dev.rendy.subclave.json` manifest in each browser's
+  native messaging directory, unless the switches were turned off first.
+  - Linux: `~/.config/<browser>/NativeMessagingHosts/` for Chrome, Chromium,
+    Edge, Brave and Vivaldi (`google-chrome`, `chromium`, `microsoft-edge`,
+    `BraveSoftware/Brave-Browser`, `vivaldi`), the Snap and Flatpak copies
+    under `~/snap/` and `~/.var/app/`, and for Firefox
+    `~/.mozilla/native-messaging-hosts/`,
+    `~/snap/firefox/common/.mozilla/native-messaging-hosts/` and
+    `~/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts/`.
+  - macOS: `~/Library/Application Support/<browser>/NativeMessagingHosts/`
+    (`Google/Chrome`, `Chromium`, `Microsoft Edge`,
+    `BraveSoftware/Brave-Browser`, `Vivaldi`), and for Firefox
+    `~/Library/Application Support/Mozilla/NativeMessagingHosts/`.
+- The AppImage's `subclave-proxy` copy, inside the app data dir.
+- The app data dir itself, which holds the vault: Linux
+  `~/.local/share/dev.rendy.subclave/`, macOS
+  `~/Library/Application Support/dev.rendy.subclave/`, Windows
+  `%APPDATA%\dev.rendy.subclave\`. Keep it, or a backup, until you no longer
+  need the vault.
+- The logs: Linux `~/.local/share/dev.rendy.subclave/logs/`, macOS
+  `~/Library/Logs/dev.rendy.subclave/`, Windows
+  `%LOCALAPPDATA%\dev.rendy.subclave\logs\`.
 
 ## Credits
 

@@ -13,6 +13,9 @@ type Props = {
   /** Renders the lock button. A locked vault passes nothing, so the button
    *  disappears rather than sitting there inert. */
   onLock?: () => void;
+  /** Trailing buttons before the lock button; the unlocked shell passes the
+   *  import and export menu. */
+  actions?: ReactNode;
   /** Middle slot, between the app name and the trailing icon cluster. The
    *  unlocked shell puts the search field here. */
   children?: ReactNode;
@@ -46,7 +49,7 @@ function onHeaderMouseDown(e: React.MouseEvent<HTMLElement>) {
   }
 }
 
-function HeaderImpl({ onOpenSettings, onLock, children }: Props) {
+function HeaderImpl({ onOpenSettings, onLock, actions, children }: Props) {
   const settingsButton = (
     <IconTooltip label="Settings">
       <Button
@@ -81,7 +84,8 @@ function HeaderImpl({ onOpenSettings, onLock, children }: Props) {
       className="border-border/60 bg-card flex shrink-0 flex-col border-b select-none"
     >
       {/* One row: the app mark, the app name, the middle slot, the drag spacer,
-          the lock and settings buttons and the window controls. */}
+          the trailing actions, the lock and settings buttons and the window
+          controls. */}
       <div
         data-tauri-drag-region
         onMouseDown={onHeaderMouseDown}
@@ -102,6 +106,8 @@ function HeaderImpl({ onOpenSettings, onLock, children }: Props) {
 
         {/* Drag spacer between the middle slot and the trailing icon cluster. */}
         <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
+
+        {actions}
 
         {onLock ? lockButton : null}
 

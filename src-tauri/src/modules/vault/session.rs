@@ -150,7 +150,12 @@ pub(crate) fn install_new_vault(
     // Refresh BEFORE installing: a concurrent access() must not see the
     // previous session's expired deadline while the new one is installed.
     state.refresh_deadline(prefs::read(dir).auto_lock_minutes);
-    *lock_or_recover(&state.inner) = Some(Unlocked { payload, key, kdf });
+    *lock_or_recover(&state.inner) = Some(Unlocked {
+        payload,
+        key,
+        kdf,
+        staged: None,
+    });
     Ok(())
 }
 
@@ -207,6 +212,7 @@ pub(crate) fn vault_unlock_inner(
         payload,
         key: opened.key,
         kdf: opened.kdf,
+        staged: None,
     });
     Ok(())
 }
