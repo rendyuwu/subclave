@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "identifier": "dev.rendy.subclave",
   "build": {
-    "beforeDevCommand": { "script": "pnpm build:sidecar:dev && pnpm dev", "wait": true },
+    "beforeDevCommand": "pnpm build:sidecar:dev && pnpm dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "pnpm build:sidecar && pnpm build",
     "frontendDist": "../dist",
