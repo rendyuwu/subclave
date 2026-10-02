@@ -107,6 +107,65 @@ then filled from the manual check. `Form` is `one page`, `two step` or
 `other`; a path cell is `ok`, `miss`, `blocked` or `n/a`; `Pass` is `yes`,
 `no`, `blocked` (until the hand check) or `n/a`.
 
-### v0.1.0 (DD-MM-YYYY)
+### v0.1.0 (02-10-2026)
 
-Not run yet.
+- Build: PR #8 at `d38e1fb`.
+- Automated run: Google Chrome for Testing 153.0.8010.12 (Playwright 1.63.0),
+  headed under Xvfb on Ubuntu, Linux 6.8.
+- Hand check: pending.
+- Real-app sign-ins: pending.
+
+| #   | Form     | Inline  | Popup   | Command | Pass    | Notes                                                  |
+| --- | -------- | ------- | ------- | ------- | ------- | ------------------------------------------------------ |
+| 1   | one page | ok      | ok      | ok      | yes     |                                                        |
+| 2   | other    | blocked | blocked | blocked | blocked | bot check ("Just a moment...")                         |
+| 3   | one page | ok      | ok      | ok      | yes     |                                                        |
+| 4   | two step | ok      | ok      | ok      | yes     |                                                        |
+| 5   | two step | ok      | ok      | ok      | yes     |                                                        |
+| 6   | two step | miss    | miss    | miss    | no      | form in a cross-origin iframe (`KNOWN-LIMITS.md`)      |
+| 7   | two step | miss    | ok      | blocked | yes     | inline: no icon; command: no login field               |
+| 8   | two step | blocked | ok      | ok      | yes     | inline: bot check ("Security Measure")                 |
+| 9   | other    | blocked | blocked | blocked | blocked | no login field ("paypal.com")                          |
+| 10  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 11  | other    | blocked | blocked | blocked | blocked | HTTP error on load                                     |
+| 12  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 13  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 14  | one page | blocked | ok      | ok      | yes     | inline: blank page                                     |
+| 15  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 16  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 17  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 18  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 19  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 20  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 21  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 22  | one page | ok      | blocked | blocked | yes     | popup, command: bot check                              |
+| 23  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 24  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 25  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 26  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 27  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 28  | one page | ok      | blocked | blocked | yes     | popup, command: bot check                              |
+| 29  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 30  | other    | blocked | blocked | blocked | blocked | bot check (proof of work)                              |
+| 31  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 32  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 33  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 34  | other    | blocked | blocked | blocked | blocked | bot check ("Checking your browser...")                 |
+| 35  | two step | miss    | ok      | ok      | yes     | inline: no icon, first step has no `autocomplete` hint |
+| 36  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 37  | two step | miss    | ok      | ok      | yes     | inline: no icon, first step has no `autocomplete` hint |
+| 38  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 39  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 40  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 41  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 42  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 43  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 44  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 45  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 46  | one page | ok      | ok      | ok      | yes     |                                                        |
+| 47  | other    | blocked | blocked | blocked | blocked | no login field within 15 s                             |
+| 48  | other    | miss    | blocked | blocked | blocked | inline: no icon; popup, command: bot check             |
+| 49  | two step | ok      | ok      | ok      | yes     |                                                        |
+| 50  | one page | ok      | ok      | ok      | yes     |                                                        |
+
+Result: pending the hand check. Automated: 42 yes, 1 no, 7 blocked.

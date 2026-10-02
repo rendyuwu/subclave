@@ -4,7 +4,7 @@ The latest release only. Every earlier version:
 [GitHub Releases](https://github.com/rendyuwu/subclave/releases). Versions:
 [SemVer](https://semver.org/); before `1.0` a minor bump may break things.
 
-## [Unreleased]
+## [0.1.0] - 02-10-2026
 
 ### Added
 
