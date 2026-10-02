@@ -133,9 +133,8 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   `cargo test --workspace --locked`; extension job: type-check, build both
   targets (`pnpm --filter subclave-extension build --target chrome`, then
   `--target firefox`), `web-ext lint` on the Firefox build, build the
-  `subclave-proxy` crate, run the Playwright specs under `extension/test/`
-  (all but `sites.spec.ts`, which loads live sites and runs only through
-  `pnpm --filter subclave-extension test:sites`), and package the zips.
+  `subclave-proxy` crate, run the Playwright specs under `extension/test/`,
+  and package the zips.
 - Docs: `ARCHITECTURE.md` holds the module map and the main flows,
   `KNOWN-LIMITS.md` the accepted limits, `SECURITY.md` the threat model. A
   change that moves a module, a flow, a limit or a trust boundary updates the
@@ -147,10 +146,7 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
 - `pnpm tauri:dev` uses `tauri.dev.conf.json` (`dev.rendy.subclave.dev`),
   isolating stores and logs in a `.dev` data dir.
 - Release: feature branch -> PR into `dev` (squash) -> PR `dev` -> `main`
-  (merge commit) -> annotated tag `vX.Y.Z` on `main`. Before the tag, run
-  `extension/test/sites.md` (the automated `test:sites` run, a hand check of
-  the sites it reports blocked, two real-app sign-ins) and record the run in
-  it. The tag (`v*`) triggers
+  (merge commit) -> annotated tag `vX.Y.Z` on `main`. The tag (`v*`) triggers
   `.github/workflows/release.yml`, which builds signed updates and a draft
   GitHub Release; notes are generated from `CHANGELOG.md` via
   `scripts/release-notes.mjs`, which reads the heading
