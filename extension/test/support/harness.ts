@@ -59,9 +59,20 @@ export async function serviceWorker(context: BrowserContext): Promise<Worker> {
   return existing ?? (await context.waitForEvent("serviceworker"));
 }
 
-/** The popup runs as an ordinary tab; its id comes from the service worker URL. */
-export async function openPopup(context: BrowserContext, extensionId: string): Promise<Page> {
+/**
+ * The popup runs as an ordinary tab; its id comes from the service worker URL.
+ * The service worker answers for the active tab, and a real popup is not a tab,
+ * so `front` (the page under test) is brought to the front before popup.html
+ * loads: the popup's first `get-state` then sees that page, never the popup's
+ * own tab.
+ */
+export async function openPopup(
+  context: BrowserContext,
+  extensionId: string,
+  front?: Page,
+): Promise<Page> {
   const popup = await context.newPage();
+  await front?.bringToFront();
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
   return popup;
 }
