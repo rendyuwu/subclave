@@ -37,14 +37,13 @@ const setMode = (mode: FakeMode) => harnessSetMode(harness, mode);
 const readLog = () => harnessReadLog(harness);
 const readConnects = () => harnessReadConnects(harness);
 
-async function openPopupPage(): Promise<Page> {
-  return openPopup(harness.context, harness.extensionId);
+async function openPopupPage(front?: Page): Promise<Page> {
+  return openPopup(harness.context, harness.extensionId, front);
 }
 
 test("lists every match and fills username and password", async () => {
   const fixture = await openFixture("login.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
 
   const options = popup.getByRole("option");
   await expect(options).toHaveCount(FAKE_ENTRIES.length);
@@ -68,8 +67,7 @@ test("lists every match and fills username and password", async () => {
 
 test("never fills hidden, zero-size or decoy password inputs, on any path", async () => {
   const fixture = await openFixture("hidden-fields.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
 
   await popup.getByRole("option").first().click();
   await expect(fixture.locator("#username")).toHaveValue(FAKE_ENTRIES[0].username);
@@ -105,8 +103,7 @@ test("never fills hidden, zero-size or decoy password inputs, on any path", asyn
 
 test("reports a page with no fillable inputs", async () => {
   const fixture = await openFixture("no-fields.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
 
   await popup.getByRole("option").first().click();
   await expect(popup.getByText("No login fields found on this page.")).toBeVisible();
@@ -128,8 +125,7 @@ test("fills through the executeScript fallback when the content script is absent
     expect(missing).toBe(true);
   }
 
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
   await popup.getByRole("option").first().click();
   await expect(fixture.locator("#username")).toHaveValue(FAKE_ENTRIES[0].username);
   await expect(fixture.locator("#password")).toHaveValue(FAKE_PASSWORD);
@@ -137,7 +133,7 @@ test("fills through the executeScript fallback when the content script is absent
 
 test("the fill command fills the newest match", async () => {
   const fixture = await openFixture("login.html");
-  const popup = await openPopupPage();
+  const popup = await openPopupPage(fixture);
   // Model the browsers without `chrome.action.openPopup` (Firefox, Chrome
   // before 127), which is the condition the newest-lastUsedAt fallback exists
   // for. Headless Chromium resolves openPopup() without ever rendering one, so
@@ -146,7 +142,6 @@ test("the fill command fills the newest match", async () => {
     const action: { openPopup?: () => Promise<void> } = chrome.action;
     delete action.openPopup;
   });
-  await fixture.bringToFront();
 
   await fixture.keyboard.press("Control+Shift+L");
   await fixture.waitForTimeout(750);
@@ -173,11 +168,13 @@ test("generates a password, fills the signup form and saves a new entry", async 
   const fixture = await openFixture("signup.html");
   await fixture.locator("#username").fill("newuser");
 
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
   await popup.getByRole("button", { name: "Generate for this site" }).click();
   await expect(fixture.locator("#password")).toHaveValue(FAKE_GENERATED);
   await expect(fixture.locator("#password-confirm")).toHaveValue(FAKE_GENERATED);
+  // The page is filled before save-login is called; the notice shows only
+  // after save-login answers, so the log holds it from here on.
+  await expect(popup.getByText("Password saved to Subclave")).toBeVisible();
 
   const saved = (await readLog()).find((entry) => entry.action === "save-login");
   expect(saved?.params?.username).toBe("newuser");
@@ -188,13 +185,13 @@ test("generates a password, fills the signup form and saves a new entry", async 
 
 test("offers an update per match and keeps the entry id", async () => {
   const fixture = await openFixture("signup.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
 
   const update = popup.getByRole("button", { name: `Update ${FAKE_ENTRIES[1].title}` });
   await expect(update).toBeVisible();
   await update.click();
   await expect(fixture.locator("#password")).toHaveValue(FAKE_GENERATED);
+  await expect(popup.getByText("Password saved to Subclave")).toBeVisible();
 
   const saved = (await readLog()).find((entry) => entry.action === "save-login");
   expect(saved?.params?.entryId).toBe(FAKE_ENTRIES[1].id);
@@ -227,8 +224,7 @@ test("offers pairing and shows the six-digit code", async () => {
   // `chrome-extension://` tab (no `tabs` permission), so the service worker
   // needs a real page to be the active tab before it can call `get-logins`.
   const fixture = await openFixture("login.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
 
   const pair = popup.getByRole("button", { name: "Pair with Subclave" });
   await expect(pair).toBeVisible();
@@ -243,8 +239,7 @@ test("offers pairing and shows the six-digit code", async () => {
 test("a generate on a page with no password field saves nothing", async () => {
   await setMode("no-fields");
   const fixture = await openFixture("no-fields.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
 
   await popup.getByRole("button", { name: "Generate for this site" }).click();
   await expect(popup.getByText("No login fields found on this page.")).toBeVisible();
@@ -255,8 +250,7 @@ test("a page load opens no connection and the first popup fill opens one", async
   const fixture = await openFixture("login.html");
   expect(await readConnects()).toBe(0);
 
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
   await popup.getByRole("option").first().click();
   await expect(fixture.locator("#password")).toHaveValue(FAKE_PASSWORD);
 
@@ -265,8 +259,7 @@ test("a page load opens no connection and the first popup fill opens one", async
 
 test("re-handshakes a replaced connection instead of forcing a re-pair", async () => {
   const fixture = await openFixture("login.html");
-  const popup = await openPopupPage();
-  await fixture.bringToFront();
+  const popup = await openPopupPage(fixture);
   // Wait for the popup's own state read (a get-logins) to finish, so the drop
   // below lands on the fill's get-credential.
   await expect(popup.getByRole("option")).toHaveCount(FAKE_ENTRIES.length);
