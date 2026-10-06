@@ -131,22 +131,26 @@ export function configSubset(config: SyncConfig): SyncConfigArg {
 }
 
 /**
- * Whether the fields a provider actually needs are filled in.
+ * The connection fields a provider needs that are still blank, by the label the
+ * join form shows; empty when the connection is complete.
  *
- * SHARED WITH `scripts/sync-verify.ts`, and that is the point: this is the one
- * boolean in the join form that can make a whole provider unusable while the
- * form still looks complete, so it lives where a check can drive it rather than
- * inside a component.
+ * SHARED WITH `scripts/sync-verify.ts`, and that is the point: a field wrongly
+ * listed here makes a whole provider unusable from the join form while Settings
+ * > Sync, which has no such check, saves the same values.
  *
- * REGION AND BUCKET ARE S3'S ALONE. A WebDAV configuration refuses unknown
- * fields, so demanding them for a WebDAV server would make the form impossible
- * to submit.
+ * REGION IS NEVER LISTED. `provider_config` in
+ * `src-tauri/src/modules/sync/engine/commands.rs` passes it through as typed, a
+ * server that takes an empty one (Cloudflare R2 reads it as `auto`) works with
+ * it blank, and Settings > Sync saves it blank.
+ *
+ * BUCKET IS S3'S ALONE. A WebDAV configuration refuses unknown fields, so
+ * demanding one for a WebDAV server would make the form impossible to submit.
  */
-export function connectionFieldsReady(config: SyncConfig, credentialsReady: boolean): boolean {
-  if (config.endpoint.trim().length === 0) return false;
-  if (!credentialsReady) return false;
-  if (config.provider === "webdav") return true;
-  return config.region.trim().length > 0 && config.bucket.trim().length > 0;
+export function missingConnectionFields(config: SyncConfig): string[] {
+  const missing: string[] = [];
+  if (config.endpoint.trim().length === 0) missing.push("Endpoint");
+  if (config.provider !== "webdav" && config.bucket.trim().length === 0) missing.push("Bucket");
+  return missing;
 }
 
 /** A device with sync never configured. Off, and naming nothing. */

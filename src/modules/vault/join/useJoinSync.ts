@@ -7,7 +7,7 @@ import { syncJoin } from "@/modules/sync/ipc";
 import { createSyncSettingsStore } from "@/modules/sync/store";
 import {
   configSubset,
-  connectionFieldsReady,
+  missingConnectionFields,
   SYNC_CONFIG_EVENT,
   SYNC_STORE_PATH,
   type SyncConfig,
@@ -31,17 +31,26 @@ export const EMPTY_JOIN_CREDENTIALS: JoinCredentials = {
   webdavPassword: "",
 };
 
-/** Whether the credential pair the selected provider reads is filled in. */
-export function credentialsReady(credentials: JoinCredentials, provider: string): boolean {
-  return provider === "webdav"
-    ? credentials.username.length > 0 && credentials.webdavPassword.length > 0
-    : credentials.accessKeyId.length > 0 && credentials.secretAccessKey.length > 0;
+/** The labels of the credential fields the selected provider reads that are still blank. */
+function missingCredentials(credentials: JoinCredentials, provider: string): string[] {
+  const fields: [label: string, value: string][] =
+    provider === "webdav"
+      ? [
+          ["Username", credentials.username],
+          ["Password", credentials.webdavPassword],
+        ]
+      : [
+          ["Access key ID", credentials.accessKeyId],
+          ["Secret access key", credentials.secretAccessKey],
+        ];
+  return fields.filter(([, value]) => value.length === 0).map(([label]) => label);
 }
 
 /**
  * Everything the join screen's form does: the one submit, its busy flag, its
- * error, the `fresh` answer a remote with no keyfile gives, and the boolean the
- * Submit button is disabled on.
+ * error, the `fresh` answer a remote with no keyfile gives, and `blockers`,
+ * every reason other than `busy` that Submit is disabled, which the screen
+ * lists under it.
  *
  * A LANDED JOIN WRITES THE CONFIGURATION, switched on. The scheduler reads it
  * on the unlock that follows, and an off configuration makes it call
@@ -56,14 +65,14 @@ export function useJoinSync({
   credentials,
   passphrase,
   password,
-  masterPasswordReady,
+  masterPasswordProblems,
 }: {
   config: SyncConfig;
   credentials: JoinCredentials;
   passphrase: string;
   password: string;
-  /** Length, confirmation and the no-recovery acknowledgement, from `useMasterPassword`. */
-  masterPasswordReady: boolean;
+  /** `problems` from `useMasterPassword`: length, confirmation and the no-recovery acknowledgement. */
+  masterPasswordProblems: string[];
 }) {
   const refreshStatus = useVaultStore((s) => s.refreshStatus);
   const refresh = useVaultStore((s) => s.refresh);
@@ -76,11 +85,19 @@ export function useJoinSync({
   const [error, setError] = useState<string | null>(null);
   const [fresh, setFresh] = useState(false);
 
-  const canSubmit =
-    masterPasswordReady &&
-    connectionFieldsReady(config, credentialsReady(credentials, config.provider)) &&
-    passphrase.length > 0 &&
-    !busy;
+  // Every reason Join vault is disabled, in the order the fields render. The
+  // list and the button cannot disagree: while it is non-empty Submit is
+  // disabled, and the only other reason is `busy`, which shows the spinner.
+  const empty = [
+    ...missingConnectionFields(config),
+    ...missingCredentials(credentials, config.provider),
+    ...(passphrase.length === 0 ? ["Sync passphrase"] : []),
+  ];
+  const blockers = [
+    ...(empty.length > 0 ? [`Still empty: ${empty.join(", ")}.`] : []),
+    ...masterPasswordProblems,
+  ];
+  const canSubmit = blockers.length === 0 && !busy;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -122,5 +139,5 @@ export function useJoinSync({
     }
   };
 
-  return { submit, busy, error, fresh, canSubmit };
+  return { submit, busy, error, fresh, canSubmit, blockers };
 }

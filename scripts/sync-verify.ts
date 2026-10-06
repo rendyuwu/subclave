@@ -31,9 +31,9 @@ import type {
   SyncStatus,
 } from "@/modules/sync/types";
 import {
-  connectionFieldsReady,
   DEFAULT_SYNC_CONFIG,
   EMPTY_SYNC_STATUS,
+  missingConnectionFields,
 } from "@/modules/sync/types";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -486,9 +486,9 @@ check(
   !syncStore.includes("readDirty"),
 );
 
-// The join form's gate. Its whole value is that it is a checked predicate
-// rather than a condition inside a component: a flipped one makes a provider
-// permanently unsubmittable while the form still looks complete.
+// The join form's connection gate. Its whole value is that it is a checked
+// function rather than a condition inside a component: a field wrongly listed
+// makes the join form refuse a connection Settings > Sync saves.
 {
   const base: SyncConfig = {
     enabled: true,
@@ -500,19 +500,26 @@ check(
     cas: true,
   };
   const webdav: SyncConfig = { ...base, provider: "webdav", region: "", bucket: "" };
-  check("a webdav connection needs no region and no bucket", connectionFieldsReady(webdav, true));
+  const missing = (config: SyncConfig): string => missingConnectionFields(config).join(", ");
   check(
-    "a webdav connection still needs its own credential pair",
-    !connectionFieldsReady(webdav, false),
+    "a webdav connection needs no region and no bucket",
+    missing(webdav) === "",
+    missing(webdav),
   );
-  check("an s3 connection needs a region and a bucket", connectionFieldsReady(base, true));
+  check("a complete s3 connection is ready", missing(base) === "", missing(base));
+  const blankRegion = missing({ ...base, region: "" });
   check(
-    "an s3 connection without a bucket is refused",
-    !connectionFieldsReady({ ...base, bucket: "" }, true),
+    "an s3 connection with a blank region is ready, as Settings > Sync saves one",
+    blankRegion === "",
+    blankRegion,
   );
+  const blankBucket = missing({ ...base, bucket: " " });
+  check("an s3 connection without a bucket names Bucket", blankBucket === "Bucket", blankBucket);
+  const blankEndpoint = missing({ ...webdav, endpoint: "  " });
   check(
-    "a connection with no endpoint is refused",
-    !connectionFieldsReady({ ...webdav, endpoint: "  " }, true),
+    "a connection with no endpoint names Endpoint",
+    blankEndpoint === "Endpoint",
+    blankEndpoint,
   );
 }
 
