@@ -18,6 +18,51 @@ your machine and syncs end to end through storage you own.
 
 v0.1.0 is the first release: an encrypted vault, sync to your own S3 bucket or WebDAV share, and a browser extension for Chromium browsers and Firefox.
 
+## Install the browser extension
+
+Releases after v0.1.0 attach the extension next to the installers:
+`subclave-chrome.zip` and `subclave-firefox.zip`. It is not in the Chrome Web
+Store or signed by Mozilla yet, so it is loaded by hand.
+
+First, in Subclave, open Settings > Browser and turn on "Chromium browsers" or
+"Firefox". That writes the native messaging manifest the extension connects
+through.
+
+### Chromium browsers (Chrome, Chromium, Edge, Brave, Vivaldi)
+
+1. Unzip `subclave-chrome.zip` into a folder you keep. The browser loads the
+   extension from that folder every time it starts.
+2. Open `chrome://extensions`, turn on Developer mode and click Load unpacked.
+3. Pick the unzipped folder. The extension's card shows the ID
+   `fbefjngeldidlcdilbigapddeimhklpn`, the only origin Subclave's native
+   messaging manifest allows. The manifest pins a `key`, so every unpacked
+   copy gets this ID.
+4. With Subclave running and unlocked, open the browser's Extensions menu on
+   the toolbar, click Subclave (pin it to keep it on the toolbar), then Pair
+   with Subclave. Click Allow in Subclave once its code matches the one in the
+   popup.
+
+To update, replace the folder's contents with the next release's
+`subclave-chrome.zip` and click reload on the extension's card. The browser
+does not update an unpacked extension by itself.
+
+### Firefox
+
+Release and Beta Firefox install only add-ons signed by Mozilla, and this one
+is not signed yet:
+
+- Release or Beta Firefox: open `about:debugging#/runtime/this-firefox`, click
+  Load Temporary Add-on and pick `subclave-firefox.zip`. Firefox removes it
+  when it restarts, so it has to be loaded again after every restart.
+- Firefox ESR, Developer Edition or Nightly: set
+  `xpinstall.signatures.required` to `false` in `about:config`, then in
+  `about:addons` pick Install Add-on From File in the gear menu and choose
+  `subclave-firefox.zip`. It stays installed.
+
+Pair from the Extensions menu as in step 4 above. If the popup offers Pair
+with Subclave again after a restart, pair again and revoke the old entry under
+Settings > Browser.
+
 ## Build from source
 
 Needs Rust stable, Node 20.19+ with pnpm, and

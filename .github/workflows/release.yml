@@ -178,3 +178,55 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           releaseBody: ${{ steps.notes.outputs.body }}
           args: ${{ matrix.args }}
+
+  # The extension zips land in the same draft release as the installers. The
+  # extension is Vite builds plus web-ext, so this job needs no Rust toolchain
+  # and no proxy build.
+  publish-extension:
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (chrome)
+        run: pnpm --filter subclave-extension build --target chrome
+
+      - name: Build (firefox)
+        run: pnpm --filter subclave-extension build --target firefox
+
+      - name: Package the zips
+        run: pnpm --filter subclave-extension zip
+
+      # By `release_id`, as tauri-action does above: a re-run creates a second
+      # draft for the same tag, so a lookup by tag could pick the wrong one.
+      - name: Upload the zips to the draft release
+        uses: actions/github-script@v9
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            const fs = require("fs");
+            for (const name of ["subclave-chrome.zip", "subclave-firefox.zip"]) {
+              await github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: Number(process.env.RELEASE_ID),
+                name,
+                data: fs.readFileSync(`extension/dist/${name}`),
+                headers: { "content-type": "application/zip" },
+              });
+            }
