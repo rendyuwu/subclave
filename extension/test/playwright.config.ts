@@ -25,7 +25,9 @@ import { FIXTURE_PORT } from "./support/harness";
 //      the API first, which is the same condition as Firefox and Chrome before
 //      127, and the multi-match branch then takes its documented
 //      newest-`lastUsedAt` fallback. The real openPopup path needs a headed
-//      browser, so these headless specs do not exercise it.
+//      browser, so these headless specs do not exercise it. `inline.spec.ts`
+//      replaces it with a stub that counts calls (or rejects) to drive the
+//      picker's more-logins row.
 //   2. A key press synthesized over CDP does not reach Chrome's own
 //      `chrome.commands` handling, so `fill.spec.ts` falls back to sending the
 //      service worker's internal `{ type: "fill-command" }` message from the

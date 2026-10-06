@@ -26,7 +26,9 @@ export type PopupRequest =
  * `inline-save-cancel`) act on the sign-in that same tab submitted: it saves
  * to the `sender.url` stamped on its `inline-submitted`, and shows only on a
  * page of that URL's site (`check-login` decides). `id` names the pending
- * sign-in the prompt shows, so a newer one is never written in its place. */
+ * sign-in the prompt shows, so a newer one is never written in its place.
+ * `inline-open-popup` only opens the toolbar popup, which lists the wider
+ * matches for the active tab in browser-owned UI; it names no entry and no URL. */
 export type InlineRequest =
   | { type: "inline-settings" }
   | { type: "inline-logins" }
@@ -37,7 +39,8 @@ export type InlineRequest =
   | { type: "inline-submitted"; username: string; password: string }
   | { type: "inline-pending-save" }
   | { type: "inline-save"; id: string; entryId: string | null }
-  | { type: "inline-save-cancel"; id: string };
+  | { type: "inline-save-cancel"; id: string }
+  | { type: "inline-open-popup" };
 
 /** A sign-in waiting for the save prompt. `id` is the pending sign-in's own;
  * `host` is the submitted page's hostname. */
@@ -71,6 +74,8 @@ export type SwResponse =
   | { type: "save-prompt"; prompt: SavePrompt | null }
   | { type: "save"; ok: true }
   | { type: "save"; ok: false; code: NmErrorCode; message: string }
+  | { type: "popup"; ok: true }
+  | { type: "popup"; ok: false; shortcut: string }
   | { type: "error"; code: NmErrorCode; message: string };
 
 /** `url` is the page the credential was released for, and `anchored` says the
