@@ -24,20 +24,21 @@ export function JoinSyncScreen({ onCreateInstead }: { onCreateInstead: () => voi
   const [passphrase, setPassphrase] = useState("");
   const masterPassword = useMasterPassword();
 
-  const { submit, busy, error, fresh, canSubmit } = useJoinSync({
+  const { submit, busy, error, fresh, canSubmit, blockers } = useJoinSync({
     config,
     credentials,
     passphrase,
     password: masterPassword.password,
-    masterPasswordReady: masterPassword.ready,
+    masterPasswordProblems: masterPassword.problems,
   });
 
+  // The whole screen scrolls, not the form, so the wheel works anywhere on it.
+  // `m-auto` centres a short form and collapses to 0 on a tall one, which keeps
+  // its top reachable. `max-w-3xl` is the Settings window's content width, so
+  // the rows shared with Settings > Sync wrap the same in both.
   return (
-    <div className="flex h-full flex-1 items-center justify-center p-6">
-      <form
-        onSubmit={submit}
-        className="flex max-h-full w-full max-w-sm flex-col gap-4 overflow-y-auto"
-      >
+    <div className="flex h-full flex-1 overflow-y-auto p-6">
+      <form onSubmit={submit} className="m-auto flex w-full max-w-3xl flex-col gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-lg font-semibold">Join a synced vault</h1>
           <p className="text-muted-foreground text-xs">
@@ -85,10 +86,23 @@ export function JoinSyncScreen({ onCreateInstead }: { onCreateInstead: () => voi
           </div>
         ) : null}
 
-        <Button type="submit" disabled={!canSubmit}>
-          {busy ? <Spinner /> : null}
-          Join vault
-        </Button>
+        <div className="flex flex-col gap-2">
+          <Button
+            type="submit"
+            disabled={!canSubmit}
+            aria-describedby={blockers.length > 0 ? "join-blockers" : undefined}
+          >
+            {busy ? <Spinner /> : null}
+            Join vault
+          </Button>
+          {blockers.length > 0 ? (
+            <ul id="join-blockers" className="text-muted-foreground flex flex-col gap-0.5 text-xs">
+              {blockers.map((blocker) => (
+                <li key={blocker}>{blocker}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
       </form>
     </div>
   );

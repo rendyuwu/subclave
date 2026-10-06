@@ -10,8 +10,8 @@ export const MIN_PASSWORD_LENGTH = 8;
 
 /**
  * The master-password half of a first-run screen: the password, its
- * confirmation, and the no-recovery acknowledgement, plus the one boolean both
- * screens gate Submit on.
+ * confirmation, and the no-recovery acknowledgement, plus `problems`, every
+ * rule it still fails, and `ready`, which is `problems` being empty.
  */
 export type MasterPasswordDraft = {
   password: string;
@@ -20,7 +20,9 @@ export type MasterPasswordDraft = {
   setPassword: (value: string) => void;
   setConfirm: (value: string) => void;
   setAcknowledged: (value: boolean) => void;
-  /** Long enough, confirmed, and acknowledged. A screen still has to add `!busy`. */
+  /** Every rule the password still fails, one sentence each, in the order the fields render; empty once `ready`. */
+  problems: string[];
+  /** Long enough, confirmed, and acknowledged: `problems` is empty. A screen still has to add `!busy`. */
   ready: boolean;
 };
 
@@ -33,9 +35,14 @@ export function useMasterPassword(): MasterPasswordDraft {
   const [confirm, setConfirm] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
 
+  const problems: string[] = [];
   // Counted by code point rather than UTF-16 unit, so four emoji are four
   // characters and not eight.
-  const longEnough = [...password].length >= MIN_PASSWORD_LENGTH;
+  if ([...password].length < MIN_PASSWORD_LENGTH) {
+    problems.push(`Master password needs at least ${MIN_PASSWORD_LENGTH} characters.`);
+  }
+  if (confirm !== password) problems.push("The confirmation doesn't match the master password.");
+  if (!acknowledged) problems.push("The no-recovery box isn't ticked.");
 
   return {
     password,
@@ -44,7 +51,8 @@ export function useMasterPassword(): MasterPasswordDraft {
     setPassword,
     setConfirm,
     setAcknowledged,
-    ready: longEnough && password === confirm && acknowledged,
+    problems,
+    ready: problems.length === 0,
   };
 }
 

@@ -10,6 +10,11 @@ The latest release only. Every earlier version:
 
 - The inline picker's "more logins" footer is now a row that opens the Subclave popup, which lists the logins saved for other hosts of the domain. Where the browser cannot open the popup from the page, the footer names the Extensions menu and the fill shortcut instead.
 
+### Fixed
+
+- The "Join a synced vault" screen scrolls as a whole and its form widens with the window, up to the Settings content width. No horizontal scrollbar appears.
+- Join vault no longer stays disabled on a blank S3 Region, which Settings > Sync already saves. While the button is disabled, a list under it names every field that is still empty or invalid.
+
 ## [0.1.1] - 06-10-2026
 
 No change to the desktop app or to the extension's code.

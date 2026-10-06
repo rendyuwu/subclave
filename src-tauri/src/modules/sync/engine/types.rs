@@ -135,9 +135,10 @@ pub struct SyncConfigArg {
     pub provider: String,
     pub endpoint: String,
     /// S3's alone. `#[serde(default)]` so a WebDAV caller does not have to send
-    /// an S3 field `provider_config` ignores. The S3 form still requires it
-    /// (`connectionFieldsReady` in `src/modules/sync/types.ts`) and
-    /// `provider_config` still puts it into the JSON `S3Config` deserializes.
+    /// an S3 field `provider_config` ignores. Neither form requires it: a server
+    /// that takes an empty region (Cloudflare R2 reads one as `auto`) works with
+    /// it blank, and `provider_config` puts it as typed into the JSON `S3Config`
+    /// deserializes.
     #[serde(default)]
     pub region: String,
     /// S3's alone, by the same default as the `region` field.

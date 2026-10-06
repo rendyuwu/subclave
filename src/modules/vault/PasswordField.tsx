@@ -50,7 +50,10 @@ export function PasswordField({
           onKeyDown={onKeyDown}
           onKeyUp={onKeyUp}
         />
-        <InputGroupAddon align="inline-end">
+        {/* Overrides the addon's `pr-3 has-[>button]:-mr-1`: the button sits in the
+            same place, but the addon no longer hangs 3px past the group, which a
+            scrolling parent turns into a horizontal scrollbar. */}
+        <InputGroupAddon align="inline-end" className="pr-2 has-[>button]:mr-0">
           <button
             type="button"
             onClick={() => setRevealed((r) => !r)}
