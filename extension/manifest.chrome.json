@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Subclave",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Fill logins from your local Subclave vault.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtLmxM8kp4Q1xQTEvVoEvVHEjkzgKtqR/8OX9mufwWPXh3n6ag1eC7pBP/E5Cm1cmyXfhHGoSx/AiaUmPq4OqpKbTI6p5Ujo1aHzLZWKpYQezxJ4zkGsAtIgWUnzb05NvwJfvtgH0bcYlaktzc5hwvLAlkOQMNeIBPyLe0EMeGMamo5XkQytUtlMXNniRBuwBjQofHx1mVwg0mAcxLmhG9Cd/pChzd8osdDjYAKzErPsq+mcriJgOdyxJIJWlwIowW5OCUPbRWzg7mdFFFucxx/zpJfwkZFPE5o7tlDI4lfHlJTWX+/fMC+zsFIUEQ/3aLIXuIOPlX48FIC4wLzMn6QIDAQAB",
   "permissions": ["nativeMessaging", "storage", "activeTab", "scripting"],

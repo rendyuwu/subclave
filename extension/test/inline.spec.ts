@@ -62,6 +62,48 @@ async function openOn(page: Page, ui: Inline, field: Locator): Promise<void> {
   await waitForOptions(page, ui);
 }
 
+/** Replaces `chrome.action.openPopup` in the service worker with a stub that
+ * counts its calls in `__popupOpens` and, with `reject`, rejects like Firefox
+ * before 149. `delete` already works on this property, so it is configurable. */
+async function stubOpenPopup(reject: boolean): Promise<void> {
+  await harness.worker.evaluate((fail) => {
+    // The worker's global keeps the count between `evaluate` calls; this stub
+    // is the only writer, so the shape is known.
+    const counter = globalThis as unknown as { __popupOpens: number };
+    counter.__popupOpens = 0;
+    Object.defineProperty(chrome.action, "openPopup", {
+      configurable: true,
+      value: async () => {
+        counter.__popupOpens += 1;
+        if (fail) throw new Error("openPopup rejected");
+      },
+    });
+  }, reject);
+}
+
+async function popupOpens(): Promise<number> {
+  return harness.worker.evaluate(() => {
+    // Written only by `stubOpenPopup`; absent before the first stub.
+    const counter = globalThis as unknown as { __popupOpens?: number };
+    return counter.__popupOpens ?? 0;
+  });
+}
+
+/** Replaces `chrome.commands.getAll` in the service worker, since headless
+ * Chromium leaves `fill-login` unbound. Another command comes first, so the
+ * lookup has to pick `fill-login` by name. */
+async function stubShortcut(shortcut: string): Promise<void> {
+  await harness.worker.evaluate((key) => {
+    Object.defineProperty(chrome.commands, "getAll", {
+      configurable: true,
+      value: async () => [
+        { name: "_execute_action", shortcut: "Alt+Shift+S" },
+        { name: "fill-login", shortcut: key },
+      ],
+    });
+  }, shortcut);
+}
+
 const GUARD_FIXTURES = [
   "guard-untrusted.html",
   "guard-timing.html",
@@ -174,7 +216,7 @@ test("opens on a field click, on the icon and on ArrowDown, for this host only",
 
   await username.click();
   await expect.poll(() => ui.popoverOpen()).toBe(true);
-  await expect.poll(() => ui.count(OPTION)).toBe(FAKE_ENTRIES.length);
+  await expect.poll(() => ui.count(OPTION)).toBe(FAKE_ENTRIES.length + 1);
   const text = await ui.pickerText();
   for (const entry of FAKE_ENTRIES) {
     expect(text).toContain(entry.title);
@@ -202,24 +244,86 @@ test("opens on a field click, on the icon and on ArrowDown, for this host only",
   expect(await page.evaluate(() => document.activeElement?.id)).toBe("username");
 });
 
-test("the footer counts the logins left for the toolbar button", async ({}, testInfo) => {
+test("the more-logins row opens the popup by pointer and by keyboard, and ignores an untrusted click", async ({}, testInfo) => {
   harness = await startHarness(testInfo);
+  await stubOpenPopup(false);
   await setMode(harness, "no-fields");
   const page = await openFixture(harness, "login.html");
   const ui = inlineOf(page);
-  await page.locator("#username").click();
-  await expect.poll(() => ui.pickerText()).toContain("No logins for 127.0.0.1.");
-  expect(await ui.pickerText()).toContain(
-    `1 more login on ${FAKE_DOMAIN}: use the Subclave toolbar button`,
-  );
+  await openOn(page, ui, page.locator("#username"));
+  expect(await ui.count(OPTION)).toBe(1);
+  const text = await ui.pickerText();
+  expect(text).toContain(`1 more login on ${FAKE_DOMAIN}`);
+  expect(text).toContain("Open in Subclave popup");
+  expect(text).toContain("No logins for 127.0.0.1.");
+
+  // Not a guarded row: an untrusted click is ignored, not refused.
+  await ui.dispatchUntrustedClick(OPTION, 0);
+  await page.waitForTimeout(300);
+  expect(await popupOpens()).toBe(0);
+  expect(await ui.count(OPTION)).toBe(1);
+  expect(await ui.count(".message")).toBe(0);
+
+  await clickInline(page, ui, OPTION, 0);
+  await expect.poll(() => popupOpens()).toBe(1);
+  await expect.poll(() => ui.popoverOpen()).toBe(false);
 
   await setMode(harness, "ok");
-  const second = await openFixture(harness, "login.html");
-  const secondUi = inlineOf(second);
-  await second.locator("#username").click();
-  await expect
-    .poll(() => secondUi.pickerText())
-    .toContain(`2 more logins on ${FAKE_DOMAIN}: use the Subclave toolbar button`);
+  const keyboard = await openFixture(harness, "login.html");
+  const keyboardUi = inlineOf(keyboard);
+  await keyboard.locator("#username").focus();
+  await keyboard.keyboard.press("ArrowDown");
+  await waitForOptions(keyboard, keyboardUi);
+  expect(await keyboardUi.count(OPTION)).toBe(FAKE_ENTRIES.length + 1);
+  expect(await keyboardUi.pickerText()).toContain(`2 more logins on ${FAKE_DOMAIN}`);
+  for (let step = 0; step < FAKE_ENTRIES.length; step += 1) {
+    await keyboard.keyboard.press("ArrowDown");
+  }
+  await keyboard.keyboard.press("Enter");
+  await expect.poll(() => popupOpens()).toBe(2);
+  await expect.poll(() => keyboardUi.popoverOpen()).toBe(false);
+
+  expect((await readLog(harness)).some((entry) => entry.action === "get-credential")).toBe(false);
+});
+
+test("where the popup cannot open, the more-logins footer names the Extensions menu and the shortcut", async ({}, testInfo) => {
+  harness = await startHarness(testInfo);
+  await stubShortcut("Ctrl+Shift+L");
+  await stubOpenPopup(true);
+  await setMode(harness, "no-fields");
+  const page = await openFixture(harness, "login.html");
+  const ui = inlineOf(page);
+  const username = page.locator("#username");
+  await openOn(page, ui, username);
+  await clickInline(page, ui, OPTION, 0);
+
+  const text = `1 more login on ${FAKE_DOMAIN}: open Subclave from the browser's Extensions menu`;
+  const fallback = `${text}, or press Ctrl+Shift+L`;
+  await expect.poll(() => ui.pickerText()).toContain(fallback);
+  expect(await ui.count(OPTION)).toBe(0);
+  expect(await popupOpens()).toBe(1);
+
+  // The page remembers: the next picker is text at once and asks no more.
+  await page.keyboard.press("Escape");
+  await expect.poll(() => ui.popoverOpen()).toBe(false);
+  await username.click();
+  await expect.poll(() => ui.pickerText()).toContain(fallback);
+  expect(await ui.count(OPTION)).toBe(0);
+  expect(await popupOpens()).toBe(1);
+
+  // A browser with no openPopup at all reads the same; with the shortcut
+  // unbound, the text names the Extensions menu only.
+  await harness.worker.evaluate(() => {
+    const action: { openPopup?: () => Promise<void> } = chrome.action;
+    delete action.openPopup;
+  });
+  await stubShortcut("");
+  const fresh = await openFixture(harness, "login.html");
+  const freshUi = inlineOf(fresh);
+  await openOn(fresh, freshUi, fresh.locator("#username"));
+  await clickInline(fresh, freshUi, OPTION, 0);
+  await expect.poll(() => freshUi.pickerText()).toContain(text);
+  expect(await freshUi.pickerText()).not.toContain(", or press");
 });
 
 test("a pick fills the field's login through via inline, by pointer and by keyboard", async ({}, testInfo) => {

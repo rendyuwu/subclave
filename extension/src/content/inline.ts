@@ -245,6 +245,13 @@ function createInline(): Inline {
    * to update. The prompt is the picker open with no anchor. */
   let saving: { prompt: SavePrompt; listing: boolean } | null = null;
   let submitSeq = 0;
+  /** The fill command's shortcut ("" when unbound) once the service worker
+   * could not open the popup for this page; the more-logins footer is text
+   * from then on. */
+  // ponytail: remembered per page, so a browser that can never open the popup
+  // shows the row until its first click on each page; have the service worker
+  // learn it up front if that matters.
+  let popupFallback: string | null = null;
 
   const isOpen = (): boolean => picker.matches(":popover-open");
 
@@ -456,6 +463,21 @@ function createInline(): Inline {
     }
   };
 
+  /** Opens the toolbar popup, which lists the wider matches in browser-owned
+   * UI. Fills and releases nothing, so its row needs a trusted event only. */
+  const openPopup = async (state: Extract<SwState, { state: "ready" }>): Promise<void> => {
+    const mine = seq;
+    const response = await ask({ type: "inline-open-popup" });
+    if (!response || mine !== seq) return;
+    if (response.type === "popup" && response.ok) close();
+    else if (response.type === "popup") {
+      popupFallback = response.shortcut;
+      showReady(state);
+    } else if (response.type === "error") {
+      errorView(response.code, response.message);
+    }
+  };
+
   const showReady = (state: Extract<SwState, { state: "ready" }>): void => {
     const next: Row[] = [];
     if (anchor && fields.get(anchor) === true) {
@@ -484,11 +506,18 @@ function createInline(): Inline {
     if (state.entries.length === 0) lines.push(note(`No logins for ${state.host}.`));
     const more = state.otherMatches;
     if (more > 0) {
-      lines.push(
-        note(
-          `${more} more login${more === 1 ? "" : "s"} on ${state.domain}: use the Subclave toolbar button`,
-        ),
-      );
+      const count = `${more} more login${more === 1 ? "" : "s"} on ${state.domain}`;
+      if (popupFallback === null) {
+        next.push({
+          label: count,
+          detail: "Open in Subclave popup",
+          guarded: false,
+          run: () => openPopup(state),
+        });
+      } else {
+        const press = popupFallback ? `, or press ${popupFallback}` : "";
+        lines.push(note(`${count}: open Subclave from the browser's Extensions menu${press}`));
+      }
     }
     render(next, lines);
   };
