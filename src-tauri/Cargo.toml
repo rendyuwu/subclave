@@ -6,7 +6,7 @@ resolver = "2"
 
 [package]
 name = "subclave"
-version = "0.1.0"
+version = "0.1.1"
 description = "Subclave - a local-first desktop password manager."
 authors = ["rendyuwu"]
 license = "Apache-2.0"
