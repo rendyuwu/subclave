@@ -144,8 +144,7 @@ test("with Show in login fields off there are no icons and the popup still fills
   await page.waitForTimeout(1000);
   expect(await inlineOf(page).count(".icon")).toBe(0);
 
-  const popup = await openPopup(harness.context, harness.extensionId);
-  await page.bringToFront();
+  const popup = await openPopup(harness.context, harness.extensionId, page);
   await popup.getByRole("option").first().click();
   await expect(page.locator("#username")).toHaveValue(FAKE_ENTRIES[0].username);
   await expect(page.locator("#password")).toHaveValue(FAKE_PASSWORD);

@@ -7,7 +7,7 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
 
 |                 |                                                                         |
 | --------------- | ----------------------------------------------------------------------- |
-| Version         | 0.1.0                                                                   |
+| Version         | 0.1.1                                                                   |
 | Repo            | `github.com/rendyuwu/subclave`                                          |
 | Stack           | Tauri 2 + Rust with React 19 + TS, Tailwind v4 and shadcn/ui            |
 | Bundle id       | `dev.rendy.subclave` (dev profile: `dev.rendy.subclave.dev`)            |
@@ -147,8 +147,8 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
   isolating stores and logs in a `.dev` data dir.
 - Release: feature branch -> PR into `dev` (squash) -> PR `dev` -> `main`
   (merge commit) -> annotated tag `vX.Y.Z` on `main`. The tag (`v*`) triggers
-  `.github/workflows/release.yml`, which builds signed updates and a draft
-  GitHub Release; notes are generated from `CHANGELOG.md` via
+  `.github/workflows/release.yml`, which builds signed updates, the extension
+  zips and a draft GitHub Release; notes are generated from `CHANGELOG.md` via
   `scripts/release-notes.mjs`, which reads the heading
   `## [X.Y.Z] - DD-MM-YYYY`. The file holds only the latest release; every
   earlier version lives in GitHub Releases, so a new draft replaces the old
