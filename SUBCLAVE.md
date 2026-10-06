@@ -7,7 +7,7 @@ Agent memory and contributor reference for Subclave. Build and PR rules:
 
 |                 |                                                                         |
 | --------------- | ----------------------------------------------------------------------- |
-| Version         | 0.1.0                                                                   |
+| Version         | 0.1.1                                                                   |
 | Repo            | `github.com/rendyuwu/subclave`                                          |
 | Stack           | Tauri 2 + Rust with React 19 + TS, Tailwind v4 and shadcn/ui            |
 | Bundle id       | `dev.rendy.subclave` (dev profile: `dev.rendy.subclave.dev`)            |
