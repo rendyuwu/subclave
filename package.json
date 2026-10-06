@@ -1,7 +1,7 @@
 {
   "name": "subclave",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Subclave - a local-first desktop password manager.",
   "author": "rendyuwu",
   "license": "Apache-2.0",
