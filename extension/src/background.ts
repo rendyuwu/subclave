@@ -81,6 +81,7 @@ const INLINE_REQUEST_TYPES: Record<string, true> = {
   "inline-pending-save": true,
   "inline-save": true,
   "inline-save-cancel": true,
+  "inline-open-popup": true,
 };
 
 export type BackgroundOptions = {
@@ -413,18 +414,7 @@ export function startBackground(options: BackgroundOptions = {}): void {
       return { type: "fill", ok: true, filled: 0 };
     }
     const entries = logins.result.entries;
-    // `chrome.action.openPopup` is Chrome 127+; Firefox and older Chrome have
-    // no such member, so it is read through a named interface.
-    const action: { openPopup?: () => Promise<void> } = chrome.action;
-    if (entries.length > 1 && action.openPopup) {
-      try {
-        await action.openPopup.call(chrome.action);
-        return { type: "fill", ok: true, filled: 0 };
-      } catch {
-        // Firefox and older Chrome reject openPopup; fall through to the
-        // newest-match fallback below.
-      }
-    }
+    if (entries.length > 1 && (await openPopup())) return { type: "fill", ok: true, filled: 0 };
     let pick = entries[0];
     if (entries.length > 1) {
       for (const entry of entries) {
@@ -579,7 +569,8 @@ export function startBackground(options: BackgroundOptions = {}): void {
    * URL, so they never reach another host's logins or the popup's wider match.
    * The save prompt saves to the browser-stamped URL of the tab's own submitted
    * sign-in, and shows only on a page of that sign-in's site (`check-login`
-   * decides, by the vault's Domain rule). */
+   * decides, by the vault's Domain rule). `inline-open-popup` uses neither the
+   * tab nor the URL; it only opens the popup. */
   const handleInline = async (
     message: InlineRequest,
     tabId: number,
@@ -622,6 +613,12 @@ export function startBackground(options: BackgroundOptions = {}): void {
       case "inline-save-cancel":
         await dropPending(tabId, message.id);
         return { type: "save", ok: true };
+      case "inline-open-popup": {
+        if (await openPopup()) return { type: "popup", ok: true };
+        const commands = await chrome.commands.getAll();
+        const shortcut = commands.find((command) => command.name === "fill-login")?.shortcut;
+        return { type: "popup", ok: false, shortcut: shortcut ?? "" };
+      }
     }
   };
 
@@ -681,6 +678,21 @@ function runtimeMessageType(message: unknown): string | null {
   if (message === null || typeof message !== "object" || !("type" in message)) return null;
   const type: unknown = message.type;
   return typeof type === "string" ? type : null;
+}
+
+/** Opens the toolbar popup in the focused window. `chrome.action.openPopup`
+ * is open to every extension from Chrome 127 and needs no user action from
+ * Firefox 149; older versions lack it or reject the call, which reads as
+ * `false`. Read through a named interface because the member can be missing. */
+async function openPopup(): Promise<boolean> {
+  const action: { openPopup?: () => Promise<void> } = chrome.action;
+  if (!action.openPopup) return false;
+  try {
+    await action.openPopup.call(chrome.action);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Chromium's UA always says "Chrome", so the other products are checked first. */

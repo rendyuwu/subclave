@@ -54,6 +54,12 @@ Until `1.0.0`, only the latest minor gets security fixes.
     `example.com` login, which was the main vector in Marek Tóth's DEF CON 33
     research
     ([DOM-based Extension Clickjacking](https://marektoth.com/blog/dom-based-extension-clickjacking)).
+    When other hosts of the domain hold matches, the picker's last row counts
+    them and only opens the popup (`chrome.action.openPopup`). It fills
+    nothing and releases nothing, so it needs a trusted click but not the six
+    guards. A clickjacked click on it can only open the popup, where a fill
+    still takes a click in browser-owned UI. Where the popup cannot be opened,
+    the row turns into text.
   - Inline fill needs a trusted user action and passes the six guards in
     `extension/src/content/guard.ts`. If any guard fails, nothing is filled.
   - The page never supplies the URL. It comes from the browser:

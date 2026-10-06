@@ -63,6 +63,26 @@ Pair from the Extensions menu as in step 4 above. If the popup offers Pair
 with Subclave again after a restart, pair again and revoke the old entry under
 Settings > Browser.
 
+## Fill a login
+
+Click a login field, or the key icon in it, to list the logins saved for that
+page's exact host, and pick one.
+
+Logins for another host of the same domain (an entry for `github.com` opened
+from `gist.github.com`) are not listed. The picker's last row,
+`N more logins on github.com`, opens the Subclave popup, which lists every
+match. Where the browser cannot open the popup from the page, the row turns
+into text; then open Subclave from the browser's Extensions menu (or the
+toolbar once pinned) and pick the login there.
+
+`Ctrl+Shift+L` (`Cmd+Shift+L` on macOS) fills the current page without the
+picker: one match fills right away; several open the popup, or fill the most
+recently used login where the browser cannot open it.
+
+The browser leaves the shortcut unset when another extension already holds
+it. Set it at `chrome://extensions/shortcuts`, or in Firefox under
+`about:addons`, gear menu, Manage Extension Shortcuts.
+
 ## Build from source
 
 Needs Rust stable, Node 20.19+ with pnpm, and
